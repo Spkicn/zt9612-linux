@@ -105,7 +105,7 @@ def main():
             n += 1
             good, _ = roundtrip(fd, 0x0004, b"", 0x0005, timeout=2.0)
             alive += 1 if good else 0
-            print("   [%2d] %s" % (n, "OK" if good else "无响应 ⚠"))
+            print("   [%2d] %s" % (n, "OK" if good else "无响应（异常）"))
         print("稳定性：%d/%d 次有响应" % (alive, n))
 
     os.close(fd)
