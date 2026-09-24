@@ -87,6 +87,15 @@ static int scan_probe;
 module_param(scan_probe, int, 0644);
 MODULE_PARM_DESC(scan_probe, "0=passive scan (default), 1=send own probe request, 2=replay vendor probe");
 
+/* M3.4 实验：TX 变体（用于定位"帧被接受但没发出去"的原因） */
+static int tx_ep = EP_TX_NUM;		/* 发送端点号（5/6/7 试验） */
+module_param(tx_ep, int, 0644);
+MODULE_PARM_DESC(tx_ep, "TX bulk OUT endpoint number (default 5)");
+
+static int tx_variant;			/* 0=正常 1=描述符+0x00 置 0 2=不带描述符 3=补齐到 512 */
+module_param(tx_variant, int, 0644);
+MODULE_PARM_DESC(tx_variant, "TX frame variant for experiments (default 0)");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -651,29 +660,43 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 	if (flen < 10 || flen > MAX_FRAME - TX_DESC_LEN - 8)
 		return -EINVAL;
 
-	d = buf + 8;
-	memset(d, 0, TX_DESC_LEN);
-	put_unaligned_le32(0xffffffff, d + 0);
-	put_unaligned_le16(flen, d + 4);
-	put_unaligned_le16(0x0700, d + 6);
-	put_unaligned_le16(0xff00, d + 8);
-	put_unaligned_le16(0x0005, d + 10);
-	put_unaligned_le16(z->tx_seq++, d + 14);
-	put_unaligned_le16(0x003f, d + 26);
-	memcpy(d + TX_DESC_LEN, frame, flen);
+	if (tx_variant == 2) {
+		/* 变体 2：不带描述符，只发 WLAN 头 + 帧 */
+		memcpy(buf, "WLAN", 4);
+		put_unaligned_le16(flen, buf + 4);
+		put_unaligned_le16(TX_TYPE_DATA, buf + 6);
+		memcpy(buf + 8, frame, flen);
+		total = 8 + flen;
+	} else {
+		d = buf + 8;
+		memset(d, 0, TX_DESC_LEN);
+		put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
+		put_unaligned_le16(flen, d + 4);
+		put_unaligned_le16(0x0700, d + 6);
+		put_unaligned_le16(0xff00, d + 8);
+		put_unaligned_le16(0x0005, d + 10);
+		put_unaligned_le16(z->tx_seq++, d + 14);
+		put_unaligned_le16(0x003f, d + 26);
+		memcpy(d + TX_DESC_LEN, frame, flen);
 
-	memcpy(buf, "WLAN", 4);
-	put_unaligned_le16(TX_DESC_LEN + flen, buf + 4);
-	put_unaligned_le16(TX_TYPE_DATA, buf + 6);
-	total = 8 + TX_DESC_LEN + flen;
+		memcpy(buf, "WLAN", 4);
+		put_unaligned_le16(TX_DESC_LEN + flen, buf + 4);
+		put_unaligned_le16(TX_TYPE_DATA, buf + 6);
+		total = 8 + TX_DESC_LEN + flen;
+	}
 	/*
 	 * 抓包实测：EP5 的传输长度是 8 的倍数（147→152、138→144），不足处补零。
-	 * 推测是 TX 路径的 DMA/对齐要求；不对齐的帧可能被固件丢掉。
+	 * 变体 3 则补齐到 512（批量端点包长的整数倍）。
 	 */
-	while (total & 7)
-		buf[total++] = 0;
+	if (tx_variant == 3) {
+		while (total & 0x1ff)
+			buf[total++] = 0;
+	} else {
+		while (total & 7)
+			buf[total++] = 0;
+	}
 
-	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_tx),
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
 			   buf, total, &sent, 1000);
 	if (ret) {
 		dev_warn(&z->intf->dev, "tx: bulk OUT 失败 (%d)\n", ret);
