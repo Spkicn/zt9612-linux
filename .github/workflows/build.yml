@@ -1,10 +1,12 @@
 name: build
 
-# 说明：本驱动针对内核 7.0 时代的 mac80211 ops 签名编写（例如
-# config(hw, radio_idx, changed)），而 GitHub 托管 runner 的内核版本更老，
-# 因此在 runner 上编译可能因为**内核 API 差异**失败，而不是代码本身有问题。
-# 这个 job 定位为"信息性"（continue-on-error）：验证语法、注释、构建系统是否自洽。
-# 真正阻塞合并的检查是 checkpatch 与 shellcheck 两个 workflow。
+# 编译验证。CI 实测结论（见 README「兼容性」）：
+#   * ubuntu-24.04 runner（内核 6.17.0-1022-azure）：**零告警编译通过**，产出 zt9612.ko
+#   * ubuntu-22.04 runner（内核 6.8.0-1064-azure）：因缺少 linux/unaligned.h 失败
+#     —— 该头文件 6.12 才引入，驱动的编译下限就是 6.12（dkms.conf 里已声明）
+#
+# 因此：build 作业在 24.04 上**阻塞**；old-kernel 作业是"预期失败"的信息性对照，
+# 用来验证下限声明是否仍然成立（不阻塞合并）。
 on:
   push:
     branches: [main]
@@ -16,14 +18,10 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    name: build (ubuntu-24.04, blocking)
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
-
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +41,31 @@ jobs:
       - name: 编译模块
         run: make -C driver modules
 
-      - name: 模块信息
+      - name: 模块信息（license / version / alias / firmware）
         run: |
-          modinfo driver/zt9612.ko || true
-          modinfo driver/zt9612.ko 2>/dev/null | grep -E '^(license|version|firmware|alias)' || true
+          modinfo driver/zt9612.ko
+          modinfo driver/zt9612.ko | grep -q '^license: *GPL' || { echo "::error::MODULE_LICENSE 不是 GPL"; exit 1; }
+          modinfo driver/zt9612.ko | grep -q 'alias:.*350Bp9612' || { echo "::error::MODULE_DEVICE_TABLE 未生效"; exit 1; }
+
+  build-old-kernel:
+    name: build (ubuntu-22.04, informational)
+    # 对照实验：22.04 runner 的内核低于 6.12 编译下限，预期编译失败。
+    # 这里**不判失败**，只在两种结果上给出提示 —— 如果哪天它编译通过了，
+    # 说明有人加了兼容层，应该同步更新 dkms.conf 与 README 的下限声明。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装构建依赖与内核头文件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc
+          sudo apt-get install -y "linux-headers-$(uname -r)" \
+            || sudo apt-get install -y linux-headers-generic
+      - name: 编译模块（低于 6.12 时预期失败）
+        run: |
+          echo "runner 内核：$(uname -r)"
+          if make -C driver modules; then
+            echo "::notice::内核 $(uname -r) 也编译成功了 —— 兼容层可能已加入，请更新 dkms.conf / README 的编译下限声明"
+          else
+            echo "::notice::预期结果：内核 $(uname -r) 低于编译下限 6.12（缺 linux/unaligned.h）"
+          fi
