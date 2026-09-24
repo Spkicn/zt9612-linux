@@ -119,6 +119,7 @@ struct zt_dev {
 	wait_queue_head_t	rx_wait;
 	bool			rx_running;
 	bool			alive;		/* 拔出/卸载后置 0，停止一切 USB IO */
+	bool			mac_started;	/* hw 是否已 start（drv_start/drv_stop），RX 注入的门控 */
 	struct completion	rx_done;	/* 在途 rx_urb 回收信号（D9） */
 
 	struct delayed_work	hb_work;
@@ -1088,11 +1089,13 @@ static void zt_rx_complete(struct urb *urb)
 			wake_up_interruptible(&z->rx_wait);
 		}
 		/*
-		 * RX 注入必须常开，不能只在扫描期间做：认证/关联/数据帧都要交给
-		 * mac80211。早期版本用 scan_active 门控，导致扫描之外收到的一切
-		 * 管理帧都被丢掉，表现为 iw connect 永远超时。
+		 * RX 注入不能只在扫描期间做：认证/关联/数据帧都要交给 mac80211。
+		 * 早期版本用 scan_active 门控，导致扫描之外收到的一切管理帧都被丢掉，
+		 * 表现为 iw connect 永远超时。
+		 * 但必须用"hw 已 start（netdev up）"门控（mac_started）：接口 down 时
+		 * mac80211 的 local->started=0，此时注帧会在 rx.c:5475 打 WARNING。
 		 */
-		if (READ_ONCE(z->hw))
+		if (READ_ONCE(z->hw) && READ_ONCE(z->mac_started))
 			zt_rx_inject(z, z->rx_buf, len);
 	}
 	if (READ_ONCE(z->rx_running)) {
@@ -1321,6 +1324,16 @@ static int zt_mac_start(struct ieee80211_hw *hw)
 {
 	struct zt_dev *z = zt_from_hw(hw);
 
+	/*
+	 * M3.5：hw 已 start 才允许把 RX 帧交给 mac80211。
+	 * mac80211 的 ieee80211_rx_list() 里有
+	 *     if (!local->in_reconfig && !local->started) WARN(...)
+	 * （反汇编 + BTF 定位：rx.c:5475，字段 local->in_reconfig / local->started）
+	 * 而 local->started 正是在 drv_start/drv_stop 前后置位/清零的。
+	 * 我们原来的 RX 注入常开，接口 down（local->started=0）期间设备仍在送 beacon，
+	 * 于是每帧打一条 WARNING（实测 down 期间 6.6 条/秒，NM 活动时爆发、taint 内核）。
+	 */
+	WRITE_ONCE(z->mac_started, true);
 	dev_info(&z->intf->dev, "mac80211: start\n");
 	return 0;
 }
@@ -1329,6 +1342,7 @@ static void zt_mac_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct zt_dev *z = zt_from_hw(hw);
 
+	WRITE_ONCE(z->mac_started, false);
 	dev_info(&z->intf->dev, "mac80211: stop\n");
 }
 
@@ -1721,6 +1735,7 @@ static void zt_mac_unregister(struct zt_dev *z)
 {
 	if (!z->hw)
 		return;
+	WRITE_ONCE(z->mac_started, false);	/* 注销后不再注帧，避免 race */
 	ieee80211_unregister_hw(z->hw);
 	ieee80211_free_hw(z->hw);
 	z->hw = NULL;
