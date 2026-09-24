@@ -16,7 +16,7 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 | 硬件识别与协议分析 | 完成 |
 | M1 内核态固件装载 | 完成，已实机验证 |
 | M2 IPC 初始化与 `/dev/zt9612` | 完成，已实机验证（IPC 往返成功） |
-| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（`wlan0` 按 MAC 被命名为 `wlx00b4011a0012`） |
+| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（接口按真实 MAC 命名为 `wlxb4011a001264`） |
 | M3.2 扫描 | 完成，已实机验证（`iw scan` 实测 40+ 个 BSS） |
 | M3.3 关联 | 完成，已实机验证（`iw connect` 关联开放 AP，`assoc=1`、接口 `LOWER_UP`） |
 | M3.4 数据面 | 完成，已实机验证（关联后广播 ARP 出网并收到网关应答、单播回包正常回收）；IP 地址取决于 AP 是否提供 DHCP |
@@ -237,7 +237,7 @@ sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳�
 M3.1 已在 `7.0.0-31-generic` 上实机验证：`iw dev` 能看到 managed 接口，`iw phy phy0 info`
 列出 2.4 GHz **14** 个信道（含 2484）+ 5 GHz **25** 个信道（5180–5825），`ethtool -i`
 返回 `driver: zt9612`。
-注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（本机是 `wlx00b4011a0012`），
+注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（本机是 `wlxb4011a001264`），
 用 `ls /sys/class/net | grep -E '^(wlx|wlan)'` 或 `iw dev` 查实际名字。
 
 ## 已知问题
