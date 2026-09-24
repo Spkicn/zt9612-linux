@@ -4,10 +4,13 @@
 # ZT9612U (ZTOP / ACEV100) USB Wi-Fi 驱动安装脚本
 #
 # 当前驱动能力（务必先读）：
-#   已实现：固件装载（M1）、IPC 初始化 + /dev/zt9612 通道（M2），可加载、可通信
-#   未验证：mac80211 注册（M3.1，代码已写但尚未在实机确认）
-#   ⇒ 装完**不会**立刻得到一个能上网的 wlan0。本脚本只负责把模块正确编译、
-#     签名、安装，并把已知风险（见 README「已知问题」）挡住。
+#   已实现并实机验证：固件装载（M1）、IPC 初始化 + /dev/zt9612 通道（M2）、
+#   mac80211 接口（M3.1）、双频扫描（M3.2/M3.5）、关联（M3.3）、数据面（M3.4）、
+#   WPA2-PSK 加密（CCMP 由 mac80211 软件加解密）
+#   ⇒ 装完手动加载后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，
+#     形如 wlx + 12 位十六进制），能扫描、关联、DHCP、ping 外网。
+#   已知短板：吞吐偏低（速率恒定 1 Mbit/s）。
+#   本脚本只负责把模块正确编译、签名、安装，并把已知风险（见 README「已知问题」）挡住。
 #
 # 用法:
 #   sudo ./install-driver.sh                # 默认：编译 + 安装，保留 blacklist（不自动加载）
@@ -154,7 +157,9 @@ if [ "$ENABLE_AUTOLOAD" -eq 1 ]; then
 	rm -f "$BLACKLIST"
 	echo
 	echo "注意：已启用自动加载。插上网卡（或开机）就会自动 probe 并装载固件。"
-	echo "      本项目曾观察到这条路径导致机器启动后无法登录（见 README 的「已知问题」）。"
+	echo "      曾观察到这条路径让机器启动后无法登录，根因是驱动漏设 wiphy 的父设备"
+	echo "      （缺少 SET_IEEE80211_DEV()），已在 v0.2.0 修复，但「干净开机自动加载」"
+	echo "      这条完整路径尚未重新复验过（见 README 的「已知问题」）。"
 	echo "      如果开机后机器异常，请参考 README 中的恢复步骤。"
 else
 	printf 'blacklist %s\n' "$DRV_NAME" > "$BLACKLIST"
@@ -174,7 +179,7 @@ if modprobe "$DRV_NAME" 2>/dev/null || insmod "$MODDESTDIR/$DRV_NAME.ko"; then
 	dmesg | tail -30
 	echo
 	echo "设备节点：$(ls -l /dev/$DRV_NAME 2>/dev/null || echo '未出现（看上面的 dmesg）')"
-	echo "网络接口：$(ip -br link 2>/dev/null | grep -w wlan0 || echo 'wlan0 尚未出现（M3.1 未验证，属预期）')"
+	echo "网络接口：$(ls /sys/class/net 2>/dev/null | grep -E '^(wlx|wlan)' | head -1 || echo '未出现（看上面的 dmesg；接口名按 MAC 生成，不一定是 wlan0）')"
 else
 	echo "加载失败，请把上面的 dmesg 贴到 issue 里"
 fi

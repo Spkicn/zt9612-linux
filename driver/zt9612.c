@@ -84,7 +84,9 @@ MODULE_PARM_DESC(do_boot, "download firmware (default 1); set 0 to reuse an alre
  *   0 = 被动扫描（默认，已验证：只听 beacon）
  *   1 = 发送本驱动自建的广播 probe request
  *   2 = 逐字节重放抓包里厂商的 probe request（用于区分"帧内容问题"与"描述符/状态问题"）
- * 主动发送尚未验证成功（收不到 probe response），因此默认 0。
+ * 已知：修好 MAC/MM_ADD_IF（第 10 轮）之后，**模式 2 实测能收到 probe response**
+ * （probe=13 / probe-resp=22）；模式 1 自那以后没有单独复验过，不要当成已验证。
+ * 主动发送曾长期收不到响应，原因不在帧里而在 vif 地址（见 re/DRIVER_PROGRESS.md 第 10 轮）。
  */
 static int scan_probe;
 module_param(scan_probe, int, 0644);
@@ -498,8 +500,8 @@ static int zt_run_init(struct zt_dev *z)
 
 	zt_cmd(z, 0x0022, &one, 1, 0x0023, 3000, NULL, NULL);
 	/* MM_ADD_IF_REQ 参数 = { u8 type; u8 mac[6]; u8 p2p; }，共 8 字节
-	 * （抓包实测：00 b4 01 1a 00 12 64 00，即 type=0/STA + 本机 MAC + p2p=0）。
-	 * 早期版本只发 7 字节且 MAC 错位，固件可能因此拒绝建 vif。 */
+	 * （抓包实测：type=0/STA + 本机 MAC + p2p=0）。
+	 * 早期版本只发 7 字节且 MAC 错位，固件因此拒绝建 vif（TX 静默失效）。 */
 	addif[0] = 0x00;			/* type: 0 = STA */
 	memcpy(addif + 1, z->mac, 6);
 	addif[7] = 0x00;			/* p2p */
