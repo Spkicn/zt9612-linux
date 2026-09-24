@@ -41,7 +41,7 @@
 #define HB_INTERVAL_MS	5000
 
 /* M3.2 扫描 */
-#define ZT_MAX_SCAN_CH	16		/* 只广播 2.4G，最多 14 个信道 */
+#define ZT_MAX_SCAN_CH	48		/* 2.4G 14 + 5G 25；厂商一轮扫 39 个信道，留余量 */
 #define ZT_SCAN_DWELL_MS 120		/* 每信道停留时间 */
 #define T_RX_DATA0	0x0000		/* RX 数据帧（描述符 48 字节） */
 #define T_RX_DATA4	0x0004		/* RX 数据帧（描述符 52 字节） */
@@ -1493,6 +1493,13 @@ static void zt_scan_work(struct work_struct *w)
 		aborted = true;
 		goto out;
 	}
+	/* RX 注入已改为常开，这些计数会跨扫描累计；不清零就无法用它们判断
+	 * "本次扫描有没有收到响应"（曾因此误判为没有发射）。 */
+	z->tx_frames = 0;
+	z->tx_probes = 0;
+	z->rx_beacons = 0;
+	z->rx_probe_resp = 0;
+	memset(z->rx_type_cnt, 0, sizeof(z->rx_type_cnt));
 	dev_info(&z->intf->dev, "scan: 开始，%d 个信道\n", z->scan_nfreqs);
 	if (zt_scan_setup(z)) {
 		dev_warn(&z->intf->dev, "scan: 前置序列失败\n");
