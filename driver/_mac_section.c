@@ -188,8 +188,10 @@ static void zt_scan_work(struct work_struct *w)
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
 		msleep(20);			/* 让信道先稳定下来 */
-		if (scan_probe)
-			zt_scan_probe(z, (u8)((f - 2407) / 5));	/* M3.4 实验 */
+		if (scan_probe == 1)
+			zt_scan_probe(z, (u8)((f - 2407) / 5));
+		else if (scan_probe == 2)
+			zt_scan_probe_vendor(z, (u8)((f - 2407) / 5));
 		msleep(ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
@@ -206,6 +208,26 @@ out:
 		 "scan: 结束（%s）tx=%lu probe=%lu beacon=%lu probe-resp=%lu\n",
 		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
 		 z->rx_beacons, z->rx_probe_resp);
+	dev_info(&z->intf->dev,
+		 "scan: RX type 0x0000=%lu 0x0004=%lu 0x0100=%lu 0x0300=%lu 其它=%lu(last=%#06x)\n",
+		 z->rx_type_cnt[0], z->rx_type_cnt[1], z->rx_type_cnt[2],
+		 z->rx_type_cnt[3], z->rx_type_cnt[4], z->last_other_type);
+	dev_info(&z->intf->dev,
+		 "scan: 未预期 IPC: %#06x x%lu | %#06x x%lu | %#06x x%lu | %#06x x%lu\n",
+		 z->unk_ids[0], z->unk_cnt[0], z->unk_ids[1], z->unk_cnt[1],
+		 z->unk_ids[2], z->unk_cnt[2], z->unk_ids[3], z->unk_cnt[3]);
+	dev_info(&z->intf->dev,
+		 "scan: 设备消息表(1): %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu\n",
+		 z->seen_ids[0], z->seen_cnt[0], z->seen_ids[1], z->seen_cnt[1],
+		 z->seen_ids[2], z->seen_cnt[2], z->seen_ids[3], z->seen_cnt[3],
+		 z->seen_ids[4], z->seen_cnt[4], z->seen_ids[5], z->seen_cnt[5],
+		 z->seen_ids[6], z->seen_cnt[6], z->seen_ids[7], z->seen_cnt[7]);
+	dev_info(&z->intf->dev,
+		 "scan: 设备消息表(2): %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu\n",
+		 z->seen_ids[8], z->seen_cnt[8], z->seen_ids[9], z->seen_cnt[9],
+		 z->seen_ids[10], z->seen_cnt[10], z->seen_ids[11], z->seen_cnt[11],
+		 z->seen_ids[12], z->seen_cnt[12], z->seen_ids[13], z->seen_cnt[13],
+		 z->seen_ids[14], z->seen_cnt[14], z->seen_ids[15], z->seen_cnt[15]);
 	mutex_unlock(&z->lock);
 
 	if (READ_ONCE(z->alive) && z->hw) {
