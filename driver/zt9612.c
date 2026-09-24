@@ -417,7 +417,7 @@ static int zt_run_init(struct zt_dev *z)
 		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x5e, 0x00, 0x02, 0x01, 0x02 },
 		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2f, 0x00, 0x02, 0x01, 0x01 },
 	};
-	u8 addif[7] = { 0 };
+	u8 addif[8] = { 0 };
 	u8 chan[12];
 	u8 resp[64];
 	u16 rlen = 0;
@@ -446,8 +446,13 @@ static int zt_run_init(struct zt_dev *z)
 	zt_cmd(z, 0x0112, &zero, 1, -1, 300, NULL, NULL);
 
 	rlen = 0;
-	if (!zt_cmd(z, 0x0100, &zero, 1, 0x0101, 3000, resp, &rlen) && rlen >= 6) {
-		memcpy(z->mac, resp, 6);
+	if (!zt_cmd(z, 0x0100, &zero, 1, 0x0101, 3000, resp, &rlen) && rlen >= 7) {
+		/* 0x0101 的参数是 { u8 status; u8 mac[6]; }（抓包实测 plen=7）。
+		 * 早期版本误把 resp[0..5] 当 MAC，导致 MAC 整体左移一字节、
+		 * 末字节被 0 顶掉，vif 也就建在了错误的地址上。 */
+		dev_info(&z->intf->dev, "fw 0x0101: status=%u mac=%pM\n",
+			 resp[0], resp + 1);
+		memcpy(z->mac, resp + 1, 6);
 		dev_info(&z->intf->dev, "MAC = %pM\n", z->mac);
 	} else {
 		eth_random_addr(z->mac);
@@ -467,8 +472,21 @@ static int zt_run_init(struct zt_dev *z)
 	msleep(50);
 
 	zt_cmd(z, 0x0022, &one, 1, 0x0023, 3000, NULL, NULL);
-	memcpy(addif, z->mac, 6);
-	zt_cmd(z, 0x0006, addif, sizeof(addif), 0x0007, 3000, NULL, NULL);
+	/* MM_ADD_IF_REQ 参数 = { u8 type; u8 mac[6]; u8 p2p; }，共 8 字节
+	 * （抓包实测：00 b4 01 1a 00 12 64 00，即 type=0/STA + 本机 MAC + p2p=0）。
+	 * 早期版本只发 7 字节且 MAC 错位，固件可能因此拒绝建 vif。 */
+	addif[0] = 0x00;			/* type: 0 = STA */
+	memcpy(addif + 1, z->mac, 6);
+	addif[7] = 0x00;			/* p2p */
+	rlen = 0;
+	if (zt_cmd(z, 0x0006, addif, sizeof(addif), 0x0007, 3000, resp, &rlen) ||
+	    rlen < 2) {
+		dev_warn(&z->intf->dev, "MM_ADD_IF 无 CFM\n");
+	} else {
+		/* mm_add_if_cfm = { u8 status; u8 inst_nbr; } */
+		dev_info(&z->intf->dev, "MM_ADD_IF_CFM: status=%u inst_nbr=%u\n",
+			 resp[0], resp[1]);
+	}
 	zt_cmd(z, 0x0020, &slottime, 1, 0x0021, 3000, NULL, NULL);
 
 	memset(chan, 0, sizeof(chan));
