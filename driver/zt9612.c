@@ -141,6 +141,9 @@ struct zt_dev {
 	u16			tx_seq;
 	unsigned long		tx_frames;
 	unsigned long		tx_probes;
+	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
+	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
+	unsigned long		rx_frames_5g;		/* 描述符频率 > 2500 的 RX 帧数 */
 	unsigned long		rx_beacons;
 	unsigned long		rx_probe_resp;
 	/* 观测：扫描期间收到的帧类型分布 + 未识别的 IPC 消息 id */
@@ -877,16 +880,62 @@ static const u8 vendor_probe_139[147] = {
 	0xff, 0xfa, 0xff,
 };
 
-static int zt_scan_probe_vendor(struct zt_dev *z, u8 channel)
+/*
+ * 厂商 5G probe request 的原样重放：WLAN 头 8 + 28 字节描述符 + 102 字节帧 = 138，补零到 144。
+ * 与 2.4G 模板的差异（re/REPORT_5GHZ.md §2.2/§2.3）：Supported Rates 换成纯 OFDM、删掉
+ * Extended Supported Rates(50) 与 DS 参数(3)，厂商 IE(191)/(255) 载荷不同。
+ * 注意：5G 帧里没有任何"当前信道"字节，数组下标 80 落在 HT Capabilities 载荷内，
+ * 绝不能像 2.4G 那样写信道号（那会破坏 HT Capabilities 的 MCS 集，见报告 §2.4）。
+ * 与抓包逐字节核对：python tools/verify_probe_5g.py
+ */
+static const u8 vendor_probe_5g[144] = {
+	0x57, 0x4c, 0x41, 0x4e, 0x82, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+	0x66, 0x00, 0x00, 0x07, 0x00, 0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00,
+	0x40, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xb4, 0x01,
+	0x1a, 0x00, 0x12, 0x64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x08, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
+	0x2d, 0x1a, 0xff, 0x09, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x2c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0xbf, 0x0c, 0xb1, 0x71, 0x90, 0x03, 0xfa, 0xff,
+	0x0c, 0x03, 0xfa, 0xff, 0x0c, 0x03, 0xff, 0x16, 0x23, 0x00, 0x00, 0x02,
+	0x00, 0x00, 0x00, 0x04, 0xe0, 0x2f, 0x64, 0x0d, 0xc0, 0x6f, 0x04, 0x80,
+	0x30, 0x00, 0xfa, 0xff, 0xfa, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+/* 频率 -> 信道号（用 wiphy 表里的 hw_value，2484 因此得到 14 而不是 (f-2407)/5=15） */
+static u8 zt_chan_hw_value(struct zt_dev *z, u16 freq)
 {
+	struct ieee80211_channel *c;
+
+	if (!READ_ONCE(z->hw))
+		return 0;
+	c = ieee80211_get_channel(z->hw->wiphy, freq);
+	return c ? (u8)c->hw_value : 0;
+}
+
+static int zt_scan_probe_vendor(struct zt_dev *z, u16 freq)
+{
+	bool is_5g = freq > 2500;
+	u16 seq = z->tx_seq & 0x0fff;		/* 描述符 +0x0e 与 802.11 序号同值（78/78） */
 	u8 *b = z->txd;
-	u16 total = sizeof(vendor_probe_139);
+	const u8 *tpl;
+	u16 total;
 
 	if (!b)
 		return -ENODEV;
-	memcpy(b, vendor_probe_139, sizeof(vendor_probe_139));
+	if (is_5g) {
+		tpl = vendor_probe_5g;
+		total = sizeof(vendor_probe_5g);
+	} else {
+		tpl = vendor_probe_139;
+		total = sizeof(vendor_probe_139);
+	}
+	memcpy(b, tpl, total);
 	put_unaligned_le16(z->tx_seq++, b + 8 + 14);	/* 描述符 +0x0e：序号 */
-	b[80] = channel;				/* DS 参数：当前信道 */
+	put_unaligned_le16(seq << 4, b + 8 + 28 + 22);	/* 802.11 seq_ctrl：与描述符同值 */
+	if (!is_5g)
+		b[80] = zt_chan_hw_value(z, freq);	/* DS 参数：仅 2.4G 帧有 */
 	while (total & 7)				/* 与抓包一致的 8 字节对齐 */
 		b[total++] = 0;
 	if (zt_tx_raw(z, b, total))
@@ -895,16 +944,21 @@ static int zt_scan_probe_vendor(struct zt_dev *z, u8 channel)
 	return 0;
 }
 
-/* 广播 probe request（SSID 通配 + 基本/扩展速率 + HT 能力 + 当前信道） */
-static int zt_scan_probe(struct zt_dev *z, u8 channel)
+/* 广播 probe request（SSID 通配 + 速率 + HT 能力；2.4G 另有扩展速率与 DS 参数） */
+static int zt_scan_probe(struct zt_dev *z, u16 freq)
 {
-	static const u8 rates[8] = { 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24 };
-	static const u8 xrates[4] = { 0x30, 0x48, 0x60, 0x6c };
+	/* 2.4G：CCK/B + OFDM 混合速率；5G：纯 OFDM（厂商 5G probe 的 rates IE，
+	 * re/REPORT_5GHZ.md §2.2）。5G 帧里没有 DS 参数 IE，也没有扩展速率 IE。 */
+	static const u8 rates_2ghz[8] = { 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24 };
+	static const u8 xrates_2ghz[4] = { 0x30, 0x48, 0x60, 0x6c };
+	static const u8 rates_5ghz[8] = { 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c };
 	static const u8 ht[28] = {
 		0x2d, 0x1a, 0xff, 0x09, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x01,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x01, 0x01, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	};
+	bool is_5g = freq > 2500;
+	u16 seq = z->tx_seq & 0x0fff;
 	u8 f[24 + 2 + 10 + 6 + 3 + sizeof(ht)];
 	u16 n = 24;
 
@@ -913,14 +967,17 @@ static int zt_scan_probe(struct zt_dev *z, u8 channel)
 	memset(f + 4, 0xff, 6);			/* DA = 广播 */
 	memcpy(f + 10, z->mac, 6);		/* SA = 本机 MAC */
 	memset(f + 16, 0xff, 6);		/* BSSID = 广播 */
-	put_unaligned_le16(0x00e0, f + 22);	/* 序号 */
+	put_unaligned_le16(seq << 4, f + 22);	/* 序号（描述符 +0x0e 由 zt_tx_frame 用同值） */
 
 	f[n++] = 0x00; f[n++] = 0x00;		/* SSID：通配 */
-	f[n++] = 0x01; f[n++] = sizeof(rates);
-	memcpy(f + n, rates, sizeof(rates)); n += sizeof(rates);
-	f[n++] = 0x32; f[n++] = sizeof(xrates);
-	memcpy(f + n, xrates, sizeof(xrates)); n += sizeof(xrates);
-	f[n++] = 0x03; f[n++] = 0x01; f[n++] = channel;	/* DS 参数 = 当前信道 */
+	f[n++] = 0x01; f[n++] = 8;
+	memcpy(f + n, is_5g ? rates_5ghz : rates_2ghz, 8); n += 8;
+	if (!is_5g) {
+		f[n++] = 0x32; f[n++] = sizeof(xrates_2ghz);
+		memcpy(f + n, xrates_2ghz, sizeof(xrates_2ghz)); n += sizeof(xrates_2ghz);
+		f[n++] = 0x03; f[n++] = 0x01;	/* DS 参数 = 当前信道（仅 2.4G） */
+		f[n++] = zt_chan_hw_value(z, freq);
+	}
 	memcpy(f + n, ht, sizeof(ht)); n += sizeof(ht);
 
 	if (zt_tx_frame(z, f, n))
@@ -1034,6 +1091,8 @@ static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
 	st->chain_signal[0] = rssi;
 
 	freq = get_unaligned_le16(d + 0x2A);
+	if (freq > 2500)
+		z->rx_frames_5g++;
 	chan = freq ? ieee80211_get_channel(z->hw->wiphy, freq) : NULL;
 	if (chan) {
 		z->rx_freq_desc++;
@@ -1298,6 +1357,7 @@ static struct ieee80211_channel zt_ch_2ghz[] = {
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11, .max_power = 20 },
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .hw_value = 12, .max_power = 20 },
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .hw_value = 13, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2484, .hw_value = 14, .max_power = 20 },
 };
 
 static struct ieee80211_rate zt_rates_2ghz[] = {
@@ -1313,6 +1373,60 @@ static struct ieee80211_supported_band zt_band_2ghz = {
 	.n_channels = ARRAY_SIZE(zt_ch_2ghz),
 	.bitrates = zt_rates_2ghz,
 	.n_bitrates = ARRAY_SIZE(zt_rates_2ghz),
+};
+
+/*
+ * M3.6 5GHz：厂商一轮扫描覆盖的标准 20MHz 栅格 25 个信道（re/REPORT_5GHZ.md §1.3/§4.1）。
+ * 速率表用纯 OFDM 6..54Mbps —— 依据是厂商 5G probe request 的 Supported Rates IE
+ * = 0c 12 18 24 30 48 60 6c（同一份报告 §2.2）；2.4G 那份是 CCK/B + OFDM 混合。
+ * DFS/NO_IR 标志不在这里写死：由 cfg80211 按当前监管域标注，扫描只做被动接收即可；
+ * 主动探测（scan_probe=1/2）会跳过被标 NO_IR/RADAR 的信道。
+ */
+static struct ieee80211_channel zt_ch_5ghz[] = {
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64,  .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .hw_value = 100, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .hw_value = 104, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .hw_value = 108, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .hw_value = 112, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .hw_value = 116, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .hw_value = 120, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .hw_value = 124, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .hw_value = 128, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .hw_value = 132, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .hw_value = 136, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .hw_value = 140, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .hw_value = 144, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161, .max_power = 20 },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165, .max_power = 20 },
+};
+
+static struct ieee80211_rate zt_rates_5ghz[] = {
+	{ .bitrate = 60,  .hw_value = 0 },
+	{ .bitrate = 90,  .hw_value = 1 },
+	{ .bitrate = 120, .hw_value = 2 },
+	{ .bitrate = 180, .hw_value = 3 },
+	{ .bitrate = 240, .hw_value = 4 },
+	{ .bitrate = 360, .hw_value = 5 },
+	{ .bitrate = 480, .hw_value = 6 },
+	{ .bitrate = 540, .hw_value = 7 },
+};
+
+static struct ieee80211_supported_band zt_band_5ghz = {
+	.band = NL80211_BAND_5GHZ,
+	.channels = zt_ch_5ghz,
+	.n_channels = ARRAY_SIZE(zt_ch_5ghz),
+	.bitrates = zt_rates_5ghz,
+	.n_bitrates = ARRAY_SIZE(zt_rates_5ghz),
 };
 
 static struct zt_dev *zt_from_hw(struct ieee80211_hw *hw)
@@ -1562,6 +1676,9 @@ static void zt_scan_work(struct work_struct *w)
 	 * "本次扫描有没有收到响应"（曾因此误判为没有发射）。 */
 	z->tx_frames = 0;
 	z->tx_probes = 0;
+	z->scan_probe_skip = 0;
+	z->scan_ch_5g = 0;
+	z->rx_frames_5g = 0;
 	z->rx_beacons = 0;
 	z->rx_probe_resp = 0;
 	z->rx_freq_desc = 0;
@@ -1589,13 +1706,25 @@ static void zt_scan_work(struct work_struct *w)
 		put_unaligned_le16(f, chan + 4);
 		put_unaligned_le16(20, chan + 10);
 		WRITE_ONCE(z->scan_freq, f);
+		if (f > 2500)
+			z->scan_ch_5g++;
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
-		msleep(20);			/* 让信道先稳定下来 */
-		if (scan_probe == 1)
-			zt_scan_probe(z, (u8)((f - 2407) / 5));
-		else if (scan_probe == 2)
-			zt_scan_probe_vendor(z, (u8)((f - 2407) / 5));
+		msleep(20);			/* 让信道先稳定（厂商 SET_CHANNEL→TX 中位 16ms） */
+		if (scan_probe) {
+			struct ieee80211_channel *ch = z->hw ?
+				ieee80211_get_channel(z->hw->wiphy, f) : NULL;
+
+			/* DFS/NO_IR 信道不做主动探测（合规；这些标志由 cfg80211 按
+			 * 当前监管域打在信道表上）。默认是被动扫描，不受影响。 */
+			if (ch && (ch->flags & (IEEE80211_CHAN_NO_IR |
+						IEEE80211_CHAN_RADAR)))
+				z->scan_probe_skip++;
+			else if (scan_probe == 1)
+				zt_scan_probe(z, f);
+			else
+				zt_scan_probe_vendor(z, f);
+		}
 		msleep(ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
@@ -1609,16 +1738,18 @@ out:
 	WRITE_ONCE(z->scan_freq, 0);
 	WRITE_ONCE(z->scan_running, false);
 	dev_info(&z->intf->dev,
-		 "scan: 结束（%s）tx=%lu probe=%lu beacon=%lu probe-resp=%lu\n",
+		 "scan: 结束（%s）tx=%lu probe=%lu(跳过 %lu) beacon=%lu probe-resp=%lu 5G信道=%lu\n",
 		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
-		 z->rx_beacons, z->rx_probe_resp);
+		 z->scan_probe_skip, z->rx_beacons, z->rx_probe_resp,
+		 z->scan_ch_5g);
 	dev_info(&z->intf->dev,
 		 "scan: RX type 0x0000=%lu 0x0004=%lu 0x0100=%lu 0x0300=%lu 其它=%lu(last=%#06x)\n",
 		 z->rx_type_cnt[0], z->rx_type_cnt[1], z->rx_type_cnt[2],
 		 z->rx_type_cnt[3], z->rx_type_cnt[4], z->last_other_type);
 	dev_info(&z->intf->dev,
-		 "scan: RX 状态来源 描述符频率=%lu 退回信道=%lu 描述符频率!=扫描信道=%lu RSSI兜底=%lu\n",
-		 z->rx_freq_desc, z->rx_freq_fb, z->rx_freq_ne_scan, z->rx_rssi_fb);
+		 "scan: RX 状态来源 描述符频率=%lu 退回信道=%lu 描述符频率!=扫描信道=%lu RSSI兜底=%lu 5G帧=%lu\n",
+		 z->rx_freq_desc, z->rx_freq_fb, z->rx_freq_ne_scan, z->rx_rssi_fb,
+		 z->rx_frames_5g);
 	dev_info(&z->intf->dev,
 		 "scan: 未预期 IPC: %#06x x%lu | %#06x x%lu | %#06x x%lu | %#06x x%lu\n",
 		 z->unk_ids[0], z->unk_cnt[0], z->unk_ids[1], z->unk_cnt[1],
@@ -1710,6 +1841,7 @@ static void zt_mac_register(struct zt_dev *z)
 	ieee80211_hw_set(hw, SIGNAL_DBM);
 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	hw->wiphy->bands[NL80211_BAND_2GHZ] = &zt_band_2ghz;
+	hw->wiphy->bands[NL80211_BAND_5GHZ] = &zt_band_5ghz;
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
 	SET_IEEE80211_PERM_ADDR(hw, z->mac);
