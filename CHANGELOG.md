@@ -8,6 +8,12 @@
 ## [Unreleased]
 
 ### Added
+- **M3.4 TX 数据路径（侦查 + 初步实现）**：从 Windows 抓包还原出 TX 走 **EP5-OUT**，
+  线上格式为 `WLAN 头 + 28 字节描述符 + 802.11 帧`（描述符 +0x04 是 802.11 帧长，
+  +0x0e 是逐帧递增序号，与同族 AIC8800 的 `txdesc_host` 同源）。
+  驱动侧新增 `zt_tx_frame()` 与 `zt_scan_probe()`，扫描时可主动发 probe request，
+  由模块参数 `scan_probe`（**默认 0**）控制；扫描结束日志新增
+  `tx= / probe= / beacon= / probe-resp=` 统计
 - **M3.2 扫描**：实现 `hw_scan`（被动扫描）与 RX 数据路径。实机验证：
   `iw dev <iface> scan` 返回 **42 个 BSS**（含 SSID、信道、WPA2、HT/VHT 能力），
   13 个信道约 1.7 秒，`dmesg` 无 oops
@@ -20,6 +26,9 @@
   Ubuntu 24.04 / 内核 `7.0.0-31-generic`
 
 ### Fixed
+- TX 帧必须带 8 字节 `WLAN` 头：首版 `zt_tx_frame()` 直接把 28 字节描述符当帧头发送，
+  固件解析失败并断言，设备复位回 ROM 模式重枚举（现象为扫描中止 + 设备掉线）。
+  补上 `WLAN` + `hlen = 28 + 帧长` + `type = 0x0000` 后设备不再崩溃
 - **修复「开机自动加载后整机失联」的根因（原 D10）**：注册 wiphy 时缺少
   `SET_IEEE80211_DEV()`，`wiphy_dev(wiphy)` 为 NULL。无线接口出现后 NetworkManager
   立即通过 `SIOCETHTOOL` 查询驱动信息，`cfg80211_get_drvinfo()` 空指针崩溃并带关中断
@@ -36,11 +45,12 @@
 - README 与 FAQ 更新 D10 的根因说明：原先怀疑的 xhci 枚举抖动、udev worker 阻塞均不成立
 
 ### Planned
-- M3.3 关联：`wpa_supplicant` 关联成功（需要关联过程的 RX 事件解析）
-- M3.4 数据面：TX 描述符格式与主动扫描所需的 probe request 发送
+- M3.4 收尾：把 TX 描述符字段语义完全解码（目前只是逐字节重放），让主动扫描收到
+  probe response；厂商抓包里有 94 个 probe response，说明设备的 RX 路径会放行
+- M3.3 关联：`wpa_supplicant` 关联成功（需要关联过程的 RX 事件解析，依赖 TX 路径）
 - 解码 RX 描述符里的 RSSI 字段，让扫描结果的信号强度可信
 - 清理 `driver/zt9612.c` 中历史遗留的乱码注释（需与编译验证一起做）
-- 复验卸载路径：修复后尚未专门做过「加载后 rmmod」的验证（原 D9）
+- 复验卸载路径：`rmmod` 只在"设备未绑定"场景验证过 0 秒返回，已绑定场景待验（原 D9）
 
 ## [0.1.0] - 2026-09-24
 

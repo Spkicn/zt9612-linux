@@ -44,6 +44,16 @@
 #define T_RX_DATA0	0x0000		/* RX 数据帧（描述符 48 字节） */
 #define T_RX_DATA4	0x0004		/* RX 数据帧（描述符 52 字节） */
 
+/* M3.4 TX 数据路径（从抓包还原，见 re/REPORT_M32_RX_PATH.md 与 analyze_tx.py）
+ *   EP5-OUT + WLAN 帧 type=0x0000，28 字节描述符后接 802.11 帧
+ *   描述符: +0x00 u32 0xffffffff | +0x04 u16 帧长 | +0x06 u16 0x0700
+ *           +0x08 u16 0xff00 | +0x0a u16 0x0005 | +0x0e u16 序号
+ *           +0x1a u16 0x003f
+ */
+#define EP_TX_NUM	5
+#define TX_DESC_LEN	28
+#define TX_TYPE_DATA	0x0000		/* TX 数据帧的 WLAN type（与 RX 侧 0x0000 同值） */
+
 #define T_IPC		0x0100
 #define T_FW_WRITE	0x0200
 #define T_FW_START	0x0201
@@ -65,6 +75,15 @@ MODULE_PARM_DESC(do_init, "run the synchronous IPC init sequence after boot (def
 static int do_boot = 1;
 module_param(do_boot, int, 0644);
 MODULE_PARM_DESC(do_boot, "download firmware (default 1); set 0 to reuse an already running firmware");
+
+/*
+ * M3.4 实验开关：扫描时是否主动发 probe request（TX 数据路径，EP5-OUT）。
+ * 默认 0：主动发送的 TX 描述符尚未验证成功（帧能发出、设备不再崩溃，但收不到
+ * probe response），因此默认只做已验证的被动扫描（只听 beacon）。
+ */
+static int scan_probe;
+module_param(scan_probe, int, 0644);
+MODULE_PARM_DESC(scan_probe, "send active probe requests during scan (default 0, experimental)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -95,6 +114,15 @@ struct zt_dev {
 	bool			scan_active;
 	bool			scan_aborted;
 	bool			scan_running;
+
+	/* M3.4 TX：EP5-OUT + 28 字节描述符 */
+	u8			ep_tx;
+	u8			*txd;
+	u16			tx_seq;
+	unsigned long		tx_frames;
+	unsigned long		tx_probes;
+	unsigned long		rx_beacons;
+	unsigned long		rx_probe_resp;
 
 	struct miscdevice	misc;
 	bool			misc_ok;
@@ -564,6 +592,86 @@ out:
 
 /* ------------------------------------------------------------------ 鏉╂劘顢戦弮鑸靛复閺€?*/
 
+/* ------------------------------------------------------------------ TX 数据路径（M3.4） */
+
+/*
+ * 把一条 802.11 帧交给设备发送：EP5-OUT。
+ * 线上格式与其它帧一致：WLAN 头 + 28 字节描述符 + 802.11 帧，
+ * 其中 WLAN 头的 hlen = 28 + 帧长（抓包实测：111 字节的 probe request → hlen=139）。
+ * 第 9 轮教训：漏掉 WLAN 头直接发描述符会让固件断言、设备复位回 ROM 模式。
+ */
+static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
+{
+	u8 *buf = z->txd;
+	u8 *d;
+	u16 total;
+	int ret, sent = 0;
+
+	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
+		return -ENODEV;
+	if (flen < 10 || flen > MAX_FRAME - TX_DESC_LEN - 8)
+		return -EINVAL;
+
+	d = buf + 8;
+	memset(d, 0, TX_DESC_LEN);
+	put_unaligned_le32(0xffffffff, d + 0);
+	put_unaligned_le16(flen, d + 4);
+	put_unaligned_le16(0x0700, d + 6);
+	put_unaligned_le16(0xff00, d + 8);
+	put_unaligned_le16(0x0005, d + 10);
+	put_unaligned_le16(z->tx_seq++, d + 14);
+	put_unaligned_le16(0x003f, d + 26);
+	memcpy(d + TX_DESC_LEN, frame, flen);
+
+	memcpy(buf, "WLAN", 4);
+	put_unaligned_le16(TX_DESC_LEN + flen, buf + 4);
+	put_unaligned_le16(TX_TYPE_DATA, buf + 6);
+	total = 8 + TX_DESC_LEN + flen;
+
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_tx),
+			   buf, total, &sent, 1000);
+	if (ret) {
+		dev_warn(&z->intf->dev, "tx: bulk OUT 失败 (%d)\n", ret);
+		return ret;
+	}
+	z->tx_frames++;
+	return 0;
+}
+
+/* 广播 probe request（SSID 通配 + 基本/扩展速率 + HT 能力 + 当前信道） */
+static int zt_scan_probe(struct zt_dev *z, u8 channel)
+{
+	static const u8 rates[8] = { 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24 };
+	static const u8 xrates[4] = { 0x30, 0x48, 0x60, 0x6c };
+	static const u8 ht[28] = {
+		0x2d, 0x1a, 0xff, 0x09, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x01, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	};
+	u8 f[24 + 2 + 10 + 6 + 3 + sizeof(ht)];
+	u16 n = 24;
+
+	put_unaligned_le16(0x0040, f + 0);	/* probe request */
+	put_unaligned_le16(0x0000, f + 2);
+	memset(f + 4, 0xff, 6);			/* DA = 广播 */
+	memcpy(f + 10, z->mac, 6);		/* SA = 本机 MAC */
+	memset(f + 16, 0xff, 6);		/* BSSID = 广播 */
+	put_unaligned_le16(0x00e0, f + 22);	/* 序号 */
+
+	f[n++] = 0x00; f[n++] = 0x00;		/* SSID：通配 */
+	f[n++] = 0x01; f[n++] = sizeof(rates);
+	memcpy(f + n, rates, sizeof(rates)); n += sizeof(rates);
+	f[n++] = 0x32; f[n++] = sizeof(xrates);
+	memcpy(f + n, xrates, sizeof(xrates)); n += sizeof(xrates);
+	f[n++] = 0x03; f[n++] = 0x01; f[n++] = channel;	/* DS 参数 = 当前信道 */
+	memcpy(f + n, ht, sizeof(ht)); n += sizeof(ht);
+
+	if (zt_tx_frame(z, f, n))
+		return -EIO;
+	z->tx_probes++;
+	return 0;
+}
+
 /*
  * M3.2：扫描期间把 RX 数据帧里的 802.11 帧交给 mac80211。
  * RX 帧格式（第 9 轮实测）：WLAN 头 + 每帧描述符 + 802.11 帧；
@@ -597,6 +705,16 @@ static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
 	if (!skb)
 		return;
 	skb_put_data(skb, buf + 8 + off, flen);
+
+	/* 统计：beacon(0x80) 与 probe response(0x50)，用于验证 TX 是否真的发出去了 */
+	if (flen >= 24) {
+		u16 fc = get_unaligned_le16(buf + 8 + off);
+
+		if ((fc & 0x00fc) == 0x0080)
+			z->rx_beacons++;
+		else if ((fc & 0x00fc) == 0x0050)
+			z->rx_probe_resp++;
+	}
 
 	st = IEEE80211_SKB_RXCB(skb);
 	memset(st, 0, sizeof(*st));
@@ -960,6 +1078,9 @@ static void zt_scan_work(struct work_struct *w)
 		WRITE_ONCE(z->scan_freq, f);
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
+		msleep(20);			/* 让信道先稳定下来 */
+		if (scan_probe)
+			zt_scan_probe(z, (u8)((f - 2407) / 5));	/* M3.4 实验 */
 		msleep(ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
@@ -972,7 +1093,10 @@ out:
 	WRITE_ONCE(z->scan_active, false);
 	WRITE_ONCE(z->scan_freq, 0);
 	WRITE_ONCE(z->scan_running, false);
-	dev_info(&z->intf->dev, "scan: 结束（%s）\n", done ? "完成" : "中止");
+	dev_info(&z->intf->dev,
+		 "scan: 结束（%s）tx=%lu probe=%lu beacon=%lu probe-resp=%lu\n",
+		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
+		 z->rx_beacons, z->rx_probe_resp);
 	mutex_unlock(&z->lock);
 
 	if (READ_ONCE(z->alive) && z->hw) {
@@ -1109,6 +1233,10 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		if (usb_endpoint_num(ep) == EP_IN_NUM && usb_endpoint_dir_in(ep) &&
 		    usb_endpoint_is_bulk_in(ep))
 			z->ep_in = ep->bEndpointAddress;
+		/* M3.4：EP5-OUT 是数据发送端点（抓包实测） */
+		if (usb_endpoint_num(ep) == EP_TX_NUM && usb_endpoint_dir_out(ep) &&
+		    usb_endpoint_is_bulk_out(ep))
+			z->ep_tx = ep->bEndpointAddress;
 		dev_info(&intf->dev, "  ep %#04x %s\n", ep->bEndpointAddress,
 			 usb_endpoint_dir_in(ep) ? "IN" : "OUT");
 	}
@@ -1116,11 +1244,14 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		ret = -ENODEV;
 		goto err;
 	}
+	if (!z->ep_tx)
+		dev_warn(&intf->dev, "未找到 EP%u-OUT，TX 数据路径不可用\n", EP_TX_NUM);
 
 	z->tx = kmalloc(MAX_FRAME, GFP_KERNEL);
 	z->pl = kmalloc(MAX_PAYLOAD, GFP_KERNEL);
 	z->rx = kmalloc(MAX_FRAME, GFP_KERNEL);
-	if (!z->tx || !z->pl || !z->rx) {
+	z->txd = kmalloc(MAX_FRAME, GFP_KERNEL);
+	if (!z->tx || !z->pl || !z->rx || !z->txd) {
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -1184,6 +1315,7 @@ err_kfifo:
 	kfifo_free(&z->rx_fifo);
 err:
 	kfree(z->tx);
+	kfree(z->txd);
 	kfree(z->pl);
 	kfree(z->rx);
 	kfree(z->mac);
@@ -1223,6 +1355,7 @@ static void zt_disconnect(struct usb_interface *intf)
 	}
 	kfifo_free(&z->rx_fifo);
 	kfree(z->tx);
+	kfree(z->txd);
 	kfree(z->pl);
 	kfree(z->rx);
 	kfree(z->mac);

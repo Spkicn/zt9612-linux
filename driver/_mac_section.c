@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * zt9612.c 的内联 mac80211 段（M3.1 + M3.2 扫描）——只读摘录，不参与编译。
+ * zt9612.c 的内联 mac80211 段（M3.1 + M3.2 扫描 + M3.4 TX）——只读摘录，不参与编译。
  *
  * 本文件不是构建输入（Makefile 只编译 zt9612.o）。它的唯一作用是方便单独阅读
  * mac80211 部分，改它不会影响编译结果。
@@ -187,6 +187,9 @@ static void zt_scan_work(struct work_struct *w)
 		WRITE_ONCE(z->scan_freq, f);
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
+		msleep(20);			/* 让信道先稳定下来 */
+		if (scan_probe)
+			zt_scan_probe(z, (u8)((f - 2407) / 5));	/* M3.4 实验 */
 		msleep(ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
@@ -199,7 +202,10 @@ out:
 	WRITE_ONCE(z->scan_active, false);
 	WRITE_ONCE(z->scan_freq, 0);
 	WRITE_ONCE(z->scan_running, false);
-	dev_info(&z->intf->dev, "scan: 结束（%s）\n", done ? "完成" : "中止");
+	dev_info(&z->intf->dev,
+		 "scan: 结束（%s）tx=%lu probe=%lu beacon=%lu probe-resp=%lu\n",
+		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
+		 z->rx_beacons, z->rx_probe_resp);
 	mutex_unlock(&z->lock);
 
 	if (READ_ONCE(z->alive) && z->hw) {
