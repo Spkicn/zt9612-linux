@@ -8,6 +8,16 @@
 ## [Unreleased]
 
 ### Added
+- **M3.4 数据面打通**：关联开放 AP 后，广播 ARP 请求能出网并收到网关应答，单播回包正常回收，
+  IPv4 组播（mDNS/IGMP）与 IPv6（RS/MLD）数据帧均正常收发；主动扫描实测
+  `probe=13 → probe-resp=22`。判定依据：同链路 ARP 完整往返，说明收发路径本身无缺陷，
+  DHCP 未拿到地址是该 AP 的行为（其网段与其他 STA 使用的网段并存）
+- **扫描日志与观测**：扫描开始清零计数，扫描结束打印 `tx/probe/beacon/probe-resp`、
+  RX 类型分布、**RX 状态来源**（描述符频率 / 退回信道 / 描述符频率≠扫描信道 / RSSI 兜底）
+- **RX 真实信号强度与信道**：`rx_status.signal` 取归一化描述符 `+0x0E`（int8 dBm，带
+  -95..-20 兜底），`freq/band` 取 `+0x2A` 并在 wiphy 反查。实测 25 个不同取值、-94~-23 dBm、
+  连扫两次平均差 0.53 dB、频率与各 AP 自报 DS IE 55/55 一致。**注意必须
+  `ieee80211_hw_set(hw, SIGNAL_DBM)`**，否则 mac80211 不会把 signal 交给 cfg80211
 - **M3.3 关联打通（认证 + 关联均成功）**：实机 `iw dev <iface> connect -w WiFi_123456789` 返回
   `connected to 48:7d:2e:6b:88:20`，驱动侧 `bss_info ... assoc=1 aid=1`，接口进入 `LOWER_UP`；
   关联后 `iw dev <iface> link` 显示 `tx bitrate 1.0 MBit/s`、DTIM/beacon 间隔等来自真实 AP 的信息
