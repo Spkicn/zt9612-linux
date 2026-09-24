@@ -78,12 +78,14 @@ MODULE_PARM_DESC(do_boot, "download firmware (default 1); set 0 to reuse an alre
 
 /*
  * M3.4 实验开关：扫描时是否主动发 probe request（TX 数据路径，EP5-OUT）。
- * 默认 0：主动发送的 TX 描述符尚未验证成功（帧能发出、设备不再崩溃，但收不到
- * probe response），因此默认只做已验证的被动扫描（只听 beacon）。
+ *   0 = 被动扫描（默认，已验证：只听 beacon）
+ *   1 = 发送本驱动自建的广播 probe request
+ *   2 = 逐字节重放抓包里厂商的 probe request（用于区分"帧内容问题"与"描述符/状态问题"）
+ * 主动发送尚未验证成功（收不到 probe response），因此默认 0。
  */
 static int scan_probe;
 module_param(scan_probe, int, 0644);
-MODULE_PARM_DESC(scan_probe, "send active probe requests during scan (default 0, experimental)");
+MODULE_PARM_DESC(scan_probe, "0=passive scan (default), 1=send own probe request, 2=replay vendor probe");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -105,6 +107,7 @@ struct zt_dev {
 
 	struct delayed_work	hb_work;
 	unsigned long		last_hb;
+	u32			hb_seq;
 
 	/* M3.2 扫描：hw_scan 在工作队列里逐个信道切换，期间把 RX 帧交给 mac80211 */
 	struct work_struct	scan_work;
@@ -123,6 +126,14 @@ struct zt_dev {
 	unsigned long		tx_probes;
 	unsigned long		rx_beacons;
 	unsigned long		rx_probe_resp;
+	/* 观测：扫描期间收到的帧类型分布 + 未识别的 IPC 消息 id */
+	unsigned long		rx_type_cnt[5];	/* 0:0x0000 1:0x0004 2:0x0100 3:0x0300 4:其它 */
+	u16			last_other_type;
+	u16			unk_ids[4];
+	unsigned long		unk_cnt[4];
+	/* 观测：设备发来的所有 IPC 消息 id（对比厂商抓包，找缺失的通知） */
+	u16			seen_ids[16];
+	unsigned long		seen_cnt[16];
 
 	struct miscdevice	misc;
 	bool			misc_ok;
@@ -132,6 +143,8 @@ struct zt_dev {
 
 	struct mutex		lock;
 };
+
+static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len);
 
 /* ------------------------------------------------------------------ 閸╄櫣顢?*/
 
@@ -184,6 +197,8 @@ static int zt_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
 		return -EPROTO;
 	*len = got;
 	*type = (u16)z->rx[6] | ((u16)z->rx[7] << 8);
+	if (*type == T_IPC)
+		zt_note_msg(z, z->rx, got);
 	return 0;
 }
 
@@ -205,10 +220,10 @@ static void zt_heartbeat(struct zt_dev *z)
 	slen = strlen(stamp) + 1;
 
 	put_unaligned_le16(0x05C2, pl + 0);
-	put_unaligned_le16(0, pl + 2);
+	put_unaligned_le16(0x05C2 >> 10, pl + 2);	/* 心跳的 dest 也是 1（抓包实测） */
 	put_unaligned_le16(100, pl + 4);
 	put_unaligned_le16(4 + slen, pl + 6);
-	memset(pl + 8, 0, 4);
+	put_unaligned_le32(z->hb_seq++, pl + 8);	/* 厂商是递增序号 */
 	memcpy(pl + 12, stamp, slen);
 
 	if (!zt_send(z, T_IPC, pl, 8 + 4 + slen))
@@ -239,7 +254,12 @@ static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	int ret;
 
 	put_unaligned_le16(id, msg + 0);
-	put_unaligned_le16(0, msg + 2);
+	/*
+	 * dest_id 必须等于消息编号里的 task 字段（id >> 10）。
+	 * 抓包实测：MM 段（0x00xx）dest=0，厂商段 0x050e 与心跳 0x05c2 都是 dest=1。
+	 * 早期实现把 dest 写死成 0，导致 0x050e 那 4 条配置消息投递给了错误的固件任务。
+	 */
+	put_unaligned_le16(id >> 10, msg + 2);
 	put_unaligned_le16(100, msg + 4);
 	put_unaligned_le16(plen, msg + 6);
 	if (plen && params)
@@ -327,7 +347,7 @@ static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	int ret;
 
 	put_unaligned_le16(id, msg + 0);
-	put_unaligned_le16(0, msg + 2);
+	put_unaligned_le16(id >> 10, msg + 2);	/* dest = task 字段，见 zt_cmd 注释 */
 	put_unaligned_le16(100, msg + 4);
 	put_unaligned_le16(plen, msg + 6);
 	if (plen && params)
@@ -351,8 +371,27 @@ static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 			continue;
 		if (type != T_IPC || len < 8)
 			continue;
-		if (get_unaligned_le16(z->rx + 8) == (u16)want_cfm)
-			return 0;
+		{
+			u16 id = get_unaligned_le16(z->rx + 8);
+			int k, slot = -1;
+
+			if (id == (u16)want_cfm)
+				return 0;
+			/* 观测：记录未预期的 IPC 消息 id（TX 确认/错误可能在里面） */
+			for (k = 0; k < 4; k++) {
+				if (z->unk_ids[k] == id) {
+					z->unk_cnt[k]++;
+					slot = -2;
+					break;
+				}
+				if (slot < 0 && z->unk_ids[k] == 0)
+					slot = k;
+			}
+			if (slot >= 0) {
+				z->unk_ids[slot] = id;
+				z->unk_cnt[slot] = 1;
+			}
+		}
 	}
 	dev_warn(&z->intf->dev, "scan: timeout waiting for cfm %#06x\n", want_cfm);
 	return -ETIMEDOUT;
@@ -627,6 +666,12 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 	put_unaligned_le16(TX_DESC_LEN + flen, buf + 4);
 	put_unaligned_le16(TX_TYPE_DATA, buf + 6);
 	total = 8 + TX_DESC_LEN + flen;
+	/*
+	 * 抓包实测：EP5 的传输长度是 8 的倍数（147→152、138→144），不足处补零。
+	 * 推测是 TX 路径的 DMA/对齐要求；不对齐的帧可能被固件丢掉。
+	 */
+	while (total & 7)
+		buf[total++] = 0;
 
 	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_tx),
 			   buf, total, &sent, 1000);
@@ -635,6 +680,61 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		return ret;
 	}
 	z->tx_frames++;
+	return 0;
+}
+
+/* 发送一条已经带好 WLAN 头的原始帧（用于逐字节重放厂商 probe） */
+static int zt_tx_raw(struct zt_dev *z, const u8 *wlan_frame, u16 total)
+{
+	int ret, sent = 0;
+
+	if (!READ_ONCE(z->alive) || !z->ep_tx)
+		return -ENODEV;
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_tx),
+			   (u8 *)wlan_frame, total, &sent, 1000);
+	if (ret) {
+		dev_warn(&z->intf->dev, "tx(raw): bulk OUT 失败 (%d)\n", ret);
+		return ret;
+	}
+	z->tx_frames++;
+	return 0;
+}
+
+/*
+ * 抓包里厂商 2.4G probe request 的原样重放（WLAN 头 + 28 字节描述符 + 111 字节帧）。
+ * 只改两处：描述符 +0x0e 的序号、DS 参数（数组下标 80）改成当前信道。
+ */
+static const u8 vendor_probe_139[147] = {
+	0x57, 0x4c, 0x41, 0x4e, 0x8b, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+	0x6f, 0x00, 0x00, 0x07, 0x00, 0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00,
+	0x40, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xb4, 0x01,
+	0x1a, 0x00, 0x12, 0x64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x08, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24,
+	0x32, 0x04, 0x30, 0x48, 0x60, 0x6c, 0x03, 0x01, 0x01, 0x2d, 0x1a, 0xff,
+	0x09, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x2c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0xbf, 0x0c, 0x91, 0x71, 0x90, 0x03, 0xfa, 0xff, 0x68, 0x01, 0xfa,
+	0xff, 0x68, 0x01, 0xff, 0x16, 0x23, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+	0x02, 0xe0, 0x2f, 0x64, 0x0d, 0xc0, 0x6f, 0x04, 0x82, 0x30, 0x00, 0xfa,
+	0xff, 0xfa, 0xff,
+};
+
+static int zt_scan_probe_vendor(struct zt_dev *z, u8 channel)
+{
+	u8 *b = z->txd;
+	u16 total = sizeof(vendor_probe_139);
+
+	if (!b)
+		return -ENODEV;
+	memcpy(b, vendor_probe_139, sizeof(vendor_probe_139));
+	put_unaligned_le16(z->tx_seq++, b + 8 + 14);	/* 描述符 +0x0e：序号 */
+	b[80] = channel;				/* DS 参数：当前信道 */
+	while (total & 7)				/* 与抓包一致的 8 字节对齐 */
+		b[total++] = 0;
+	if (zt_tx_raw(z, b, total))
+		return -EIO;
+	z->tx_probes++;
 	return 0;
 }
 
@@ -670,6 +770,31 @@ static int zt_scan_probe(struct zt_dev *z, u8 channel)
 		return -EIO;
 	z->tx_probes++;
 	return 0;
+}
+
+/* 记录一条设备→主机 IPC 消息 id（观测用：与厂商抓包对比，找缺失的通知） */
+static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len)
+{
+	u16 id;
+	int i, slot = -1;
+
+	if (len < 10 || memcmp(frame, "WLAN", 4))
+		return;
+	if (get_unaligned_le16(frame + 6) != T_IPC)
+		return;
+	id = get_unaligned_le16(frame + 8);
+	for (i = 0; i < 16; i++) {
+		if (z->seen_ids[i] == id) {
+			z->seen_cnt[i]++;
+			return;
+		}
+		if (slot < 0 && z->seen_ids[i] == 0)
+			slot = i;
+	}
+	if (slot >= 0) {
+		z->seen_ids[slot] = id;
+		z->seen_cnt[slot] = 1;
+	}
 }
 
 /*
@@ -737,6 +862,23 @@ static void zt_rx_complete(struct urb *urb)
 	}
 	if (urb->status == 0 && len >= 8 && !memcmp(z->rx_buf, "WLAN", 4)) {
 		u16 flen = (u16)len;
+		u16 ftype = get_unaligned_le16(z->rx_buf + 6);
+
+		/* 观测：统计收到的帧类型（扫描期间才有意义） */
+		if (ftype == 0x0000)
+			z->rx_type_cnt[0]++;
+		else if (ftype == 0x0004)
+			z->rx_type_cnt[1]++;
+		else if (ftype == 0x0100)
+			z->rx_type_cnt[2]++;
+		else if (ftype == 0x0300)
+			z->rx_type_cnt[3]++;
+		else {
+			z->rx_type_cnt[4]++;
+			z->last_other_type = ftype;
+		}
+		if (ftype == 0x0100)
+			zt_note_msg(z, z->rx_buf, len);
 
 		if (kfifo_avail(&z->rx_fifo) >= flen + 2) {
 			kfifo_in(&z->rx_fifo, (u8 *)&flen, 2);
@@ -1079,8 +1221,10 @@ static void zt_scan_work(struct work_struct *w)
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
 		msleep(20);			/* 让信道先稳定下来 */
-		if (scan_probe)
-			zt_scan_probe(z, (u8)((f - 2407) / 5));	/* M3.4 实验 */
+		if (scan_probe == 1)
+			zt_scan_probe(z, (u8)((f - 2407) / 5));
+		else if (scan_probe == 2)
+			zt_scan_probe_vendor(z, (u8)((f - 2407) / 5));
 		msleep(ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
@@ -1097,6 +1241,26 @@ out:
 		 "scan: 结束（%s）tx=%lu probe=%lu beacon=%lu probe-resp=%lu\n",
 		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
 		 z->rx_beacons, z->rx_probe_resp);
+	dev_info(&z->intf->dev,
+		 "scan: RX type 0x0000=%lu 0x0004=%lu 0x0100=%lu 0x0300=%lu 其它=%lu(last=%#06x)\n",
+		 z->rx_type_cnt[0], z->rx_type_cnt[1], z->rx_type_cnt[2],
+		 z->rx_type_cnt[3], z->rx_type_cnt[4], z->last_other_type);
+	dev_info(&z->intf->dev,
+		 "scan: 未预期 IPC: %#06x x%lu | %#06x x%lu | %#06x x%lu | %#06x x%lu\n",
+		 z->unk_ids[0], z->unk_cnt[0], z->unk_ids[1], z->unk_cnt[1],
+		 z->unk_ids[2], z->unk_cnt[2], z->unk_ids[3], z->unk_cnt[3]);
+	dev_info(&z->intf->dev,
+		 "scan: 设备消息表(1): %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu\n",
+		 z->seen_ids[0], z->seen_cnt[0], z->seen_ids[1], z->seen_cnt[1],
+		 z->seen_ids[2], z->seen_cnt[2], z->seen_ids[3], z->seen_cnt[3],
+		 z->seen_ids[4], z->seen_cnt[4], z->seen_ids[5], z->seen_cnt[5],
+		 z->seen_ids[6], z->seen_cnt[6], z->seen_ids[7], z->seen_cnt[7]);
+	dev_info(&z->intf->dev,
+		 "scan: 设备消息表(2): %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu %#06x x%lu\n",
+		 z->seen_ids[8], z->seen_cnt[8], z->seen_ids[9], z->seen_cnt[9],
+		 z->seen_ids[10], z->seen_cnt[10], z->seen_ids[11], z->seen_cnt[11],
+		 z->seen_ids[12], z->seen_cnt[12], z->seen_ids[13], z->seen_cnt[13],
+		 z->seen_ids[14], z->seen_cnt[14], z->seen_ids[15], z->seen_cnt[15]);
 	mutex_unlock(&z->lock);
 
 	if (READ_ONCE(z->alive) && z->hw) {

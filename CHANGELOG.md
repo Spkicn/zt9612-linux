@@ -10,10 +10,11 @@
 ### Added
 - **M3.4 TX 数据路径（侦查 + 初步实现）**：从 Windows 抓包还原出 TX 走 **EP5-OUT**，
   线上格式为 `WLAN 头 + 28 字节描述符 + 802.11 帧`（描述符 +0x04 是 802.11 帧长，
-  +0x0e 是逐帧递增序号，与同族 AIC8800 的 `txdesc_host` 同源）。
-  驱动侧新增 `zt_tx_frame()` 与 `zt_scan_probe()`，扫描时可主动发 probe request，
-  由模块参数 `scan_probe`（**默认 0**）控制；扫描结束日志新增
-  `tx= / probe= / beacon= / probe-resp=` 统计
+  +0x0e 是逐帧递增序号，与同族 AIC8800 的 `txdesc_host` 同源），传输长度按
+  `align8(8+hlen)` 补零。驱动侧新增 `zt_tx_frame()` 与 `zt_scan_probe()`，
+  扫描时可主动发 probe request，由模块参数 `scan_probe`（**0=被动，1=自建 probe，
+  2=逐字节重放厂商 probe**）控制；扫描结束日志新增 `tx= / probe= / beacon= /
+  probe-resp=`、RX 类型分布、设备消息表等观测打点
 - **M3.2 扫描**：实现 `hw_scan`（被动扫描）与 RX 数据路径。实机验证：
   `iw dev <iface> scan` 返回 **42 个 BSS**（含 SSID、信道、WPA2、HT/VHT 能力），
   13 个信道约 1.7 秒，`dmesg` 无 oops
@@ -26,6 +27,10 @@
   Ubuntu 24.04 / 内核 `7.0.0-31-generic`
 
 ### Fixed
+- **`dest_id` 必须等于消息编号里的 task 字段（`id >> 10`）**：抓包实测 MM 段为 `dest=0`，
+  而厂商段 `0x050e`（×4，疑似 RF/PHY 配置）与心跳 `0x05c2` 都是 `dest=1`。此前驱动把
+  `dest` 写死为 0，等于把这 4 条配置消息投递给了错误的固件任务。心跳的参数序号（前 4 字节）
+  也改为递增，与厂商一致
 - TX 帧必须带 8 字节 `WLAN` 头：首版 `zt_tx_frame()` 直接把 28 字节描述符当帧头发送，
   固件解析失败并断言，设备复位回 ROM 模式重枚举（现象为扫描中止 + 设备掉线）。
   补上 `WLAN` + `hlen = 28 + 帧长` + `type = 0x0000` 后设备不再崩溃
