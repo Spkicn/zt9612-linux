@@ -1,0 +1,39 @@
+name: checkpatch
+
+# 内核代码风格检查。ERROR 阻塞合并；WARNING / CHECK 只提示 ——
+# 存量代码里还有历史告警，新增代码不应引入新告警（见 CONTRIBUTING.md）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkpatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载 checkpatch.pl（无内核树模式）
+        run: |
+          curl -fsSLO https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl
+          curl -fsSL -o spelling.txt \
+            https://raw.githubusercontent.com/torvalds/linux/master/scripts/spelling.txt || true
+          chmod +x checkpatch.pl
+          perl checkpatch.pl --version || true
+
+      - name: 对驱动源码运行 checkpatch
+        run: |
+          perl checkpatch.pl -f --no-tree --strict --max-line-length=100 \
+            driver/zt9612.c 2>&1 | tee checkpatch.log
+
+      - name: 汇总（仅 ERROR 阻塞）
+        run: |
+          if grep -q 'ERROR:' checkpatch.log; then
+            echo "::error::checkpatch 报出 ERROR，请修复后重试"
+            exit 1
+          fi
+          echo "checkpatch 无 ERROR（WARNING/CHECK 见上方日志）"

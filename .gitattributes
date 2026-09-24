@@ -1,0 +1,15 @@
+# 统一换行与文本判定，避免 Windows 开发/Linux 编译之间产生整文件 diff
+* text=auto eol=lf
+
+*.c      text diff=c
+*.h      text diff=c
+*.md     text
+*.sh     text eol=lf
+Makefile text
+Kbuild   text
+
+*.bin    binary
+*.ko     binary
+*.pcap   binary
+*.png    binary
+*.jpg    binary

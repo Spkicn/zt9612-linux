@@ -1,0 +1,53 @@
+ZT9612U / ACEV100 USB Wi-Fi adapter - USB IDs
+=============================================
+
+驱动匹配表（driver/zt9612.c 的 zt_id_table）:
+
+  /* 网卡模式：本驱动的工作模式 */
+  { USB_DEVICE(0x350B, 0x9612) },
+
+厂商: ZTOP / 山东兆通微电子（Zhaotong Micro），模组 ZT9612U V1.0
+平台: ACEV100（自研 Wi-Fi 6 2T2R SoC）
+FCC ID: 2BOBE-ZT9612UV10
+
+
+设备会以两种身份出现
+--------------------
+
+1) 驱动光盘模式（出厂默认）
+   350b:f179   USB 大容量存储 / CD-ROM，卷标 "Wi-Fi6 Adapter"，内含 auto_load.exe
+   本驱动**不匹配**这个 ID；需要先切模式：
+
+     sudo eject /dev/sr0
+     sudo sg_start --eject /dev/sr0
+     sudo usb_modeswitch -K -W -v 350b -p f179
+
+   自动切换（推荐）：sudo ./scripts/setup-mode-switch.sh
+   原理：标准 SCSI 媒体弹出（START_STOP_UNIT + LoEj=1），与 Windows 侧厂商
+   工具的 IOCTL_STORAGE_EJECT_MEDIA 等价 —— 不是厂商私有 SCSI 命令。
+
+2) 网卡模式（切换后）
+   350b:9612   bcdDevice 0x0200，iProduct "802.11ax 2x2 WLAN Adapter"
+   接口: 1 个，class FF/FF/FF（厂商自定义），5 个 512 字节批量端点
+         EP4-IN(0x84) 设备->主机，EP8-OUT(0x08) 主机->设备
+   序列号: B40418000012（示例，随卡不同）
+
+   注意：切换后 ROM 只留出**秒级**窗口接受固件下载，所以要"插上就切、切完就加载"。
+
+
+怎么确认你手上是同一块卡
+------------------------
+
+  Linux : lsusb | grep -i 350b
+          lsusb -v -d 350b:9612        # 看 iProduct / bcdDevice / 端点
+  Windows: 设备管理器 -> 属性 -> 详细信息 -> 硬件 ID
+           USB\VID_350B&PID_F179   (光盘模式)
+           USB\VID_350B&PID_9612   (网卡模式)
+
+如果 VID/PID 不同（例如同厂 350b:9101 / 9611），那是别的型号，本驱动不适用。
+
+
+同厂其它已知 ID（本驱动不支持，仅供参考）
+-----------------------------------------
+  350b:9101   老款 802.11n 网卡
+  350b:9611   同系列，对应 zt9611_fw.bin
