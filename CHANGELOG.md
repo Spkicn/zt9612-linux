@@ -8,6 +8,16 @@
 ## [Unreleased]
 
 ### Added
+- **M3.3 关联打通（认证 + 关联均成功）**：实机 `iw dev <iface> connect -w WiFi_123456789` 返回
+  `connected to 48:7d:2e:6b:88:20`，驱动侧 `bss_info ... assoc=1 aid=1`，接口进入 `LOWER_UP`；
+  关联后 `iw dev <iface> link` 显示 `tx bitrate 1.0 MBit/s`、DTIM/beacon 间隔等来自真实 AP 的信息
+  - **mac80211 TX 路径**：`.tx` 与 `wake_tx_queue` 只做登记，真正的 `usb_bulk_msg()` 提交放在
+    `tx_work`（这两个回调可能在软中断上下文执行，不能睡眠）。本内核把 TXQ 路径定为必选：
+    缺少 `wake_tx_queue` 时 `ieee80211_alloc_hw_nm()` 会 WARN 并返回失败（`main.c:800`）
+  - **`config` 回调同步信道**：mac80211 切信道时向固件发 `MM_SET_CHANNEL`（12 字节，5 GHz
+    首字段为 1）；切信道前重放厂商的使能序列（`SET_IDLE / 0x0104 / SET_FILTER`），
+    可用新模块参数 `tx_prep=0` 关闭
+  - `bss_info_changed` 打点（`assoc/aid/bssid`），用于观察关联过程
 - **M3.4 调试通道**：`/dev/zt9612` 上的 ioctl `ZT_IOC_TXRAW`，用户态可以把一条完整 `WLAN`
   帧直接发到 TX 端点（用于在不重载模块的前提下批量试描述符与时序）。之所以不用 debugfs：
   Secure Boot 下内核处于 `lockdown=integrity`，会拒绝写 debugfs
@@ -30,6 +40,11 @@
   Ubuntu 24.04 / 内核 `7.0.0-31-generic`
 
 ### Fixed
+- **RX 注入被 `scan_active` 门控（关联一直超时的根因）**：原实现只在扫描进行中才把收到的帧
+  交给 mac80211，扫描之外的认证响应/关联响应全部丢失，`iw connect` 必然超时；而
+  `iw scan` 却完全正常，所以长期没有暴露。改为常开注入（仅在 `hw` 存在时）后关联立即成功。
+  同批修复还包括：`assoc`/`aid` 在本内核已移到 `vif->cfg`，`bss_info_changed` 不能再用
+  `bss_conf.assoc`
 - **MAC 读取错位 + `MM_ADD_IF_REQ` 少一字节（TX 一直不发射的根因）**：`0x0101` 应答的参数是
   `{ u8 status; u8 mac[6]; }`（7 字节），旧代码把 `resp[0..5]` 当 MAC，得到错位的
   `00:b4:01:1a:00:12`；真 MAC 是 `b4:01:1a:00:12:64`（抓包中 95 个发往本机的单播帧 addr1 证实）。
