@@ -14,7 +14,9 @@
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/debugfs.h>
 #include <linux/kfifo.h>
+#include <linux/poll.h>
 #include <linux/wait.h>
 #include <linux/completion.h>
 #include <linux/workqueue.h>
@@ -643,6 +645,98 @@ out:
 /* ------------------------------------------------------------------ TX 数据路径（M3.4） */
 
 /*
+ * 调试通道（M3.4）：/dev/zt9612 上的 ioctl ZT_IOC_TXRAW
+ * 用户态把"完整的 WLAN 帧"（含 8 字节头、不含补零）交进来，驱动原样发到 tx_ep。
+ * 为什么不用 debugfs：本机 Secure Boot 打开时内核处于 lockdown=integrity，
+ * lockdown 会拒绝写 debugfs（实测 EPERM），而 ioctl 路径不受影响。
+ */
+struct zt_txraw_req {
+	__u32 len;
+	__u32 pad;
+	__u64 data;		/* 用户态缓冲区指针 */
+};
+
+#define ZT_IOC_TXRAW	_IOW('Z', 1, struct zt_txraw_req)
+
+static long zt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct zt_dev *z = file->private_data;
+	struct zt_txraw_req req;
+	u8 *buf;
+	int ret, sent = 0;
+
+	if (cmd != ZT_IOC_TXRAW)
+		return -ENOTTY;
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.len < 9 || req.len > MAX_FRAME)
+		return -EINVAL;
+	buf = memdup_user((void __user *)(unsigned long)req.data, req.len);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
+			   buf, (int)req.len, &sent, 1000);
+	kfree(buf);
+	if (ret) {
+		dev_warn(&z->intf->dev, "ioctl tx: bulk OUT 失败 (%d)\n", ret);
+		return ret;
+	}
+	z->tx_frames++;
+	return 0;
+}
+
+/*
+ * 调试通道：/sys/kernel/debug/zt9612/tx_raw
+ * 用户态把"完整的 WLAN 帧"（含 8 字节头，不含任何补零）写进来，驱动原样发到 tx_ep。
+ * 目的：M3.4 期间可以在不重新编译/加载模块的前提下批量试描述符与时序。
+ */
+static ssize_t zt_dbg_tx_write(struct file *f, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct zt_dev *z = f->private_data;
+	u8 *buf;
+	int ret, sent = 0;
+
+	if (!z || !READ_ONCE(z->alive))
+		return -ENODEV;
+	if (count < 9 || count > MAX_FRAME)
+		return -EINVAL;
+	buf = memdup_user(ubuf, count);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
+			   buf, (int)count, &sent, 1000);
+	kfree(buf);
+	if (ret) {
+		dev_warn(&z->intf->dev, "dbg tx: bulk OUT 失败 (%d)\n", ret);
+		return ret;
+	}
+	z->tx_frames++;
+	return count;
+}
+
+static const struct file_operations zt_dbg_tx_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = zt_dbg_tx_write,
+	.llseek = noop_llseek,
+};
+
+static struct dentry *zt_dbg_root;
+
+static void zt_dbg_init(struct zt_dev *z)
+{
+	if (!zt_dbg_root)
+		zt_dbg_root = debugfs_create_dir("zt9612", NULL);
+	if (IS_ERR_OR_NULL(zt_dbg_root))
+		return;
+	debugfs_create_file("tx_raw", 0200, zt_dbg_root, z, &zt_dbg_tx_fops);
+	debugfs_create_u32("tx_frames", 0400, zt_dbg_root, (u32 *)&z->tx_frames);
+}
+
+/*
  * 把一条 802.11 帧交给设备发送：EP5-OUT。
  * 线上格式与其它帧一致：WLAN 头 + 28 字节描述符 + 802.11 帧，
  * 其中 WLAN 头的 hlen = 28 + 帧长（抓包实测：111 字节的 probe request → hlen=139）。
@@ -989,36 +1083,63 @@ static ssize_t zt_read(struct file *file, char __user *buf, size_t count, loff_t
 {
 	struct zt_dev *z = file->private_data;
 	u8 hdr[2];
+	u8 junk[2];
 	u16 flen;
 	unsigned int copied = 0;
-	int ret;
+	unsigned long end;
 
 	if (!READ_ONCE(z->alive))
 		return -ENODEV;
-	if (kfifo_len(&z->rx_fifo) < 2) {
-		if (file->f_flags & O_NONBLOCK)
-			return -EAGAIN;
-		ret = wait_event_interruptible_timeout(z->rx_wait,
-						       kfifo_len(&z->rx_fifo) >= 2 ||
-						       !READ_ONCE(z->alive),
-						       msecs_to_jiffies(3000));
+
+	/*
+	 * 只等到"完整的一帧"再返回。早期实现只看 kfifo 里有没有 2 字节长度头，
+	 * 于是半帧（URB 分片）会让 read() 反复错位、每次都白等 3 秒。
+	 */
+	end = jiffies + msecs_to_jiffies(3000);
+	for (;;) {
+		if (kfifo_out_peek(&z->rx_fifo, hdr, 2) == 2) {
+			flen = get_unaligned_le16(hdr);
+			if (flen > MAX_FRAME) {		/* 脏数据：丢掉长度头继续 */
+				if (kfifo_out(&z->rx_fifo, junk, 2) != 2)
+					return -EIO;
+				continue;
+			}
+			if (kfifo_len(&z->rx_fifo) >= (unsigned int)flen + 2)
+				break;			/* 完整帧到齐 */
+		}
 		if (!READ_ONCE(z->alive))
 			return -ENODEV;
-		if (ret == 0)
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		if (time_after(jiffies, end))
 			return -ETIMEDOUT;
-		if (ret < 0)
-			return ret;
+		if (wait_event_interruptible_timeout(z->rx_wait,
+						     kfifo_len(&z->rx_fifo) >= 2 ||
+						     !READ_ONCE(z->alive),
+						     msecs_to_jiffies(200)) < 0)
+			return -ERESTARTSYS;
 	}
+
+	if (count < flen)
+		return -EINVAL;			/* 头不消费，调用方可以放大缓冲重试 */
 	if (kfifo_out(&z->rx_fifo, hdr, 2) != 2)
 		return -EIO;
-	flen = get_unaligned_le16(hdr);
-	if (flen > MAX_FRAME)
-		return -EIO;
-	if (count < flen)
-		return -EINVAL;
 	if (kfifo_to_user(&z->rx_fifo, buf, flen, &copied))
 		return -EFAULT;
 	return copied;
+}
+
+static __poll_t zt_poll(struct file *file, poll_table *wait)
+{
+	struct zt_dev *z = file->private_data;
+	__poll_t mask = 0;
+
+	poll_wait(file, &z->rx_wait, wait);
+	if (!READ_ONCE(z->alive))
+		return EPOLLHUP | EPOLLERR;
+	if (kfifo_len(&z->rx_fifo) >= 2)
+		mask |= EPOLLIN | EPOLLRDNORM;
+	return mask;
 }
 
 static ssize_t zt_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
@@ -1060,6 +1181,8 @@ static const struct file_operations zt_fops = {
 	.open = zt_open,
 	.read = zt_read,
 	.write = zt_write,
+	.unlocked_ioctl = zt_ioctl,
+	.poll = zt_poll,
 	.release = zt_release,
 	.llseek = noop_llseek,
 };
@@ -1488,6 +1611,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	dev_info(&intf->dev, "M1+M2 done: firmware running, /dev/zt9612 %s\n",
 		 z->misc_ok ? "ready" : "unavailable");
 
+	zt_dbg_init(z);
 	zt_mac_register(z);
 	return 0;
 
@@ -1533,6 +1657,10 @@ static void zt_disconnect(struct usb_interface *intf)
 	if (z->misc_ok) {
 		misc_deregister(&z->misc);
 		z->misc_ok = false;
+	}
+	if (zt_dbg_root) {
+		debugfs_remove_recursive(zt_dbg_root);
+		zt_dbg_root = NULL;
 	}
 	zt_mac_unregister(z);
 
