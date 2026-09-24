@@ -60,15 +60,16 @@ Linux 内核驱动，用于 **VID:PID `350b:9612`** 的 ZT9612U / ACEV100 USB �
 
 | 项目 | 值 |
 |---|---|
-| 已验证内核 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64） |
-| 声明支持 | `>= 5.15`（`dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`），但**较老内核很可能编译不过** |
-| 已验证编译器 | 发行版自带 gcc（见 CI 矩阵） |
+| **已实机验证** | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）—— M1/M2 通过 |
+| **已验证可编译** | `6.17.0-1022-azure`（CI，ubuntu-24.04 runner，**零告警**）；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
+| **编译下限** | **6.12**（`dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动使用 6.12 才引入的 `linux/unaligned.h`；CI 实测 6.8 内核因缺该头文件编译失败 |
+| 未验证区间 | 6.12~6.16 能否正确工作未验证；mac80211 ops 签名只在 6.17+/7.0 上确认匹配 |
 | 需要 | `build-essential`、`linux-headers-$(uname -r)` |
 
-> 本驱动使用 7.0 时代的 mac80211 ops 签名（例如
+> 本驱动使用较新的 mac80211 ops 签名（例如
 > `config(struct ieee80211_hw *, int radio_idx, u32 changed)`、
 > `tx(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *)`）。
-> 老内核上需要适配，欢迎提 PR（附完整报错）。
+> 老内核上需要适配，欢迎提 PR（附完整报错与 `uname -a`）。
 
 ## 安装
 
