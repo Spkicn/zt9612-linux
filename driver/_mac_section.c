@@ -1,15 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * zt9612.c 的内联 mac80211 段（M3.1）——只读摘录，不参与编译。
+ * zt9612.c 的内联 mac80211 段（M3.1 + M3.2 扫描）——只读摘录，不参与编译。
  *
  * 本文件不是构建输入（Makefile 只编译 zt9612.o）。它的唯一作用是方便单独阅读
  * mac80211 部分，改它不会影响编译结果。
  *
  * 保持同步的办法：改动 zt9612.c 时，从该文件里"mac80211 (M3.1)"那段段首注释开始，
  * 到函数 zt_mac_unregister() 的结束大括号为止，整段原样复制到本文件末尾。
- *
- * 历史教训：这份摘录曾经停留在"首版缺 configure_filter/wake_tx_queue/chanctx"的
- * 旧版本，与 zt9612.c 不一致（见 docs/04 与 docs/07）。
  */
 
 /* ================================================================== mac80211 (M3.1)
@@ -115,6 +112,128 @@ static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *
 		ieee80211_free_txskb(hw, skb);
 	}
 }
+/* ------------------------------------------------------------------ M3.2 扫描 */
+
+/*
+ * 扫描前置序列，逐步照抄厂商抓包（第 9 轮实测的时序）：
+ *   SET_IDLE(0) → 0x0104(1) → SET_FILTER(98860215) → SET_FILTER(88860215)
+ *   → 0x0104(0) → SET_IDLE(1) → SET_IDLE(0) → 0x0104(1) → SET_FILTER(98860215)
+ * 每条都要等到对应 CFM 再发下一条。
+ */
+static int zt_scan_setup(struct zt_dev *z)
+{
+	static const u8 f1[4] = { 0x98, 0x86, 0x02, 0x15 };
+	static const u8 f2[4] = { 0x88, 0x86, 0x02, 0x15 };
+	u8 v;
+
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f1, 4, 0x000f, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f2, 4, 0x000f, 1000))
+		return -EIO;
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f1, 4, 0x000f, 1000))
+		return -EIO;
+	return 0;
+}
+
+static void zt_scan_work(struct work_struct *w)
+{
+	struct zt_dev *z = container_of(w, struct zt_dev, scan_work);
+	bool aborted = false, done = false;
+	u8 chan[12];
+	int i;
+
+	mutex_lock(&z->lock);
+	if (!READ_ONCE(z->alive)) {
+		aborted = true;
+		goto out;
+	}
+	dev_info(&z->intf->dev, "scan: 开始，%d 个信道\n", z->scan_nfreqs);
+	if (zt_scan_setup(z)) {
+		dev_warn(&z->intf->dev, "scan: 前置序列失败\n");
+		aborted = true;
+		goto out;
+	}
+	WRITE_ONCE(z->scan_active, true);
+	for (i = 0; i < z->scan_nfreqs; i++) {
+		u16 f = z->scan_freqs[i];
+
+		if (!READ_ONCE(z->alive) || z->scan_aborted) {
+			aborted = true;
+			break;
+		}
+		memset(chan, 0, sizeof(chan));
+		put_unaligned_le16(0, chan + 0);
+		put_unaligned_le16(f, chan + 2);
+		put_unaligned_le16(f, chan + 4);
+		put_unaligned_le16(20, chan + 10);
+		WRITE_ONCE(z->scan_freq, f);
+		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
+			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
+		msleep(ZT_SCAN_DWELL_MS);
+	}
+	done = !aborted;
+	if (done) {
+		u8 v = 1;
+
+		zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000);	/* 回到 idle */
+	}
+out:
+	WRITE_ONCE(z->scan_active, false);
+	WRITE_ONCE(z->scan_freq, 0);
+	WRITE_ONCE(z->scan_running, false);
+	dev_info(&z->intf->dev, "scan: 结束（%s）\n", done ? "完成" : "中止");
+	mutex_unlock(&z->lock);
+
+	if (READ_ONCE(z->alive) && z->hw) {
+		/* 本内核（7.0）的签名是 cfg80211_scan_info，不是 bool */
+		struct cfg80211_scan_info info = { .aborted = aborted };
+
+		ieee80211_scan_completed(z->hw, &info);
+	}
+}
+
+static int zt_mac_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			  struct ieee80211_scan_request *hw_req)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+	struct cfg80211_scan_request *req = &hw_req->req;
+	int i;
+
+	if (READ_ONCE(z->scan_running))
+		return -EBUSY;
+	if (req->n_channels == 0 || req->n_channels > ZT_MAX_SCAN_CH)
+		return -EINVAL;
+
+	mutex_lock(&z->lock);
+	for (i = 0; i < req->n_channels; i++)
+		z->scan_freqs[i] = req->channels[i]->center_freq;
+	z->scan_nfreqs = req->n_channels;
+	z->scan_aborted = false;
+	WRITE_ONCE(z->scan_running, true);
+	mutex_unlock(&z->lock);
+
+	schedule_work(&z->scan_work);
+	return 0;
+}
+
 static const struct ieee80211_ops zt_mac_ops = {
 	.start = zt_mac_start,
 	.stop = zt_mac_stop,
@@ -124,6 +243,8 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.tx = zt_mac_tx,
 	.configure_filter = zt_mac_configure_filter,
 	.wake_tx_queue = zt_mac_wake_tx_queue,
+	/* M3.2：被动扫描（只听 beacon），probe request 的 TX 留到 M3.4 */
+	.hw_scan = zt_mac_hw_scan,
 	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,

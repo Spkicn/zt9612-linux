@@ -8,6 +8,13 @@
 ## [Unreleased]
 
 ### Added
+- **M3.2 扫描**：实现 `hw_scan`（被动扫描）与 RX 数据路径。实机验证：
+  `iw dev <iface> scan` 返回 **42 个 BSS**（含 SSID、信道、WPA2、HT/VHT 能力），
+  13 个信道约 1.7 秒，`dmesg` 无 oops
+  - RX 数据路径：EP4-IN 上 `type=0x0000/0x0004` 的帧 = 每帧描述符（48 / 52 字节）+ 802.11 帧，
+    跳过描述符后经 `ieee80211_rx_irqsafe()` 交给 mac80211
+  - 扫描期间 RX URB 不能停，改用 `zt_cmd_fifo()` 从 URB 填充的 kfifo 取 CFM，避免与 URB
+    抢同一个 IN 端点
 - M3.1 实机验证通过：无线接口注册成功（`wlan0` 按 MAC 命名为 `wlx00b4011a0012`），
   `iw dev`、`iw phy phy0 info`、`ethtool -i` 均正常；实测环境
   Ubuntu 24.04 / 内核 `7.0.0-31-generic`
@@ -20,6 +27,8 @@
   日志：`BUG: kernel NULL pointer dereference, address: 0x68`，`Comm: NetworkManager`，
   `RIP: cfg80211_get_drvinfo`。修复后 `ethtool -i` 返回 `driver: zt9612`，
   NetworkManager 与 sshd 全程存活，`dmesg` 无 oops
+- 停止 RX 时也唤醒回收等待者：原实现只在 `alive==0` 时 `complete()`，设备正常但 RX 空闲时
+  会让 `zt_rx_stop()` 白等满 2 秒并走到"泄漏实例"分支（此修复尚未单独复验）
 
 ### Changed
 - 文档统一去除 emoji，README、CONTRIBUTING、FAQ 重写为更平实的措辞；
@@ -27,10 +36,9 @@
 - README 与 FAQ 更新 D10 的根因说明：原先怀疑的 xhci 枚举抖动、udev worker 阻塞均不成立
 
 ### Planned
-- M3.2 扫描：需要实现 `hw_scan`（或 `sw_scan_start/complete`）并接通扫描通道。
-  现状：`iw scan` 静默返回零结果，驱动侧没有任何动作
-- M3.3 关联：`wpa_supplicant` 关联成功
-- M3.4 数据面：TX 描述符与 RX 数据路径（当前最大的未知项）
+- M3.3 关联：`wpa_supplicant` 关联成功（需要关联过程的 RX 事件解析）
+- M3.4 数据面：TX 描述符格式与主动扫描所需的 probe request 发送
+- 解码 RX 描述符里的 RSSI 字段，让扫描结果的信号强度可信
 - 清理 `driver/zt9612.c` 中历史遗留的乱码注释（需与编译验证一起做）
 - 复验卸载路径：修复后尚未专门做过「加载后 rmmod」的验证（原 D9）
 
