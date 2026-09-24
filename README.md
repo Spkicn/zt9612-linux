@@ -15,11 +15,12 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 | 硬件识别与协议分析 | 完成 |
 | M1 内核态固件装载 | 完成，已实机验证 |
 | M2 IPC 初始化与 `/dev/zt9612` | 完成，已实机验证（IPC 往返成功） |
-| M3.1 mac80211 注册（`wlan0`） | 代码就绪，尚未实机验证 |
+| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（`wlan0` 按 MAC 被命名为 `wlx00b4011a0012`） |
 | M3.2 扫描 / M3.3 关联 / M3.4 数据面 | 未开始 |
 
-加载驱动后能得到的是：芯片被点亮、固件运行、可在 `/dev/zt9612` 上收发原始 IPC 帧。
-目前不会出现可用的 `wlan0`，也无法联网。
+加载驱动后可以得到一个 managed 模式的无线接口（名字取决于 systemd 的可预测命名规则，
+按 MAC 生成），`iw dev`、`ethtool -i`、`/dev/zt9612` 都可用。但扫描、关联与数据面尚未实现，
+因此还无法联网。
 
 这块网卡在 Windows 下工作正常。本项目的目标是在 Linux 下把它跑起来。厂商没有公开
 发布 Linux 驱动，但存在内部版本，向厂商索取是更省力的路线。
@@ -49,12 +50,14 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 - 同步 IPC 初始化：`MM_RESET`、`MM_VERSION`、厂商私有段、`MM_START`（约 6.5 秒）、
   `MM_SET_IDLE`、`MM_ADD_IF`、`MM_SET_SLOTTIME`、`MM_SET_CHANNEL`
 - 5 秒心跳维持固件存活；`/dev/zt9612` 上收发原始 `WLAN` 帧
+- 注册 mac80211：出现 managed 模式的无线接口，2.4 GHz 13 个信道、4 个基础速率，
+  `iw dev`、`iw phy`、`ethtool -i` 均可正常读取
 
 尚未实现：
 
-- `wlan0` 网络接口（M3.1 未验证）
-- 扫描、关联、数据传输（M3.2~M3.4）
-- 5 GHz 频段、AP 模式、监听模式、蓝牙
+- 扫描与关联（`iw scan` 目前静默返回零结果，驱动侧没有任何动作）
+- 数据传输（TX 直接丢包，RX 数据路径未接）
+- 5 GHz 频段、AP 模式、蓝牙
 
 ## 兼容性
 
@@ -180,6 +183,9 @@ zt9612 1-9:1.0: MM_START_REQ (rf init, waiting ~6.5s)
 zt9612 1-9:1.0: MM_START_CFM received (firmware up)
 zt9612 1-9:1.0: M1+M2 done: firmware running, /dev/zt9612 ready
 zt9612 1-9:1.0: mac80211 registered (M3.1) - wlan0 should appear
+zt9612 1-9:1.0 wlx00b4011a0012: renamed from wlan0
+zt9612 1-9:1.0: mac80211: start
+zt9612 1-9:1.0: mac80211: add_interface type=2 addr=00:b4:01:1a:00:12
 ```
 
 再做一次 IPC 往返自测（M2 验收）：
@@ -190,26 +196,47 @@ sudo python3 scripts/zt9612-devtest.py
 sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳定性
 ```
 
-`wlan0` 是否出现是 M3.1 的验收点，目前尚未确认，欢迎反馈结果。
+M3.1 已在 `7.0.0-31-generic` 上实机验证：`iw dev` 能看到 managed 接口，`iw phy phy0 info`
+列出 2.4 GHz 的 13 个信道与 4 个基础速率，`ethtool -i` 返回 `driver: zt9612`。
+注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（本机是 `wlx00b4011a0012`），
+用 `ls /sys/class/net | grep -E '^(wlx|wlan)'` 或 `iw dev` 查实际名字。
 
 ## 已知问题
 
 ### 不要反复 rmmod / insmod
 
-连续卸载与加载曾两次把整机变成「能 ping、能连 22 端口，但 SSH 读不到 banner」，
-只能硬重启。卸载路径已经加固（`usb_poison_urb()` 加 2 秒上限，超时故意泄漏实例而不是
-无界阻塞），但 USB 控制器层面是否仍会被拖住尚无证据排除。需要换模块时请重启机器。
-`uninstall-driver.sh` 默认不执行 `rmmod`。
+连续卸载与加载曾两次把整机变成「能 ping、能连 22 端口，但 SSH 读不到 banner」。
+这两次都发生在 `wlan0` 出现之后，与上面那条 `cfg80211_get_drvinfo` 缺陷的表现一致；
+当时怀疑的「卸载路径死锁」只是推测，并没有证据（`dmesg` 里没有出现过
+`rx urb 2s 未回收`）。卸载路径仍然做了加固（`usb_poison_urb()` 加 2 秒上限，
+超时故意泄漏实例而不是无界阻塞），但修复后还没有专门做过一次「加载后卸载」的验证。
 
-### 开机自动加载存在未定位风险
+在做过该验证之前，换模块请重启机器，`uninstall-driver.sh` 也默认不执行 `rmmod`。
 
-模块放入 `/lib/modules/$(uname -r)/extra/` 后，内核会通过 USB modalias 在开机时自动加载。
-本项目观察到这条路径会导致开机后失联，症状与上一条相同，且该次没有任何 `rmmod`
-或 `insmod` 操作，因此与卸载死锁无关。可疑方向包括 xhci 枚举抖动、probe 在 udev worker
-中耗时约 7 秒、以及 mac80211 注册后 NetworkManager 的动作。根因尚未定位。
+### 开机自动加载曾导致失联，根因已定位并修复
 
-因此 `install-driver.sh` 默认写入 `blacklist zt9612`。确认机器安全后再使用
-`--enable-autoload`。如果机器已经失联：硬重启、物理拔插网卡、保留该 blacklist。
+这一条此前是未定位问题：模块经 USB modalias 在开机时自动加载后，机器会变成「能 ping、
+能连 22 端口，但 SSH 读不到 banner」，只能硬重启。现在原因已经查清，是驱动的缺陷：
+
+驱动注册 wiphy 时没有设置父设备（缺少 `SET_IEEE80211_DEV()`），于是 `wiphy_dev(wiphy)`
+为 `NULL`。无线接口出现后 NetworkManager 立即通过 `SIOCETHTOOL` 查询驱动信息，
+`cfg80211_get_drvinfo()` 解引用空指针，在关闭中断的状态下崩溃，用户态随之卡死。
+实测崩溃现场：
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000068
+CPU: 16 PID: 1127 Comm: NetworkManager  Tainted: G  O  7.0.0-31-generic
+RIP: 0010:cfg80211_get_drvinfo+0x27/0x1c0 [cfg80211]
+Call Trace: ethtool_get_drvinfo → __dev_ethtool → dev_ioctl
+note: NetworkManager[1127] exited with irqs disabled
+```
+
+修复是在 `ieee80211_register_hw()` 之前加上 `SET_IEEE80211_DEV(hw, &z->intf->dev)`。
+修复后已在实机复测：`ethtool -i` 正常返回，NetworkManager、sshd 全程存活，`dmesg`
+无 oops。
+
+`install-driver.sh` 仍然默认写入 `blacklist zt9612`，因为「干净开机自动加载」这条路径
+还没有重新跑过一次完整验证。确认没问题后可以用 `--enable-autoload`。
 
 ### 芯片挂死后需要物理拔插
 
@@ -258,10 +285,10 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 
 | 步骤 | 目标 | 当前障碍 |
 |---|---|---|
-| M3.1 | `wlan0` 出现 | 代码已就绪，只差实机验证 |
-| M3.2 | `iw dev wlan0 scan` 能扫到 AP | RX 数据路径格式未知：扫描结果以什么帧从 EP4-IN 上来 |
-| M3.3 | `wpa_supplicant` 关联 | 认证与关联消息的参数布局 |
-| M3.4 | 能 ping 通 | TX 描述符格式未知，即 TXQ / host desc 如何填写 |
+| M3.1 | 注册 mac80211 并出现无线接口 | 已完成并实机验证 |
+| M3.2 | `iw dev <iface> scan` 能扫到 AP | 需要实现 `hw_scan`（或 `sw_scan_start/complete`）并接通扫描通道；目前 `iw scan` 静默返回零结果，驱动侧没有任何动作 |
+| M3.3 | `wpa_supplicant` 关联 | 认证与关联消息的参数布局，以及 RX 事件解析 |
+| M3.4 | 能 ping 通 | TX 描述符格式未知，即 TXQ / host desc 如何填写；RX 数据路径也未接 |
 | 收尾 | 协议细节 | `0x020c`、`0x0104`、`0x0105`、`0x050e` 的精确语义 |
 | 可选 | 扩展 | 5 GHz 频段、蓝牙（同芯片 BT 功能，属复合接口） |
 

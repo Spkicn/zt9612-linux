@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * zt9612.c 的内联 mac80211 段（M3.1）——**只读摘录，不参与编译**。
+ * zt9612.c 的内联 mac80211 段（M3.1）——只读摘录，不参与编译。
  *
  * 本文件不是构建输入（Makefile 只编译 zt9612.o）。它的唯一作用是方便单独阅读
  * mac80211 部分，改它不会影响编译结果。
@@ -148,6 +148,13 @@ static void zt_mac_register(struct zt_dev *z)
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
 	SET_IEEE80211_PERM_ADDR(hw, z->mac);
+	/*
+	 * D10 修复：必须设置 wiphy 的父设备。否则 wiphy_dev(wiphy) 为 NULL，
+	 * userspace 通过 ethtool 取驱动信息时 cfg80211_get_drvinfo() 会空指针崩溃
+	 * （实测 NetworkManager 在 wlan0 出现后立即触发，进程带关中断退出，导致整机
+	 *  用户态卡死、"能 ping 不能 SSH"）。
+	 */
+	SET_IEEE80211_DEV(hw, &z->intf->dev);
 
 	ret = ieee80211_register_hw(hw);
 	if (ret) {

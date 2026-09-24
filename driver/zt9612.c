@@ -771,6 +771,13 @@ static void zt_mac_register(struct zt_dev *z)
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
 	SET_IEEE80211_PERM_ADDR(hw, z->mac);
+	/*
+	 * D10 修复：必须设置 wiphy 的父设备。否则 wiphy_dev(wiphy) 为 NULL，
+	 * userspace 通过 ethtool 取驱动信息时 cfg80211_get_drvinfo() 会空指针崩溃
+	 * （实测 NetworkManager 在 wlan0 出现后立即触发，进程带关中断退出，导致整机
+	 *  用户态卡死、"能 ping 不能 SSH"）。
+	 */
+	SET_IEEE80211_DEV(hw, &z->intf->dev);
 
 	ret = ieee80211_register_hw(hw);
 	if (ret) {
