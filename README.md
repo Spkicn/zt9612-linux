@@ -16,14 +16,14 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 | 硬件识别与协议分析 | 完成 |
 | M1 内核态固件装载 | 完成，已实机验证 |
 | M2 IPC 初始化与 `/dev/zt9612` | 完成，已实机验证（IPC 往返成功） |
-| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（接口按真实 MAC 命名为 `wlxb4011a001264`） |
+| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（接口按真实 MAC 命名为 `wlx` + MAC 十六进制） |
 | M3.2 扫描 | 完成，已实机验证（`iw scan` 实测 40+ 个 BSS） |
 | M3.3 关联 | 完成，已实机验证（`iw connect` 关联开放 AP，`assoc=1`、接口 `LOWER_UP`） |
 | M3.4 数据面 | 完成，已实机验证（关联后广播 ARP 出网并收到网关应答、单播回包正常回收）；IP 地址取决于 AP 是否提供 DHCP |
 | M3.5 5GHz | 完成，已实机验证（`iw phy info` 列出 2.4G 14 信道 + 5G 25 信道；`iw scan` 59 个 BSS 中 7 个在 5GHz） |
 | WPA2 关联与加密 | 完成，已实机验证（WPA2-PSK 热点：关联 226 ms、四次握手 344 ms、`PTK=CCMP GTK=CCMP`、DHCP 拿到租约、`ping` 外网 3/3） |
 
-加载驱动后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，例如 `wlxb4011a001264`），
+加载驱动后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，例如 `wlxb4011aXXXXXX`），
 `iw dev`、`iw scan`、`iw connect`、`ethtool -i`、`/dev/zt9612` 都可用。扫描覆盖 2.4 GHz 与
 5 GHz，能列出周围 AP（含 SSID、信道、加密、HT/VHT 能力与**真实信号强度**）。关联、加密与
 数据面均已走通：WPA2-PSK 热点下四次握手到 `COMPLETED`（`PTK=CCMP GTK=CCMP`，CCMP 由
@@ -209,6 +209,8 @@ sudo dmesg | tail -30
 
 ```
 zt9612 1-9:1.0: probing 350b:9612 (iface 0)
+zt9612 1-9:1.0:   ep 0x84 IN
+zt9612 1-9:1.0:   ep 0x05 OUT
 zt9612 1-9:1.0: hello ack: yes (try 1)
 zt9612 1-9:1.0:   wrote addr=0x61070000 len=219048 (449 blocks) cs=0x2d14
 zt9612 1-9:1.0:   wrote addr=0x210ce700 len=212 (1 blocks) cs=0x0001
@@ -216,15 +218,24 @@ zt9612 1-9:1.0: RUN (1 sections)
 zt9612 1-9:1.0: boot notify: type=0x0100 len=16
 zt9612 1-9:1.0: firmware loaded
 zt9612 1-9:1.0: === IPC init sequence ===
-zt9612 1-9:1.0: MAC = 00:b4:01:1a:00:12
+zt9612 1-9:1.0: fw 0x0101: status=0 mac=XX:XX:XX:XX:XX:XX
+zt9612 1-9:1.0: MAC = XX:XX:XX:XX:XX:XX
 zt9612 1-9:1.0: MM_START_REQ (rf init, waiting ~6.5s)
 zt9612 1-9:1.0: MM_START_CFM received (firmware up)
+zt9612 1-9:1.0: MM_ADD_IF_CFM: status=0 inst_nbr=0
 zt9612 1-9:1.0: M1+M2 done: firmware running, /dev/zt9612 ready
 zt9612 1-9:1.0: mac80211 registered (M3.1) - wlan0 should appear
-zt9612 1-9:1.0 wlx00b4011a0012: renamed from wlan0
+zt9612 1-9:1.0 wlxXXXXXXXXXXXX: renamed from wlan0
 zt9612 1-9:1.0: mac80211: start
-zt9612 1-9:1.0: mac80211: add_interface type=2 addr=00:b4:01:1a:00:12
+zt9612 1-9:1.0: mac80211: add_interface type=2 addr=XX:XX:XX:XX:XX:XX
 ```
+
+> 上面的 MAC 与接口名已用 `XX` 隐去（驱动实际打印的是内核 `%pM` 格式的地址）。
+> 接口名是 systemd 按 MAC 生成的可预测名（`wlx` + 12 位十六进制），
+> 所以**不要**假设它叫 `wlan0`。早期版本读 MAC 时错位（少读一个 status 字节），
+> 打印出来的是整体左移一字节、末字节被 0 顶掉的值。若你看到的是那样的值，
+> 说明模块来自 v0.2.0 之前的代码：此时 TX 帧会被固件静默丢弃、单播 RX 也会被过滤掉
+> （见 CHANGELOG 的 Fixed 一节）。
 
 再做一次 IPC 往返自测（M2 验收）：
 
@@ -237,7 +248,7 @@ sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳�
 M3.1 已在 `7.0.0-31-generic` 上实机验证：`iw dev` 能看到 managed 接口，`iw phy phy0 info`
 列出 2.4 GHz **14** 个信道（含 2484）+ 5 GHz **25** 个信道（5180–5825），`ethtool -i`
 返回 `driver: zt9612`。
-注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（本机是 `wlxb4011a001264`），
+注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（形如 `wlxb4011aXXXXXX`），
 用 `ls /sys/class/net | grep -E '^(wlx|wlan)'` 或 `iw dev` 查实际名字。
 
 ## 已知问题
@@ -324,11 +335,20 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 |---|---|---|
 | `do_init` | 1 | 固件装载后是否执行同步初始化序列；`0` 表示只装载固件 |
 | `do_boot` | 1 | 是否下载固件；`0` 表示复用已在运行的固件，只做 IPC 初始化 |
-| `scan_probe` | 0 | 扫描时是否主动发送 probe request：`0` 被动（默认），`1` 自建 probe，`2` 逐字节重放厂商 probe（实测能收到 probe response）。主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道 |
+| `scan_probe` | 0 | 扫描时是否主动发送 probe request：`0` 被动（默认），`1` 自建 probe（尚未单独复验），`2` 逐字节重放厂商 probe（**已验证能收到 probe response**）。主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道 |
+| `tx_ep` | 5 | TX 端点号（实验开关，一般不用改） |
+| `tx_prep` | 1 | 切换信道前是否重放厂商的使能序列 |
+| `tx_variant` | 0 | TX 帧变体实验开关 |
 
-`/dev/zt9612` 的接口约定：`write()` 传入完整 `WLAN` 帧
-（`"WLAN" + u16 hlen + u16 type + payload`）并原样发往 EP8；`read()` 返回一条设备发来的
-完整帧，阻塞等待且 3 秒超时，支持 `O_NONBLOCK`。
+`/dev/zt9612` 的接口约定（调试通道，非数据面）：
+
+| 操作 | 语义 |
+|---|---|
+| `write()` | 传入完整 `WLAN` 帧（`"WLAN" + u16 hlen + u16 type + payload`），原样发往 EP8 |
+| `read()` | 返回一条设备发来的完整帧，阻塞等待且 3 秒超时，支持 `O_NONBLOCK`；保证整帧，半帧不会错位 |
+| `poll()` | 支持 `select()`/`poll()` 等待可读 |
+| ioctl `ZT_IOC_TXRAW` | 把一条完整 `WLAN` 帧直接交给 TX 端点，用于**不重载模块**就试验 TX 描述符与时序 |
+| debugfs `zt9612/tx_raw` | 同上，走写入方式（Secure Boot 的 `lockdown=integrity` 下 debugfs 不可写，通常用 ioctl） |
 
 内核 taint 提示：任何外部模块加载后内核都会被标记 `O`，未签名模块再加 `E`。
 因此 `cat /proc/sys/kernel/tainted` 非 0，以及 `dmesg` 中的

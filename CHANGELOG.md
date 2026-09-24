@@ -7,6 +7,40 @@
 
 ## [Unreleased]
 
+> 下一站 **v0.3 吞吐**。这里的条目在实机验证通过前不要写"已完成"。
+
+### Changed
+- 修正文档与代码不一致的历史遗留：`zt9612.conf` 补全全部 6 个模块参数并更新
+  `scan_probe` 说明（`2` 重放厂商 probe 已验证能收到 probe response，`1` 自建 probe 尚未单独复验）、
+  `install-driver.sh` 的能力说明改为 v0.2.0 的真实状态（不再 grep `wlan0`，
+  改为按实际接口名查找，因为接口名由 MAC 生成）、README 验收输出改用当前的 MAC 读取路径
+- 公开文件（README、CHANGELOG）不再出现本机真实 MAC、AP BSSID 与 SSID，改用占位符；
+  设备唯一信息只留在本地未入库的交接文档与进度日志里
+
+### Planned
+- **TX status 上报**：驱动目前发完即释放 skb，mac80211 的速率控制（minstrel_ht）
+  拿不到任何反馈。计划先按帧上报（`ieee80211_tx_status_irqsafe()`，
+  仅对置了 `IEEE80211_TX_CTL_REQ_TX_STATUS` 的帧），再评估固件侧是否存在真正的 TX 确认通道
+- **2.4 GHz 速率表补齐**：现在只有 4 个 CCK 速率（1/2/5.5/11 Mbps），
+  计划补上 OFDM 6~54 Mbps；5 GHz 已是 8 个 OFDM 速率
+- **HT/VHT 能力**：厂商 probe 帧里带 HT Capabilities，说明射频支持；最后再动 `band->ht_cap`，
+  因为声明之后 mac80211 会开始使用聚合，对发送队列的要求更高
+- 干净开机自动加载复验（D10 已修复，但"插卡 + 开机自动加载"这条完整路径尚未重跑）
+- RX 描述符里的**速率**字段：描述符 `+0x10`/`+0x25` 是弱候选，
+  USB 层抓包没有 radiotap 真值，宁缺勿猜
+- 清理驱动源码中历史遗留的乱码注释（必须与实机编译验证一起做）
+
+### Known limitations（已知限制，不是待办）
+- 实测速率恒定 1 Mbit/s：既因为速率表只有 CCK，也因为速率控制拿不到 TX status
+- WPA2-Enterprise（802.1X）路径未验证：实验环境没有 802.1X AP
+- 每次 `rmmod` 会泄漏一个实例（卸载时设备不应答在途 bulk-IN，驱动按设计宁可泄漏也不 UAF）；
+  换模块优先重启机器
+
+## [0.2.0] - 2026-09-24
+
+> 第一个**功能可用**的版本：双频扫描、关联、数据面、WPA2-PSK 全部实机验证；
+> 已知短板是吞吐（`iw link` 恒 1 Mbit/s）。
+
 ### Added
 - **WPA2 关联、加密与端到端联网打通（M3 验收全部达成）**：连接 WPA2-PSK 热点实测
   关联 226 ms、四次握手 344 ms、`WPA: Key negotiation completed [PTK=CCMP GTK=CCMP]`，
@@ -32,8 +66,8 @@
   -95..-20 兜底），`freq/band` 取 `+0x2A` 并在 wiphy 反查。实测 25 个不同取值、-94~-23 dBm、
   连扫两次平均差 0.53 dB、频率与各 AP 自报 DS IE 55/55 一致。**注意必须
   `ieee80211_hw_set(hw, SIGNAL_DBM)`**，否则 mac80211 不会把 signal 交给 cfg80211
-- **M3.3 关联打通（认证 + 关联均成功）**：实机 `iw dev <iface> connect -w WiFi_123456789` 返回
-  `connected to 48:7d:2e:6b:88:20`，驱动侧 `bss_info ... assoc=1 aid=1`，接口进入 `LOWER_UP`；
+- **M3.3 关联打通（认证 + 关联均成功）**：实机 `iw dev <iface> connect -w <SSID>` 返回
+  `connected to <AP 的 BSSID>`，驱动侧 `bss_info ... assoc=1 aid=1`，接口进入 `LOWER_UP`；
   关联后 `iw dev <iface> link` 显示 `tx bitrate 1.0 MBit/s`、DTIM/beacon 间隔等来自真实 AP 的信息
   - **mac80211 TX 路径**：`.tx` 与 `wake_tx_queue` 只做登记，真正的 `usb_bulk_msg()` 提交放在
     `tx_work`（这两个回调可能在软中断上下文执行，不能睡眠）。本内核把 TXQ 路径定为必选：
@@ -59,7 +93,7 @@
     跳过描述符后经 `ieee80211_rx_irqsafe()` 交给 mac80211
   - 扫描期间 RX URB 不能停，改用 `zt_cmd_fifo()` 从 URB 填充的 kfifo 取 CFM，避免与 URB
     抢同一个 IN 端点
-- M3.1 实机验证通过：无线接口注册成功（`wlan0` 按 MAC 命名为 `wlx00b4011a0012`），
+- M3.1 实机验证通过：无线接口注册成功（`wlan0` 按 MAC 重命名为可预测名，形如 `wlx` + MAC 十六进制），
   `iw dev`、`iw phy phy0 info`、`ethtool -i` 均正常；实测环境
   Ubuntu 24.04 / 内核 `7.0.0-31-generic`
 
@@ -70,10 +104,10 @@
   同批修复还包括：`assoc`/`aid` 在本内核已移到 `vif->cfg`，`bss_info_changed` 不能再用
   `bss_conf.assoc`
 - **MAC 读取错位 + `MM_ADD_IF_REQ` 少一字节（TX 一直不发射的根因）**：`0x0101` 应答的参数是
-  `{ u8 status; u8 mac[6]; }`（7 字节），旧代码把 `resp[0..5]` 当 MAC，得到错位的
-  `00:b4:01:1a:00:12`；真 MAC 是 `b4:01:1a:00:12:64`（抓包中 95 个发往本机的单播帧 addr1 证实）。
+  `{ u8 status; u8 mac[6]; }`（7 字节），旧代码把 `resp[0..5]` 当 MAC，于是 MAC 整体左移一字节、
+  末字节被 0 顶掉（抓包中 95 个发往本机的单播帧 addr1 证实了正确的六个字节在 `resp[1..6]`）。
   同时 `MM_ADD_IF_REQ` 按 rwnx 布局是 `{ u8 type; u8 mac[6]; u8 p2p; }`（8 字节，
-  抓包实测 `00 b4 01 1a 00 12 64 00`），旧代码只发 7 字节。二者叠加使固件中的 vif 建在错误地址上：
+  抓包实测参数为 `00` + 本机 MAC + `00`），旧代码只发 7 字节。二者叠加使固件中的 vif 建在错误地址上：
   主机 TX 帧被静默丢弃、RX 单播被地址过滤，扫描只能看到 beacon。修复后实测
   `MM_ADD_IF_CFM status=0 inst_nbr=0`、主动扫描 `probe=13 / probe-resp=18`（M3.4 打通），
   接口按真实 MAC 命名，并新增 `MM_ADD_IF_CFM` 状态日志便于回归
@@ -103,13 +137,24 @@
   原有内容与结论未变（本地交接文档同步做了同样的清理）
 - README 与 FAQ 更新 D10 的根因说明：原先怀疑的 xhci 枚举抖动、udev worker 阻塞均不成立
 
-### Planned
-- v0.3 吞吐：驱动目前不上报 TX status，mac80211 的速率控制拿不到反馈；同时 2.4G 只声明了
-  4 个 CCK 速率，实测恒定 1 Mbit/s。计划先上报 TX status、再补 OFDM 速率表；若 `iw link`
-  速率上升而实测传输不变，则说明固件自行选速，需转向"主机如何把速率告诉固件"的逆向
-- WPA2-Enterprise（802.1X）路径验证：当前实验环境无 802.1X AP，未验证
-- 解出 RX 描述符里的速率字段（USB 层抓包无 radiotap 真值，宁缺勿猜）
-- 清理 `driver/zt9612.c` 中历史遗留的乱码注释（需与编译验证一起做）
+### Known issues
+- **吞吐偏低**：实测速率恒定 1 Mbit/s（2.4G 只声明 4 个 CCK 速率，且驱动不上报 TX status，
+  速率控制拿不到反馈）。这是 v0.3 的目标，见 `[Unreleased]`
+- **每次 `rmmod` 泄漏一个实例**：卸载时设备不应答在途 bulk-IN，驱动按设计宁可泄漏也不
+  use-after-free；换模块优先重启机器
+- **WPA2-Enterprise（802.1X）未验证**：实验环境没有 802.1X AP
+- **干净开机自动加载未复验**：D10 的根因已修复，但"插卡 + 开机自动加载"这条完整路径
+  还没有重新跑过，因此 `install-driver.sh` 默认仍写 `blacklist zt9612`
+- `driver/zt9612.c` 部分中文注释在早期编辑中损坏成乱码（不影响编译），待清理
+
+### Verified（实机验证记录，供发布说明引用）
+- **稳定性回归**：10 轮 `rmmod`/`insmod`（12 次卸载中 11 次走到"泄漏实例"分支，但 10/10
+  次重新加载成功）、20 轮接口 up/down + 每轮 `iw scan`、NetworkManager 长跑 10 分钟、
+  3 轮热点断连重连（3/3 重新 `COMPLETED` 并拿到 DHCP 租约）—— 全程 **0 Oops / 0 BUG /
+  0 WARNING**，`rx.c:5475` 计数始终为 0
+- **DKMS 实装**：`dkms add/build/install` + `dkms status` 显示
+  `zt9612/0.2.0, <kernel>, x86_64: installed`；注意 Secure Boot 下 DKMS 3.0.11 即使配置了
+  `mok_signing_key` 也**不会给 `.ko.zst` 签名**，需就地补签（见 README「Secure Boot 签名」）
 
 ## [0.1.0] - 2026-09-24
 
@@ -151,5 +196,6 @@
 - `driver/zt9612.c` 中部分中文注释在早期编辑中损坏成乱码（不影响编译），待清理
 - 只支持 2.4G 频段、STA 模式；无蓝牙、无 AP / 监听模式
 
-[Unreleased]: https://github.com/Spkicn/zt9612-linux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Spkicn/zt9612-linux/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.1.0
