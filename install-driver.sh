@@ -153,9 +153,9 @@ fi
 if [ "$ENABLE_AUTOLOAD" -eq 1 ]; then
 	rm -f "$BLACKLIST"
 	echo
-	echo "⚠️  已启用自动加载：插上网卡（或开机）就会自动 probe 并装载固件。"
-	echo "    本项目曾观察到该路径导致机器启动后无法登录（见 README「已知问题」）。"
-	echo "    如果开机后机器异常，请参考 README 的恢复步骤。"
+	echo "注意：已启用自动加载。插上网卡（或开机）就会自动 probe 并装载固件。"
+	echo "      本项目曾观察到这条路径导致机器启动后无法登录（见 README 的「已知问题」）。"
+	echo "      如果开机后机器异常，请参考 README 中的恢复步骤。"
 else
 	printf 'blacklist %s\n' "$DRV_NAME" > "$BLACKLIST"
 	echo

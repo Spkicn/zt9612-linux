@@ -61,7 +61,7 @@ fi
 if lsmod | grep -q "^$DRV_NAME"; then
 	if [ "$FORCE_RMMOD" -eq 1 ]; then
 		echo
-		echo "⚠️  正在 rmmod $DRV_NAME ...（若命令长时间不返回，说明命中了已知的卸载死锁）"
+		echo "注意：正在 rmmod $DRV_NAME ...（若命令长时间不返回，说明命中了已知的卸载死锁）"
 		rmmod "$DRV_NAME" && echo "已卸载" || echo "rmmod 失败"
 	else
 		echo
