@@ -135,7 +135,7 @@ sudo ./install-driver.sh --dkms
 sudo dkms install .                  # 等价的手动方式
 ```
 
-`dkms.conf` 位于仓库根目录，版本为 `0.1.0`，安装到
+`dkms.conf` 位于仓库根目录，版本为 `0.2.0`，安装到
 `/lib/modules/<kernel>/updates/dkms/`。内核升级后 DKMS 会自动重建。Secure Boot 机器需要
 先配置好 MOK，否则新模块没有签名。
 
