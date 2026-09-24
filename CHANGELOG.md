@@ -38,7 +38,10 @@
   （udev 自动切模式）、`scripts/install-firmware.sh`（SHA-256 校验后安装固件）
 - 文档：`README.md`、`FAQ.md`、`supported-device-IDs`、`firmware/README.md`、
   `CONTRIBUTING.md`、`zt9612.conf`
-- CI：`.github/workflows/`（多内核版本编译、checkpatch、shellcheck）
+- CI：`.github/workflows/` —— `build`（ubuntu-24.04 阻塞门禁 + 低于编译下限的对照作业）、
+  `checkpatch`（仅 ERROR 阻塞）、`shellcheck`。首次运行的实测结论：
+  6.17.0-1022-azure 上**零告警编译通过**并正确生成 `alias: usb:v350Bp9612d*`；
+  6.8.0-1064-azure 因缺 `linux/unaligned.h` 失败 ⇒ 编译下限为 **6.12**
 
 ### Known issues
 - **M3.1 未验证**：`wlan0` 是否出现尚未在实机确认；当前驱动不提供可用的网络接口
