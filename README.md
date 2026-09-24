@@ -179,6 +179,24 @@ make sign
 `install-driver.sh` 检测到 Secure Boot 且没有密钥时，会引导完成上述步骤。
 `MOK.*` 已被 `.gitignore` 排除，不要提交。
 
+**DKMS + Secure Boot 实测注意（2026-09-24，dkms 3.0.11 / Ubuntu 24.04 / 模块压缩为 `.ko.zst`）**：
+`dkms add/build/install` 本身正常（`dkms status` 显示 `zt9612/0.2.0, <kernel>, x86_64: installed`），
+但在 `/etc/dkms/framework.conf` 里指定已注册的 `mok_signing_key` / `mok_certificate` 之后，
+DKMS 虽然打印 `Signing module …`，**安装到 `/lib/modules/$(uname -r)/updates/dkms/zt9612.ko.zst`
+的产物仍然没有签名**，`modprobe` 会以 `Key was rejected by service` 失败。就地补签即可：
+
+```bash
+KVER=$(uname -r); KO=/lib/modules/$KVER/updates/dkms/zt9612.ko.zst
+sudo zstd -d -f $KO -o /tmp/zt9612.ko
+sudo $KVER/build/scripts/sign-file sha256 MOK.priv MOK.pem /tmp/zt9612.ko   # 密钥路径按实际调整
+sudo zstd -f -q /tmp/zt9612.ko -o $KO
+sudo depmod -a && sudo modprobe zt9612
+modinfo -k $KVER zt9612 | grep signer      # 应显示已注册的签名者
+```
+
+补签后 `dkms status` 会提示 `WARNING! Diff between built and installed module!`（安装产物被重签过），
+属预期现象；下一次 `dkms install` 会再次覆盖成未签名版本，需要重复上面这一步。
+
 ## 验收
 
 ```bash
@@ -217,21 +235,34 @@ sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳�
 ```
 
 M3.1 已在 `7.0.0-31-generic` 上实机验证：`iw dev` 能看到 managed 接口，`iw phy phy0 info`
-列出 2.4 GHz 的 13 个信道与 4 个基础速率，`ethtool -i` 返回 `driver: zt9612`。
+列出 2.4 GHz **14** 个信道（含 2484）+ 5 GHz **25** 个信道（5180–5825），`ethtool -i`
+返回 `driver: zt9612`。
 注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（本机是 `wlx00b4011a0012`），
 用 `ls /sys/class/net | grep -E '^(wlx|wlan)'` 或 `iw dev` 查实际名字。
 
 ## 已知问题
 
-### 不要反复 rmmod / insmod
+### 反复 rmmod / insmod 会泄漏实例（已实测，可重载）
 
-连续卸载与加载曾两次把整机变成「能 ping、能连 22 端口，但 SSH 读不到 banner」。
-这两次都发生在 `wlan0` 出现之后，与上面那条 `cfg80211_get_drvinfo` 缺陷的表现一致；
-当时怀疑的「卸载路径死锁」只是推测，并没有证据（`dmesg` 里没有出现过
-`rx urb 2s 未回收`）。卸载路径仍然做了加固（`usb_poison_urb()` 加 2 秒上限，
-超时故意泄漏实例而不是无界阻塞），但修复后还没有专门做过一次「加载后卸载」的验证。
+2026-09-24 的稳定性回归（v0.2.0，10 轮 rmmod/insmod）实测：**12 次卸载里 11 次**出现
+`rx urb 2s 未回收（设备可能已挂死），泄漏该实例以避免 UAF` +
+`disconnected (teardown incomplete, instance leaked)`（唯一一次干净卸载紧跟在另一次干净
+卸载之后，设备还没进入"不再应答在途 URB"的状态）。
 
-在做过该验证之前，换模块请重启机器，`uninstall-driver.sh` 也默认不执行 `rmmod`。
+- 原因不是死锁：卸载时设备不再回应在途的 bulk-IN，`usb_poison_urb()` 之后 2 秒内收不到
+  completion，驱动按 D9 设计**故意泄漏该实例**（宁可泄漏也不 use-after-free）。
+- 之后 USB 会自行重新枚举（`350b:f179` 光驱 → `350b:9612` 网卡，约 8–11 秒），
+  所以重新加载必须等 ~20 秒；本轮 10/10 轮重新加载成功，接口与扫描全部恢复。
+- 同一轮回归的其他项目全部干净：20 次接口 up/down + 每次 `iw scan`（rc=0，51–58 个 BSS）、
+  10 分钟 NetworkManager 长跑（含自动扫描）、3 轮热点断连重连（3/3 重新 `COMPLETED` 并
+  拿到 DHCP 租约、`ping` 通网关）——全程 **0 Oops / 0 BUG / 0 WARNING**，
+  `rx.c:5475` 始终为 0，也没有再出现「能 ping 不能 SSH」的失联。
+- 代价：每次卸载泄漏一个实例（KB 级）；阶段 1 的 Slab 从 424.3 MB 涨到 425.5 MB
+  （含扫描等噪声，未做严格归因）。
+
+结论：**可以重载（等 20 秒），但每次卸载都有泄漏**。彻底消除需要在卸载前让固件停下来
+或更可靠地回收 URB，留作后续任务；在此之前「换模块优先重启」仍是更保险的做法，
+`uninstall-driver.sh` 也继续默认不执行 `rmmod`。
 
 ### 开机自动加载曾导致失联，根因已定位并修复
 
@@ -271,11 +302,12 @@ note: NetworkManager[1127] exited with irqs disabled
 
 ### 其它
 
-- 扫描结果的 `signal` 目前固定为 -50 dBm：RX 描述符里的 RSSI 字段语义尚未解码，
-  因此 `iw scan` 报告的信号强度不可信
+- 扫描结果的 `signal` 是**描述符里的真值**（int8 dBm，实测 −94…−23 dBm；同 AP 同信道组内
+  极差 ≤2 dB），`iw scan` 可直接用于判断远近
 - 单帧上限约 1000 字节，较大的 802.11 帧会被截断
 - 驱动源码中部分中文注释在早期编辑中损坏成乱码，不影响编译，待清理
-- 仅支持 2.4 GHz 与 STA 模式
+- 支持 2.4 GHz + 5 GHz、STA 模式；AP 模式与蓝牙未实现
+- 2.4 GHz 频段只声明 4 个 CCK 速率且驱动不上报 TX status，实测速率恒定 1 Mbit/s（吞吐偏低）
 - 0.x 阶段的接口（模块参数、`/dev` 协议）可能变化
 
 ## 调试
@@ -292,7 +324,7 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 |---|---|---|
 | `do_init` | 1 | 固件装载后是否执行同步初始化序列；`0` 表示只装载固件 |
 | `do_boot` | 1 | 是否下载固件；`0` 表示复用已在运行的固件，只做 IPC 初始化 |
-| `scan_probe` | 0 | 扫描时是否主动发送 probe request（M3.4 实验，TX 描述符尚未验证成功） |
+| `scan_probe` | 0 | 扫描时是否主动发送 probe request：`0` 被动（默认），`1` 自建 probe，`2` 逐字节重放厂商 probe（实测能收到 probe response）。主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道 |
 
 `/dev/zt9612` 的接口约定：`write()` 传入完整 `WLAN` 帧
 （`"WLAN" + u16 hlen + u16 type + payload`）并原样发往 EP8；`read()` 返回一条设备发来的
@@ -307,15 +339,17 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 
 ## 路线图
 
-| 步骤 | 目标 | 当前障碍 |
+| 步骤 | 目标 | 状态 |
 |---|---|---|
 | M3.1 | 注册 mac80211 并出现无线接口 | 已完成并实机验证 |
-| M3.2 | `iw dev <iface> scan` 能扫到 AP | 已完成并实机验证（被动扫描） |
-| M3.4 | TX 数据路径 | 已定位：EP5-OUT + 28 字节描述符；帧能被设备接受，但主动 probe 尚未收到响应，原因待查 |
-| M3.3 | `wpa_supplicant` 关联 | 认证与关联消息的参数布局，以及关联过程的 RX 事件解析；依赖 TX 路径 |
-| M3.4 | 能 ping 通 | TX 描述符语义完全解码、TXQ 与速率控制 |
+| M3.2 | `iw dev <iface> scan` 能扫到 AP | 已完成并实机验证（双频，一轮 59 个 BSS） |
+| M3.3 | 关联（开放 AP 与 WPA2-PSK） | 已完成并实机验证 |
+| M3.4 | 数据面与联网 | 已完成并实机验证（DHCP 租约 + `ping` 网关与公网） |
+| M3.5 | 5 GHz 频段 | 已完成并实机验证 |
+| 下一步 | 速率与吞吐 | 2.4 GHz 速率表与 TX status 上报（当前恒定 1 Mbit/s） |
+| 下一步 | WPA2-Enterprise（802.1X） | 代码路径未验证（实验环境无 802.1X AP） |
 | 收尾 | 协议细节 | `0x020c`、`0x0104`、`0x0105`、`0x050e` 的精确语义 |
-| 可选 | 扩展 | 5 GHz 频段、蓝牙（同芯片 BT 功能，属复合接口） |
+| 可选 | 扩展 | AP 模式、40/80 MHz、蓝牙（同芯片 BT 功能，属复合接口） |
 
 更省力的替代路线是向厂商索取官方 Linux 驱动
 （`ZTOP_ACEV100_Android_wifi_bt_*.tar.gz`，内含 `build_linux.sh`）。取得后本仓库可以转为
