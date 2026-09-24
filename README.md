@@ -62,7 +62,8 @@ AP（含 SSID、信道、加密与 HT/VHT 能力）。但关联与数据面尚�
 尚未实现：
 
 - 关联（`wpa_supplicant`）与数据传输（TX 直接丢包）
-- 主动扫描（probe request 需要 TX 路径）
+- 主动扫描：probe request 已能通过 EP5 发出（`scan_probe=1` 开启），但尚未验证成功
+  （收不到 probe response，原因待查），因此默认只做被动扫描
 - 5 GHz 频段、AP 模式、蓝牙
 
 ## 兼容性
@@ -278,6 +279,7 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 |---|---|---|
 | `do_init` | 1 | 固件装载后是否执行同步初始化序列；`0` 表示只装载固件 |
 | `do_boot` | 1 | 是否下载固件；`0` 表示复用已在运行的固件，只做 IPC 初始化 |
+| `scan_probe` | 0 | 扫描时是否主动发送 probe request（M3.4 实验，TX 描述符尚未验证成功） |
 
 `/dev/zt9612` 的接口约定：`write()` 传入完整 `WLAN` 帧
 （`"WLAN" + u16 hlen + u16 type + payload`）并原样发往 EP8；`read()` 返回一条设备发来的
@@ -296,8 +298,9 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 |---|---|---|
 | M3.1 | 注册 mac80211 并出现无线接口 | 已完成并实机验证 |
 | M3.2 | `iw dev <iface> scan` 能扫到 AP | 已完成并实机验证（被动扫描） |
-| M3.3 | `wpa_supplicant` 关联 | 认证与关联消息的参数布局，以及关联过程的 RX 事件解析 |
-| M3.4 | 能 ping 通 | TX 描述符格式未知（TXQ / host desc 如何填写）；主动扫描也依赖它 |
+| M3.4 | TX 数据路径 | 已定位：EP5-OUT + 28 字节描述符；帧能被设备接受，但主动 probe 尚未收到响应，原因待查 |
+| M3.3 | `wpa_supplicant` 关联 | 认证与关联消息的参数布局，以及关联过程的 RX 事件解析；依赖 TX 路径 |
+| M3.4 | 能 ping 通 | TX 描述符语义完全解码、TXQ 与速率控制 |
 | 收尾 | 协议细节 | `0x020c`、`0x0104`、`0x0105`、`0x050e` 的精确语义 |
 | 可选 | 扩展 | 5 GHz 频段、蓝牙（同芯片 BT 功能，属复合接口） |
 
