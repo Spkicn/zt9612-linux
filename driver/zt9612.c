@@ -38,6 +38,12 @@
 #define RX_FIFO_SIZE	(64 * 1024)
 #define HB_INTERVAL_MS	5000
 
+/* M3.2 扫描 */
+#define ZT_MAX_SCAN_CH	16		/* 只广播 2.4G，最多 14 个信道 */
+#define ZT_SCAN_DWELL_MS 120		/* 每信道停留时间 */
+#define T_RX_DATA0	0x0000		/* RX 数据帧（描述符 48 字节） */
+#define T_RX_DATA4	0x0004		/* RX 数据帧（描述符 52 字节） */
+
 #define T_IPC		0x0100
 #define T_FW_WRITE	0x0200
 #define T_FW_START	0x0201
@@ -80,6 +86,15 @@ struct zt_dev {
 
 	struct delayed_work	hb_work;
 	unsigned long		last_hb;
+
+	/* M3.2 扫描：hw_scan 在工作队列里逐个信道切换，期间把 RX 帧交给 mac80211 */
+	struct work_struct	scan_work;
+	u16			scan_freqs[ZT_MAX_SCAN_CH];
+	int			scan_nfreqs;
+	u16			scan_freq;
+	bool			scan_active;
+	bool			scan_aborted;
+	bool			scan_running;
 
 	struct miscdevice	misc;
 	bool			misc_ok;
@@ -233,6 +248,85 @@ static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 		return 0;
 	}
 	dev_warn(&z->intf->dev, "timeout waiting for cfm %#06x\n", want_cfm);
+	return -ETIMEDOUT;
+}
+
+/*
+ * M3.2：扫描期间 RX URB 一直在跑，不能再走 zt_recv() 的同步读（会和 URB 抢同一个
+ * IN 端点）。这里改为从 URB 填充的 kfifo 里取帧，语义与 zt_recv 相同。
+ */
+static int zt_kfifo_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(timeout_ms);
+
+	while (time_before(jiffies, end)) {
+		u8 hdr[2];
+		u16 flen;
+
+		if (kfifo_len(&z->rx_fifo) < 2) {
+			msleep(2);
+			continue;
+		}
+		if (kfifo_out_peek(&z->rx_fifo, hdr, 2) != 2)
+			continue;
+		flen = (u16)hdr[0] | ((u16)hdr[1] << 8);
+		if (flen < 8 || flen > MAX_FRAME) {
+			unsigned int d = kfifo_out(&z->rx_fifo, hdr, 2);	/* 脏数据，丢弃 */
+
+			(void)d;
+			continue;
+		}
+		if (kfifo_len(&z->rx_fifo) < 2 + flen) {
+			msleep(2);
+			continue;
+		}
+		if (kfifo_out(&z->rx_fifo, hdr, 2) != 2)
+			continue;
+		if (kfifo_out(&z->rx_fifo, z->rx, flen) != flen)
+			continue;
+		*len = flen;
+		*type = get_unaligned_le16(z->rx + 6);
+		return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
+		       int want_cfm, int timeout_ms)
+{
+	u8 *msg = z->pl;
+	unsigned long end;
+	int ret;
+
+	put_unaligned_le16(id, msg + 0);
+	put_unaligned_le16(0, msg + 2);
+	put_unaligned_le16(100, msg + 4);
+	put_unaligned_le16(plen, msg + 6);
+	if (plen && params)
+		memcpy(msg + 8, params, plen);
+
+	ret = zt_send(z, T_IPC, msg, 8 + plen);
+	if (ret)
+		return ret;
+	if (want_cfm < 0)
+		return 0;
+
+	end = jiffies + msecs_to_jiffies(timeout_ms);
+	while (time_before(jiffies, end)) {
+		u16 type = 0;
+		int len = 0;
+
+		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
+			zt_heartbeat(z);
+
+		if (zt_kfifo_recv(z, &type, &len, 50))
+			continue;
+		if (type != T_IPC || len < 8)
+			continue;
+		if (get_unaligned_le16(z->rx + 8) == (u16)want_cfm)
+			return 0;
+	}
+	dev_warn(&z->intf->dev, "scan: timeout waiting for cfm %#06x\n", want_cfm);
 	return -ETIMEDOUT;
 }
 
@@ -470,6 +564,49 @@ out:
 
 /* ------------------------------------------------------------------ 鏉╂劘顢戦弮鑸靛复閺€?*/
 
+/*
+ * M3.2：扫描期间把 RX 数据帧里的 802.11 帧交给 mac80211。
+ * RX 帧格式（第 9 轮实测）：WLAN 头 + 每帧描述符 + 802.11 帧；
+ *   type=0x0000 → 描述符 48 字节；type=0x0004 → 描述符 52 字节。
+ * 在 URB 完成上下文里调用，用 GFP_ATOMIC 并走 ieee80211_rx_irqsafe()。
+ */
+static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
+{
+	struct ieee80211_rx_status *st;
+	struct sk_buff *skb;
+	u16 hlen, type, freq;
+	int off, flen;
+
+	if (len < 8)
+		return;
+	hlen = get_unaligned_le16(buf + 4);
+	type = get_unaligned_le16(buf + 6);
+	if (type == T_RX_DATA0)
+		off = 48;
+	else if (type == T_RX_DATA4)
+		off = 52;
+	else
+		return;			/* IPC / 事件帧不往 mac80211 送 */
+	if (hlen <= off || 8 + hlen > len)
+		return;
+	flen = hlen - off;
+	if (flen < 24 || flen > 2304)
+		return;
+
+	skb = __dev_alloc_skb(flen + 32, GFP_ATOMIC);
+	if (!skb)
+		return;
+	skb_put_data(skb, buf + 8 + off, flen);
+
+	st = IEEE80211_SKB_RXCB(skb);
+	memset(st, 0, sizeof(*st));
+	freq = READ_ONCE(z->scan_freq);
+	st->freq = freq ? freq : 2412;
+	st->band = NL80211_BAND_2GHZ;
+	st->signal = -50;	/* 描述符里的 RSSI 语义未定，先给保守值 */
+	ieee80211_rx_irqsafe(z->hw, skb);
+}
+
 static void zt_rx_complete(struct urb *urb)
 {
 	struct zt_dev *z = urb->context;
@@ -488,9 +625,19 @@ static void zt_rx_complete(struct urb *urb)
 			kfifo_in(&z->rx_fifo, z->rx_buf, flen);
 			wake_up_interruptible(&z->rx_wait);
 		}
+		if (READ_ONCE(z->scan_active) && z->hw)
+			zt_rx_inject(z, z->rx_buf, len);
 	}
-	if (z->rx_running)
+	if (READ_ONCE(z->rx_running)) {
 		usb_submit_urb(urb, GFP_ATOMIC);
+	} else {
+		/*
+		 * D9：停止 RX 时也要唤醒等待者。原实现只在 alive==0 时 complete()，
+		 * 于是设备正常但 RX 处于空闲（URB 在途等数据）时，zt_rx_stop() 会白等满
+		 * 2 秒并走到"泄漏实例"分支。
+		 */
+		complete(&z->rx_done);
+	}
 }
 
 static int zt_rx_start(struct zt_dev *z)
@@ -738,6 +885,128 @@ static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *
 		ieee80211_free_txskb(hw, skb);
 	}
 }
+/* ------------------------------------------------------------------ M3.2 扫描 */
+
+/*
+ * 扫描前置序列，逐步照抄厂商抓包（第 9 轮实测的时序）：
+ *   SET_IDLE(0) → 0x0104(1) → SET_FILTER(98860215) → SET_FILTER(88860215)
+ *   → 0x0104(0) → SET_IDLE(1) → SET_IDLE(0) → 0x0104(1) → SET_FILTER(98860215)
+ * 每条都要等到对应 CFM 再发下一条。
+ */
+static int zt_scan_setup(struct zt_dev *z)
+{
+	static const u8 f1[4] = { 0x98, 0x86, 0x02, 0x15 };
+	static const u8 f2[4] = { 0x88, 0x86, 0x02, 0x15 };
+	u8 v;
+
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f1, 4, 0x000f, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f2, 4, 0x000f, 1000))
+		return -EIO;
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 0;
+	if (zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000))
+		return -EIO;
+	v = 1;
+	if (zt_cmd_fifo(z, 0x0104, &v, 1, 0x0105, 1000))
+		return -EIO;
+	if (zt_cmd_fifo(z, 0x000e, f1, 4, 0x000f, 1000))
+		return -EIO;
+	return 0;
+}
+
+static void zt_scan_work(struct work_struct *w)
+{
+	struct zt_dev *z = container_of(w, struct zt_dev, scan_work);
+	bool aborted = false, done = false;
+	u8 chan[12];
+	int i;
+
+	mutex_lock(&z->lock);
+	if (!READ_ONCE(z->alive)) {
+		aborted = true;
+		goto out;
+	}
+	dev_info(&z->intf->dev, "scan: 开始，%d 个信道\n", z->scan_nfreqs);
+	if (zt_scan_setup(z)) {
+		dev_warn(&z->intf->dev, "scan: 前置序列失败\n");
+		aborted = true;
+		goto out;
+	}
+	WRITE_ONCE(z->scan_active, true);
+	for (i = 0; i < z->scan_nfreqs; i++) {
+		u16 f = z->scan_freqs[i];
+
+		if (!READ_ONCE(z->alive) || z->scan_aborted) {
+			aborted = true;
+			break;
+		}
+		memset(chan, 0, sizeof(chan));
+		put_unaligned_le16(0, chan + 0);
+		put_unaligned_le16(f, chan + 2);
+		put_unaligned_le16(f, chan + 4);
+		put_unaligned_le16(20, chan + 10);
+		WRITE_ONCE(z->scan_freq, f);
+		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
+			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
+		msleep(ZT_SCAN_DWELL_MS);
+	}
+	done = !aborted;
+	if (done) {
+		u8 v = 1;
+
+		zt_cmd_fifo(z, 0x0022, &v, 1, 0x0023, 1000);	/* 回到 idle */
+	}
+out:
+	WRITE_ONCE(z->scan_active, false);
+	WRITE_ONCE(z->scan_freq, 0);
+	WRITE_ONCE(z->scan_running, false);
+	dev_info(&z->intf->dev, "scan: 结束（%s）\n", done ? "完成" : "中止");
+	mutex_unlock(&z->lock);
+
+	if (READ_ONCE(z->alive) && z->hw) {
+		/* 本内核（7.0）的签名是 cfg80211_scan_info，不是 bool */
+		struct cfg80211_scan_info info = { .aborted = aborted };
+
+		ieee80211_scan_completed(z->hw, &info);
+	}
+}
+
+static int zt_mac_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			  struct ieee80211_scan_request *hw_req)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+	struct cfg80211_scan_request *req = &hw_req->req;
+	int i;
+
+	if (READ_ONCE(z->scan_running))
+		return -EBUSY;
+	if (req->n_channels == 0 || req->n_channels > ZT_MAX_SCAN_CH)
+		return -EINVAL;
+
+	mutex_lock(&z->lock);
+	for (i = 0; i < req->n_channels; i++)
+		z->scan_freqs[i] = req->channels[i]->center_freq;
+	z->scan_nfreqs = req->n_channels;
+	z->scan_aborted = false;
+	WRITE_ONCE(z->scan_running, true);
+	mutex_unlock(&z->lock);
+
+	schedule_work(&z->scan_work);
+	return 0;
+}
+
 static const struct ieee80211_ops zt_mac_ops = {
 	.start = zt_mac_start,
 	.stop = zt_mac_stop,
@@ -747,6 +1016,8 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.tx = zt_mac_tx,
 	.configure_filter = zt_mac_configure_filter,
 	.wake_tx_queue = zt_mac_wake_tx_queue,
+	/* M3.2：被动扫描（只听 beacon），probe request 的 TX 留到 M3.4 */
+	.hw_scan = zt_mac_hw_scan,
 	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
@@ -827,6 +1098,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	init_completion(&z->rx_done);
 	z->alive = true;		/* 从这里开始才允许 USB IO */
 	INIT_DELAYED_WORK(&z->hb_work, zt_hb_work);
+	INIT_WORK(&z->scan_work, zt_scan_work);
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
@@ -904,6 +1176,8 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 err_kfifo:
 	usb_set_intfdata(intf, NULL);
 	WRITE_ONCE(z->alive, false);
+	z->scan_aborted = true;
+	cancel_work_sync(&z->scan_work);
 	cancel_delayed_work_sync(&z->hb_work);
 	if (zt_rx_stop(z))		/* 泄漏实例，避免 use-after-free */
 		return ret;
@@ -932,6 +1206,8 @@ static void zt_disconnect(struct usb_interface *intf)
 	 * 4) 回收 RX URB（有界等待，见 zt_rx_stop）。
 	 */
 	WRITE_ONCE(z->alive, false);
+	z->scan_aborted = true;
+	cancel_work_sync(&z->scan_work);	/* 扫描可能正在切信道，先等它退出 */
 	cancel_delayed_work_sync(&z->hb_work);
 	wake_up_interruptible_all(&z->rx_wait);	/* 唤醒阻塞中的 read() */
 
