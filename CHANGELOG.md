@@ -7,15 +7,32 @@
 
 ## [Unreleased]
 
+### Added
+- M3.1 实机验证通过：无线接口注册成功（`wlan0` 按 MAC 命名为 `wlx00b4011a0012`），
+  `iw dev`、`iw phy phy0 info`、`ethtool -i` 均正常；实测环境
+  Ubuntu 24.04 / 内核 `7.0.0-31-generic`
+
+### Fixed
+- **修复「开机自动加载后整机失联」的根因（原 D10）**：注册 wiphy 时缺少
+  `SET_IEEE80211_DEV()`，`wiphy_dev(wiphy)` 为 NULL。无线接口出现后 NetworkManager
+  立即通过 `SIOCETHTOOL` 查询驱动信息，`cfg80211_get_drvinfo()` 空指针崩溃并带关中断
+  退出，导致用户态卡死（能 ping、22 端口能连、SSH 无 banner）。崩溃现场见上一版
+  日志：`BUG: kernel NULL pointer dereference, address: 0x68`，`Comm: NetworkManager`，
+  `RIP: cfg80211_get_drvinfo`。修复后 `ethtool -i` 返回 `driver: zt9612`，
+  NetworkManager 与 sshd 全程存活，`dmesg` 无 oops
+
 ### Changed
 - 文档统一去除 emoji，README、CONTRIBUTING、FAQ 重写为更平实的措辞；
   原有内容与结论未变（本地交接文档同步做了同样的清理）
+- README 与 FAQ 更新 D10 的根因说明：原先怀疑的 xhci 枚举抖动、udev worker 阻塞均不成立
 
 ### Planned
-- M3.2 扫描：`iw dev wlan0 scan` 触发逐信道扫描并上报 AP
+- M3.2 扫描：需要实现 `hw_scan`（或 `sw_scan_start/complete`）并接通扫描通道。
+  现状：`iw scan` 静默返回零结果，驱动侧没有任何动作
 - M3.3 关联：`wpa_supplicant` 关联成功
-- M3.4 数据面：TX 描述符 / RX 数据路径（当前最大的未知项）
+- M3.4 数据面：TX 描述符与 RX 数据路径（当前最大的未知项）
 - 清理 `driver/zt9612.c` 中历史遗留的乱码注释（需与编译验证一起做）
+- 复验卸载路径：修复后尚未专门做过「加载后 rmmod」的验证（原 D9）
 
 ## [0.1.0] - 2026-09-24
 
