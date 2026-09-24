@@ -55,6 +55,7 @@
 #define EP_TX_NUM	5
 #define TX_DESC_LEN	28
 #define TX_TYPE_DATA	0x0000		/* TX 数据帧的 WLAN type（与 RX 侧 0x0000 同值） */
+#define ZT_MAX_PEND_TXQ	16		/* wake_tx_queue 一次最多登记几个待处理队列 */
 
 #define T_IPC		0x0100
 #define T_FW_WRITE	0x0200
@@ -93,6 +94,10 @@ MODULE_PARM_DESC(scan_probe, "0=passive scan (default), 1=send own probe request
 static int tx_ep = EP_TX_NUM;		/* 发送端点号（5/6/7 试验） */
 module_param(tx_ep, int, 0644);
 MODULE_PARM_DESC(tx_ep, "TX bulk OUT endpoint number (default 5)");
+
+static int tx_prep = 1;			/* 切信道前是否重放厂商的使能序列 */
+module_param(tx_prep, int, 0644);
+MODULE_PARM_DESC(tx_prep, "replay the vendor TX-enable sequence before SET_CHANNEL (default 1)");
 
 static int tx_variant;			/* 0=正常 1=描述符+0x00 置 0 2=不带描述符 3=补齐到 512 */
 module_param(tx_variant, int, 0644);
@@ -151,11 +156,22 @@ struct zt_dev {
 
 	struct ieee80211_hw	*hw;
 	unsigned long		tx_dropped;
+	/* M3.3：mac80211 的发送队列 + 提交工作。.tx 可能在软中断上下文被调用，
+	 * 而 usb_bulk_msg() 会睡眠，所以入队与提交必须分开。 */
+	struct sk_buff_head	txq;
+	struct work_struct	tx_work;
+	unsigned long		tx_path_frames;
+	/* wake_tx_queue 只登记"哪个队列有活"，提交在 tx_work 里做 */
+	struct ieee80211_txq	*txq_pend[ZT_MAX_PEND_TXQ];
+	int			txq_n;
+	spinlock_t		txq_lock;
+	unsigned long		txq_overflow;
 
 	struct mutex		lock;
 };
 
 static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len);
+static int zt_scan_setup(struct zt_dev *z);
 
 /* ------------------------------------------------------------------ 閸╄櫣顢?*/
 
@@ -1020,7 +1036,12 @@ static void zt_rx_complete(struct urb *urb)
 			kfifo_in(&z->rx_fifo, z->rx_buf, flen);
 			wake_up_interruptible(&z->rx_wait);
 		}
-		if (READ_ONCE(z->scan_active) && z->hw)
+		/*
+		 * RX 注入必须常开，不能只在扫描期间做：认证/关联/数据帧都要交给
+		 * mac80211。早期版本用 scan_active 门控，导致扫描之外收到的一切
+		 * 管理帧都被丢掉，表现为 iw connect 永远超时。
+		 */
+		if (READ_ONCE(z->hw))
 			zt_rx_inject(z, z->rx_buf, len);
 	}
 	if (READ_ONCE(z->rx_running)) {
@@ -1276,8 +1297,115 @@ static void zt_mac_remove_interface(struct ieee80211_hw *hw, struct ieee80211_vi
 	dev_info(&z->intf->dev, "mac80211: remove_interface\n");
 }
 
+/* 切换信道：厂商格式的 12 字节参数（5 GHz 时首字段为 1）。 */
+static int zt_set_channel(struct zt_dev *z, u16 freq)
+{
+	u8 chan[12];
+
+	memset(chan, 0, sizeof(chan));
+	put_unaligned_le16(freq > 2500 ? 1 : 0, chan + 0);
+	put_unaligned_le16(freq, chan + 2);
+	put_unaligned_le16(freq, chan + 4);
+	put_unaligned_le16(0x14, chan + 10);
+	return zt_cmd_fifo(z, 0x0010, chan, sizeof(chan), 0x0011, 1000);
+}
+
+/*
+ * M3.3：把 mac80211 交下来的 skb 提交到 EP5-OUT。
+ * 本内核（7.0）要求驱动必须实现 wake_tx_queue（TXQ 路径），而 wake_tx_queue 与 .tx
+ * 都可能在软中断上下文里执行、不能直接 usb_bulk_msg()，所以两者都只做登记，
+ * 真正的 USB 提交统一在 tx_work（进程上下文，可以睡眠）里做。
+ */
+static void zt_tx_one(struct zt_dev *z, struct ieee80211_hw *hw, struct sk_buff *skb,
+		      bool legacy)
+{
+	int ret;
+
+	mutex_lock(&z->lock);
+	ret = zt_tx_frame(z, skb->data, skb->len);
+	mutex_unlock(&z->lock);
+	if (ret) {
+		z->tx_dropped++;
+		if (legacy)
+			dev_kfree_skb_any(skb);
+		else
+			ieee80211_free_txskb(hw, skb);
+		return;
+	}
+	z->tx_path_frames++;
+	dev_kfree_skb_any(skb);
+}
+
+static void zt_tx_work(struct work_struct *w)
+{
+	struct zt_dev *z = container_of(w, struct zt_dev, tx_work);
+	struct ieee80211_txq *pend[ZT_MAX_PEND_TXQ];
+	unsigned long flags;
+	struct sk_buff *skb;
+	int n, i;
+
+	for (;;) {
+		/* 1) 传统 .tx 路径登记进来的 skb */
+		while ((skb = skb_dequeue(&z->txq)))
+			zt_tx_one(z, z->hw, skb, true);
+
+		/* 2) TXQ 路径：取出本轮被唤醒的队列，逐个 dequeue 到空 */
+		spin_lock_irqsave(&z->txq_lock, flags);
+		n = z->txq_n;
+		memcpy(pend, z->txq_pend, n * sizeof(pend[0]));
+		z->txq_n = 0;
+		spin_unlock_irqrestore(&z->txq_lock, flags);
+		if (!n)
+			return;
+		for (i = 0; i < n; i++) {
+			while ((skb = ieee80211_tx_dequeue(z->hw, pend[i])))
+				zt_tx_one(z, z->hw, skb, false);
+		}
+	}
+}
+
+static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&z->txq_lock, flags);
+	for (i = 0; i < z->txq_n; i++) {
+		if (z->txq_pend[i] == txq)
+			goto out;
+	}
+	if (z->txq_n < ZT_MAX_PEND_TXQ)
+		z->txq_pend[z->txq_n++] = txq;
+	else
+		z->txq_overflow++;
+out:
+	spin_unlock_irqrestore(&z->txq_lock, flags);
+	schedule_work(&z->tx_work);
+}
+
+/* M3.3：mac80211 切信道时同步给固件，认证/关联帧才有正确的射频配置 */
 static int zt_mac_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
+	struct zt_dev *z = zt_from_hw(hw);
+	u16 freq;
+
+	if (!(changed & IEEE80211_CONF_CHANGE_CHANNEL) || !hw->conf.chandef.chan)
+		return 0;
+	freq = hw->conf.chandef.chan->center_freq;
+	if (!READ_ONCE(z->alive))
+		return 0;
+	mutex_lock(&z->lock);
+	/* 厂商在发第一帧之前会补一遍使能序列（SET_IDLE / 0x0104 / SET_FILTER），
+	 * 顺序是"使能序列 → SET_CHANNEL → TX"。扫描路径有自己的前置序列，
+	 * 关联/数据路径（mac80211 通过 config 切信道）必须在这里补上。 */
+	if (tx_prep && zt_scan_setup(z))
+		dev_warn(&z->intf->dev, "config: 前置序列失败\n");
+	if (zt_set_channel(z, freq))
+		dev_warn(&z->intf->dev, "config: 切到 %u MHz 无 CFM\n", freq);
+	else
+		dev_info(&z->intf->dev, "config: 信道 -> %u MHz\n", freq);
+	mutex_unlock(&z->lock);
 	return 0;
 }
 
@@ -1287,8 +1415,13 @@ static void zt_mac_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *cont
 {
 	struct zt_dev *z = zt_from_hw(hw);
 
-	z->tx_dropped++;
-	ieee80211_free_txskb(hw, skb);
+	if (!READ_ONCE(z->alive)) {
+		z->tx_dropped++;
+		ieee80211_free_txskb(hw, skb);
+		return;
+	}
+	skb_queue_tail(&z->txq, skb);
+	schedule_work(&z->tx_work);
 }
 
 static void zt_mac_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
@@ -1298,16 +1431,14 @@ static void zt_mac_configure_filter(struct ieee80211_hw *hw, unsigned int change
 	*total_flags = 0;
 }
 
-/* M3.1: modern TX API is mandatory in this kernel; dequeue and drop for now (data path = M3.4) */
-static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
+/* M3.3：关联状态观测（认证/关联是否走通，先看 bss_info 回调） */
+static void zt_mac_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+				    struct ieee80211_bss_conf *info, u64 changed)
 {
 	struct zt_dev *z = zt_from_hw(hw);
-	struct sk_buff *skb;
 
-	while ((skb = ieee80211_tx_dequeue(hw, txq))) {
-		z->tx_dropped++;
-		ieee80211_free_txskb(hw, skb);
-	}
+	dev_info(&z->intf->dev, "bss_info: changed=%#llx assoc=%d aid=%u bssid=%pM\n",
+		 changed, vif->cfg.assoc, (unsigned int)vif->cfg.aid, info->bssid);
 }
 /* ------------------------------------------------------------------ M3.2 扫描 */
 
@@ -1467,7 +1598,9 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.config = zt_mac_config,
 	.tx = zt_mac_tx,
 	.configure_filter = zt_mac_configure_filter,
+	/* 本内核把 TXQ 路径定为必选：alloc_hw 会检查 wake_tx_queue 是否存在 */
 	.wake_tx_queue = zt_mac_wake_tx_queue,
+	.bss_info_changed = zt_mac_bss_info_changed,
 	/* M3.2：被动扫描（只听 beacon），probe request 的 TX 留到 M3.4 */
 	.hw_scan = zt_mac_hw_scan,
 	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
@@ -1551,6 +1684,9 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	z->alive = true;		/* 从这里开始才允许 USB IO */
 	INIT_DELAYED_WORK(&z->hb_work, zt_hb_work);
 	INIT_WORK(&z->scan_work, zt_scan_work);
+	INIT_WORK(&z->tx_work, zt_tx_work);
+	skb_queue_head_init(&z->txq);
+	spin_lock_init(&z->txq_lock);
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
@@ -1669,6 +1805,11 @@ static void zt_disconnect(struct usb_interface *intf)
 	WRITE_ONCE(z->alive, false);
 	z->scan_aborted = true;
 	cancel_work_sync(&z->scan_work);	/* 扫描可能正在切信道，先等它退出 */
+	cancel_work_sync(&z->tx_work);		/* 在途 TX 提交也要收尾 */
+	skb_queue_purge(&z->txq);
+	spin_lock_irq(&z->txq_lock);
+	z->txq_n = 0;
+	spin_unlock_irq(&z->txq_lock);
 	cancel_delayed_work_sync(&z->hb_work);
 	wake_up_interruptible_all(&z->rx_wait);	/* 唤醒阻塞中的 read() */
 
