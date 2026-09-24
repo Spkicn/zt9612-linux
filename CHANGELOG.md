@@ -8,6 +8,12 @@
 ## [Unreleased]
 
 ### Added
+- **M3.5 5GHz 支持**：注册 `NL80211_BAND_5GHZ`（5180..5825 共 25 个信道，与厂商扫描列表一致）
+  与 OFDM 速率表；2.4G 表补上 `2484`(ch14) 并用 wiphy 的 `hw_value` 填 DS 参数（修掉 2484 被算成 15
+  的老 bug）。probe 模板按频率分叉：2.4G 保留 DS 参数补丁，**5GHz 完全按厂商模板不改帧**
+  （5G 帧里没有信道字节，原补丁会写坏 HT Capabilities）；主动探测跳过 `NO_IR`/`RADAR` 信道。
+  实机：`iw phy info` 两个频段（14 + 25 信道）、`iw scan` 59 个 BSS 中 7 个 5GHz、关联与
+  WARNING 检查均无回归
 - **M3.4 数据面打通**：关联开放 AP 后，广播 ARP 请求能出网并收到网关应答，单播回包正常回收，
   IPv4 组播（mDNS/IGMP）与 IPv6（RS/MLD）数据帧均正常收发；主动扫描实测
   `probe=13 → probe-resp=22`。判定依据：同链路 ARP 完整往返，说明收发路径本身无缺陷，

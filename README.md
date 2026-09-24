@@ -19,6 +19,7 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 | M3.2 扫描 | 完成，已实机验证（`iw scan` 实测 40+ 个 BSS） |
 | M3.3 关联 | 完成，已实机验证（`iw connect` 关联开放 AP，`assoc=1`、接口 `LOWER_UP`） |
 | M3.4 数据面 | 完成，已实机验证（关联后广播 ARP 出网并收到网关应答、单播回包正常回收）；IP 地址取决于 AP 是否提供 DHCP |
+| M3.5 5GHz | 完成，已实机验证（`iw phy info` 列出 2.4G 14 信道 + 5G 25 信道；`iw scan` 59 个 BSS 中 7 个在 5GHz） |
 
 加载驱动后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，例如 `wlxb4011a001264`），
 `iw dev`、`iw scan`、`iw connect`、`ethtool -i`、`/dev/zt9612` 都可用。扫描能列出周围 AP
