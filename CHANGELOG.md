@@ -8,6 +8,14 @@
 ## [Unreleased]
 
 ### Added
+- **WPA2 关联、加密与端到端联网打通（M3 验收全部达成）**：连接 WPA2-PSK 热点实测
+  关联 226 ms、四次握手 344 ms、`WPA: Key negotiation completed [PTK=CCMP GTK=CCMP]`，
+  `wpa_cli status` 报 `wpa_state=COMPLETED`；随后 DHCP 拿到 `192.168.43.8/24`（租约 6 h），
+  `ping` 网关 3/4、`ping 223.5.5.5` 3/3（48~69 ms）、`ping 8.8.8.8` 3/3（54~82 ms），
+  全程 0 条 Oops/WARNING。**本项驱动零改动**：mac80211 自带默认加密套件表
+  （`iw phy info` 列出 WEP/TKIP/CCMP/GCMP 共 7 个），且 `set_key` 为空时自动回退软件加密
+  （`ieee80211_key_enable_hw_accel` 的 `je` 分支），因此无需注册 `cipher_suites`、也无需实现
+  `set_key`——CCMP 由 mac80211 软件完成
 - **M3.5 5GHz 支持**：注册 `NL80211_BAND_5GHZ`（5180..5825 共 25 个信道，与厂商扫描列表一致）
   与 OFDM 速率表；2.4G 表补上 `2484`(ch14) 并用 wiphy 的 `hw_value` 填 DS 参数（修掉 2484 被算成 15
   的老 bug）。probe 模板按频率分叉：2.4G 保留 DS 参数补丁，**5GHz 完全按厂商模板不改帧**
