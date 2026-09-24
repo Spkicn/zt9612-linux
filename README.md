@@ -8,7 +8,8 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 
 ## 项目状态
 
-当前版本 0.1.0，功能尚未完成。
+当前版本 0.2.0：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
+端到端联网（DHCP + `ping` 外网）均已实机验证。
 
 | 里程碑 | 状态 |
 |---|---|
@@ -23,10 +24,11 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 | WPA2 关联与加密 | 完成，已实机验证（WPA2-PSK 热点：关联 226 ms、四次握手 344 ms、`PTK=CCMP GTK=CCMP`、DHCP 拿到租约、`ping` 外网 3/3） |
 
 加载驱动后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，例如 `wlxb4011a001264`），
-`iw dev`、`iw scan`、`iw connect`、`ethtool -i`、`/dev/zt9612` 都可用。扫描能列出周围 AP
-（含 SSID、信道、加密、HT/VHT 能力与**真实信号强度**）。关联与数据面均已走通：关联成功后
-广播 ARP 能出网并收到网关应答、单播回包正常回收。**WPA2 握手尚未验证**，实际能否联网
-取决于所连 AP 是否提供 DHCP。
+`iw dev`、`iw scan`、`iw connect`、`ethtool -i`、`/dev/zt9612` 都可用。扫描覆盖 2.4 GHz 与
+5 GHz，能列出周围 AP（含 SSID、信道、加密、HT/VHT 能力与**真实信号强度**）。关联、加密与
+数据面均已走通：WPA2-PSK 热点下四次握手到 `COMPLETED`（`PTK=CCMP GTK=CCMP`，CCMP 由
+mac80211 软件加解密），DHCP 能拿到租约，`ping` 网关与公网均通。WPA2-Enterprise（802.1X）
+的代码路径**未验证**——当前实验环境里没有任何 802.1X AP。
 
 > 扫描支持被动与主动两种：模块参数 `scan_probe` 控制是否由驱动自己发 probe request
 > （`0`=被动，`1`=自建 probe，`2`=逐字节重放厂商 probe）；mac80211 触发的扫描走同一条 TX 路径。
@@ -59,23 +61,29 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 - 同步 IPC 初始化：`MM_RESET`、`MM_VERSION`、厂商私有段、`MM_START`（约 6.5 秒）、
   `MM_SET_IDLE`、`MM_ADD_IF`、`MM_SET_SLOTTIME`、`MM_SET_CHANNEL`
 - 5 秒心跳维持固件存活；`/dev/zt9612` 上收发原始 `WLAN` 帧
-- 注册 mac80211：出现 managed 模式的无线接口，2.4 GHz 13 个信道、4 个基础速率，
+- 注册 mac80211：出现 managed 模式的无线接口，**2.4 GHz 14 个信道（含 2484）+ 5 GHz 25 个信道**，
   `iw dev`、`iw phy`、`ethtool -i` 均可正常读取
-- **扫描**：实现 `hw_scan` 与 RX 数据路径，`iw scan` 能列出周围 AP
-  （实机实测 42 个 BSS，含 SSID、信道、加密、HT/VHT 能力）
+- **扫描**：实现 `hw_scan` 与 RX 数据路径，mac80211 会把一次 `iw scan` 按频段拆成两段
+  （2.4 GHz 14 信道 + 5 GHz 25 信道）；实机实测一轮 59 个 BSS，其中 7 个在 5 GHz
+- **关联与数据面**：`iw connect` 关联开放 AP 成功，TX/RX 双向正常，`iw link` 计数增长
+- **WPA2-PSK 加密**：四次握手到 `wpa_state=COMPLETED`（`PTK=CCMP GTK=CCMP`），DHCP 拿到
+  租约并 `ping` 通网关与公网；驱动不实现 `set_key`，CCMP 由 mac80211 走软件加解密
 
 尚未实现：
 
-- 关联（`wpa_supplicant`）与数据传输（TX 直接丢包）
-- 主动扫描：probe request 已能通过 EP5 发出（`scan_probe=1` 开启），但尚未验证成功
-  （收不到 probe response，原因待查），因此默认只做被动扫描
-- 5 GHz 频段、AP 模式、蓝牙
+- WPA2-Enterprise（802.1X）：代码路径未验证（实验环境无 802.1X AP；`wpa_supplicant`
+  的 EAP 配置与 PSK 路径共用同一条数据面）
+- 主动扫描默认关闭（`scan_probe=0` 为被动）：`scan_probe=2` 的厂商 probe 回放已实测能收到
+  probe response，且主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道
+- 吞吐优化：2.4 GHz 频段只声明 4 个 CCK 速率，且驱动不上报 TX status，
+  实测速率恒定 1 Mbit/s（功能正常，吞吐偏低）
+- AP 模式、蓝牙、40/80 MHz 带宽
 
 ## 兼容性
 
 | 项目 | 值 |
 |---|---|
-| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64），M1/M2 通过 |
+| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）：M1–M3.5 + WPA2-PSK 全部通过（固件装载、IPC、mac80211、双频扫描、关联、DHCP 与公网 `ping`） |
 | 已验证可编译 | `6.17.0-1022-azure`（CI，ubuntu-24.04 runner，无告警）；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
 | 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h`，CI 上 6.8 内核即因缺该头文件失败 |
 | 未验证区间 | 6.12~6.16 能否正常工作未验证；mac80211 ops 签名只在 6.17 及以上确认匹配 |
@@ -136,7 +144,7 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 ```bash
 sudo dkms install .                          # add、build、install 一步完成
 dkms status
-sudo dkms remove zt9612/0.1.0 --all
+sudo dkms remove zt9612/0.2.0 --all
 ```
 
 手动编译的等价流程：
