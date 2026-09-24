@@ -150,6 +150,11 @@ struct zt_dev {
 	/* 观测：设备发来的所有 IPC 消息 id（对比厂商抓包，找缺失的通知） */
 	u16			seen_ids[16];
 	unsigned long		seen_cnt[16];
+	/* 观测：RX 状态量的来源（描述符真值 vs 兜底），扫描结束时打印 */
+	unsigned long		rx_freq_desc;	/* 用描述符 +0x2A 频率的帧数 */
+	unsigned long		rx_freq_fb;	/* 描述符频率不可用 → 退回扫描信道 */
+	unsigned long		rx_freq_ne_scan;/* 描述符频率 != 当前扫描信道 */
+	unsigned long		rx_rssi_fb;	/* RSSI 越界 → 退回 -50 的帧数 */
 
 	struct miscdevice	misc;
 	bool			misc_ok;
@@ -957,34 +962,51 @@ static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len)
 static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
 {
 	struct ieee80211_rx_status *st;
+	struct ieee80211_channel *chan;
 	struct sk_buff *skb;
+	const u8 *d, *payload;
 	u16 hlen, type, freq;
+	s8 rssi;
 	int off, flen;
 
 	if (len < 8)
 		return;
 	hlen = get_unaligned_le16(buf + 4);
 	type = get_unaligned_le16(buf + 6);
-	if (type == T_RX_DATA0)
+
+	/*
+	 * 描述符归一化：type=0x0004 的 52 字节描述符 = 4 字节 00 前缀 +
+	 * 与 type=0x0000 的 48 字节逐字节同布局的结构（整体偏移 +4），
+	 * 所以丢掉前 4 字节后按同一套偏移读取（re/REPORT_RX_DESC.md §4）。
+	 * 一律按 type 判定，不用"前 4 字节是否为 0"来猜。
+	 */
+	switch (type) {
+	case T_RX_DATA0:
 		off = 48;
-	else if (type == T_RX_DATA4)
+		d = buf + 8;
+		break;
+	case T_RX_DATA4:
 		off = 52;
-	else
+		d = buf + 12;		/* payload + 4 */
+		break;
+	default:
 		return;			/* IPC / 事件帧不往 mac80211 送 */
+	}
 	if (hlen <= off || 8 + hlen > len)
 		return;
 	flen = hlen - off;
 	if (flen < 24 || flen > 2304)
 		return;
+	payload = buf + 8 + off;
 
 	skb = __dev_alloc_skb(flen + 32, GFP_ATOMIC);
 	if (!skb)
 		return;
-	skb_put_data(skb, buf + 8 + off, flen);
+	skb_put_data(skb, payload, flen);
 
 	/* 统计：beacon(0x80) 与 probe response(0x50)，用于验证 TX 是否真的发出去了 */
 	if (flen >= 24) {
-		u16 fc = get_unaligned_le16(buf + 8 + off);
+		u16 fc = get_unaligned_le16(payload);
 
 		if ((fc & 0x00fc) == 0x0080)
 			z->rx_beacons++;
@@ -994,10 +1016,39 @@ static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
 
 	st = IEEE80211_SKB_RXCB(skb);
 	memset(st, 0, sizeof(*st));
-	freq = READ_ONCE(z->scan_freq);
-	st->freq = freq ? freq : 2412;
-	st->band = NL80211_BAND_2GHZ;
-	st->signal = -50;	/* 描述符里的 RSSI 语义未定，先给保守值 */
+
+	/*
+	 * d 指向归一化（48B 坐标系）描述符，字段语义见 re/REPORT_RX_DESC.md：
+	 *   +0x0E  int8 RSSI（dBm，抓包实测 -87~-42，同组内极差 <=2 dB）
+	 *   +0x28  band（0 = 2.4 GHz，1 = 5 GHz）
+	 *   +0x2A  u16 中心频率 MHz（真实接收信道：切信道后有最长 ~22 ms 延迟）
+	 */
+	rssi = (s8)d[0x0E];
+	if (rssi < -95 || rssi > -20) {	/* 合理性兜底：越界时退回旧行为 */
+		rssi = -50;
+		z->rx_rssi_fb++;
+	}
+	st->signal = rssi;
+	st->chains = BIT(0);
+	st->chain_signal[0] = rssi;
+
+	freq = get_unaligned_le16(d + 0x2A);
+	chan = freq ? ieee80211_get_channel(z->hw->wiphy, freq) : NULL;
+	if (chan) {
+		z->rx_freq_desc++;
+		if (freq != READ_ONCE(z->scan_freq))
+			z->rx_freq_ne_scan++;
+	} else {
+		/* 未注册的频段（例如 5G 尚未加进 wiphy）不能用，退回本次扫描信道，
+		 * 否则 mac80211 查不到 channel 会把这一帧丢掉。 */
+		z->rx_freq_fb++;
+		freq = READ_ONCE(z->scan_freq);
+		if (!freq)
+			freq = 2412;
+		chan = ieee80211_get_channel(z->hw->wiphy, freq);
+	}
+	st->freq = freq;
+	st->band = chan ? chan->band : NL80211_BAND_2GHZ;
 	ieee80211_rx_irqsafe(z->hw, skb);
 }
 
@@ -1499,6 +1550,10 @@ static void zt_scan_work(struct work_struct *w)
 	z->tx_probes = 0;
 	z->rx_beacons = 0;
 	z->rx_probe_resp = 0;
+	z->rx_freq_desc = 0;
+	z->rx_freq_fb = 0;
+	z->rx_freq_ne_scan = 0;
+	z->rx_rssi_fb = 0;
 	memset(z->rx_type_cnt, 0, sizeof(z->rx_type_cnt));
 	dev_info(&z->intf->dev, "scan: 开始，%d 个信道\n", z->scan_nfreqs);
 	if (zt_scan_setup(z)) {
@@ -1547,6 +1602,9 @@ out:
 		 "scan: RX type 0x0000=%lu 0x0004=%lu 0x0100=%lu 0x0300=%lu 其它=%lu(last=%#06x)\n",
 		 z->rx_type_cnt[0], z->rx_type_cnt[1], z->rx_type_cnt[2],
 		 z->rx_type_cnt[3], z->rx_type_cnt[4], z->last_other_type);
+	dev_info(&z->intf->dev,
+		 "scan: RX 状态来源 描述符频率=%lu 退回信道=%lu 描述符频率!=扫描信道=%lu RSSI兜底=%lu\n",
+		 z->rx_freq_desc, z->rx_freq_fb, z->rx_freq_ne_scan, z->rx_rssi_fb);
 	dev_info(&z->intf->dev,
 		 "scan: 未预期 IPC: %#06x x%lu | %#06x x%lu | %#06x x%lu | %#06x x%lu\n",
 		 z->unk_ids[0], z->unk_cnt[0], z->unk_ids[1], z->unk_cnt[1],
@@ -1629,6 +1687,13 @@ static void zt_mac_register(struct zt_dev *z)
 	*(struct zt_dev **)hw->priv = z;
 	z->hw = hw;
 
+	/*
+	 * 声明 RX RSSI 的单位是 dBm。mac80211 的 ieee80211_bss_info_update() 只在
+	 * 该标志存在时才把 rx_status->signal 换算成 mBm 交给 cfg80211，否则
+	 * data.signal 恒为 0，cfg80211 就不发 NL80211_BSS_SIGNAL_MBM，
+	 * 结果是 iw scan 里完全没有 "signal:" 行（实测过）。
+	 */
+	ieee80211_hw_set(hw, SIGNAL_DBM);
 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	hw->wiphy->bands[NL80211_BAND_2GHZ] = &zt_band_2ghz;
 	hw->wiphy->max_scan_ssids = 1;
