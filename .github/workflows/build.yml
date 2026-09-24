@@ -1,0 +1,49 @@
+name: build
+
+# 说明：本驱动针对内核 7.0 时代的 mac80211 ops 签名编写（例如
+# config(hw, radio_idx, changed)），而 GitHub 托管 runner 的内核版本更老，
+# 因此在 runner 上编译可能因为**内核 API 差异**失败，而不是代码本身有问题。
+# 这个 job 定位为"信息性"（continue-on-error）：验证语法、注释、构建系统是否自洽。
+# 真正阻塞合并的检查是 checkpatch 与 shellcheck 两个 workflow。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖与内核头文件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc
+          sudo apt-get install -y "linux-headers-$(uname -r)" \
+            || sudo apt-get install -y linux-headers-generic
+
+      - name: 显示环境
+        run: |
+          uname -a
+          gcc --version | head -1
+          ls -d /lib/modules/$(uname -r)/build
+
+      - name: 编译模块
+        run: make -C driver modules
+
+      - name: 模块信息
+        run: |
+          modinfo driver/zt9612.ko || true
+          modinfo driver/zt9612.ko 2>/dev/null | grep -E '^(license|version|firmware|alias)' || true

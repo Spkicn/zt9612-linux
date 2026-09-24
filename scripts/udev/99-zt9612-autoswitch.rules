@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# 由 scripts/setup-mode-switch.sh 安装到 /etc/udev/rules.d/99-zt9612-autoswitch.rules
+#
+# 插上 ZT9612U（350b:f179 驱动光盘模式）时自动切到网卡模式（350b:9612）
+# 依赖：sudo apt install usb-modeswitch
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="350b", ATTR{idProduct}=="f179", RUN+="/usr/sbin/usb_modeswitch -K -W -v 350b -p f179"
+
+# 不想用 usb_modeswitch 的话也可以用 eject（等 sr 设备出现后弹一次）：
+# ACTION=="add", SUBSYSTEM=="block", KERNEL=="sr*", ATTRS{idVendor}=="350b", ATTRS{idProduct}=="f179", RUN+="/usr/bin/eject /dev/%k"

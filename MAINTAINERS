@@ -1,0 +1,27 @@
+ZT9612U USB WIFI DRIVER
+M:	Spkicn <Spkicn@users.noreply.github.com>
+L:	https://github.com/Spkicn/zt9612-linux/issues
+W:	https://github.com/Spkicn/zt9612-linux
+S:	Maintained
+Q:	https://github.com/Spkicn/zt9612-linux/blob/main/FAQ.md
+T:	git https://github.com/Spkicn/zt9612-linux.git
+
+F:	driver/
+F:	scripts/
+F:	dkms.conf
+F:	dkms-make.sh
+F:	install-driver.sh
+F:	uninstall-driver.sh
+F:	supported-device-IDs
+F:	zt9612.conf
+F:	firmware/README.md
+F:	README.md
+F:	CONTRIBUTING.md
+F:	FAQ.md
+F:	CHANGELOG.md
+F:	SECURITY.md
+
+X:	docs/
+X:	re/
+X:	tools/
+X:	firmware_from_cd/

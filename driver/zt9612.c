@@ -1,0 +1,970 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * zt9612.c - Linux driver for ZT9612U (ZTOP / 閸忓棝鈧艾浜?ACEV100) USB WiFi adapter
+ *
+ * M1 + M2:
+ *   - 閸ヨ桨娆㈢憗鍛版祰閿涘牊褰欓幍?/ 488B 閸?/ 閺堫偄娼?XOR16 / 闁板秶鐤嗛崸?/ RUN閿? *   - 閸氬本顒為崚婵嗩潗閸栨牕绨崚妤嬬礄閸欐垳绔撮弶锛勭搼娑撯偓閺?CFM閿涘绱癛ESET -> VERSION -> 閸樺倸鏅?-> START(缁涘瀹?6.5s) -> 闁板秶鐤? *   - 5 缁夋帒绺剧捄?0x05c2閿涘牐娴囬懡宄版儓 ASCII 閺冨爼妫块幋绛圭礆閿涘奔绗夐崣鎴濇祼娴犳湹绱伴惇瀣，閻欐顦叉担? *   - /dev/zt9612閿涙氨鏁ら幋閿嬧偓浣稿讲閻╁瓨甯撮弨璺哄絺閸樼喎顫?"WLAN" 鐢? *
+ * 閸楀繗顔呴弶銉ㄥ殰 USB 閹舵挸瀵?+ 闂堟瑦鈧線鈧棗鎮滈獮鍫曗偓鎰摟閼哄倿鐛欑拠渚婄礄鐟?zt9612-linux/re/REPORT*.md閵嗕笍RIVER_PROGRESS.md閿? */
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/usb.h>
+#include <linux/firmware.h>
+#include <linux/delay.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/kfifo.h>
+#include <linux/wait.h>
+#include <linux/completion.h>
+#include <linux/workqueue.h>
+#include <linux/time.h>
+#include <linux/time64.h>
+#include <linux/etherdevice.h>
+#include <linux/unaligned.h>
+#include <net/mac80211.h>
+
+#define DRV_NAME	"zt9612"
+
+#define ZT_VID		0x350B
+#define ZT_PID		0x9612
+#define EP_OUT_NUM	8
+#define EP_IN_NUM	4
+
+#define ZT_BLOCK_SIZE	488
+#define SETTINGS_ADDR	0x210CE700
+#define MAX_FRAME	1024
+#define MAX_PAYLOAD	(MAX_FRAME - 8)
+#define RX_FIFO_SIZE	(64 * 1024)
+#define HB_INTERVAL_MS	5000
+
+#define T_IPC		0x0100
+#define T_FW_WRITE	0x0200
+#define T_FW_START	0x0201
+#define T_FW_WRITE_LAST	0x0204
+
+#define SUB_FW_START	0x00
+#define SUB_FW_READY	0x01
+#define SUB_FW_BLOCK	0x02
+#define SUB_FW_LAST	0x03
+#define SUB_FW_ACK	0x04
+#define SUB_RUN		0x05
+
+#define ZT_MAGIC	0x545A		/* "ZT" */
+
+static int do_init = 1;
+module_param(do_init, int, 0644);
+MODULE_PARM_DESC(do_init, "run the synchronous IPC init sequence after boot (default 1)");
+
+static int do_boot = 1;
+module_param(do_boot, int, 0644);
+MODULE_PARM_DESC(do_boot, "download firmware (default 1); set 0 to reuse an already running firmware");
+
+struct zt_dev {
+	struct usb_device	*udev;
+	struct usb_interface	*intf;
+	u8			ep_out;
+	u8			ep_in;
+	u8			*tx;
+	u8			*pl;
+	u8			*rx;
+	u8			*mac;
+
+	struct urb		*rx_urb;
+	u8			*rx_buf;
+	struct kfifo		rx_fifo;
+	wait_queue_head_t	rx_wait;
+	bool			rx_running;
+	bool			alive;		/* 拔出/卸载后置 0，停止一切 USB IO */
+	struct completion	rx_done;	/* 在途 rx_urb 回收信号（D9） */
+
+	struct delayed_work	hb_work;
+	unsigned long		last_hb;
+
+	struct miscdevice	misc;
+	bool			misc_ok;
+
+	struct ieee80211_hw	*hw;
+	unsigned long		tx_dropped;
+
+	struct mutex		lock;
+};
+
+/* ------------------------------------------------------------------ 閸╄櫣顢?*/
+
+static u16 zt_xor16(const u8 *p, size_t len)
+{
+	u16 cs = 0;
+	size_t i;
+
+	for (i = 0; i + 1 < len; i += 2)
+		cs ^= (u16)p[i] | ((u16)p[i + 1] << 8);
+	return cs;
+}
+
+static int zt_send(struct zt_dev *z, u16 type, const u8 *payload, u16 hlen)
+{
+	int ret, sent = 0;
+	u16 total = 8 + hlen;
+
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;
+	if (total > MAX_FRAME)
+		return -EINVAL;
+
+	memcpy(z->tx, "WLAN", 4);
+	z->tx[4] = hlen & 0xff;
+	z->tx[5] = hlen >> 8;
+	z->tx[6] = type & 0xff;
+	z->tx[7] = type >> 8;
+	if (hlen)
+		memcpy(z->tx + 8, payload, hlen);
+
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_out),
+			   z->tx, total, &sent, 2000);
+	if (ret)
+		dev_err(&z->intf->dev, "bulk OUT failed (%d)\n", ret);
+	return ret;
+}
+
+static int zt_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
+{
+	int ret, got = 0;
+
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;
+	ret = usb_bulk_msg(z->udev, usb_rcvbulkpipe(z->udev, z->ep_in),
+			   z->rx, MAX_FRAME, &got, timeout_ms);
+	if (ret)
+		return ret;
+	if (got < 8 || memcmp(z->rx, "WLAN", 4))
+		return -EPROTO;
+	*len = got;
+	*type = (u16)z->rx[6] | ((u16)z->rx[7] << 8);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ 韫囧啳鐑?*/
+
+static void zt_heartbeat(struct zt_dev *z)
+{
+	struct timespec64 ts;
+	struct tm tm;
+	char stamp[24];
+	u8 pl[8 + 4 + 24];
+	u16 slen;
+
+	ktime_get_real_ts64(&ts);
+	time64_to_tm(ts.tv_sec, 0, &tm);
+	scnprintf(stamp, sizeof(stamp), "%04d-%02d-%02d_%02d-%02d-%02d",
+		  (int)(tm.tm_year + 1900), (int)(tm.tm_mon + 1), (int)tm.tm_mday,
+		  (int)tm.tm_hour, (int)tm.tm_min, (int)tm.tm_sec);
+	slen = strlen(stamp) + 1;
+
+	put_unaligned_le16(0x05C2, pl + 0);
+	put_unaligned_le16(0, pl + 2);
+	put_unaligned_le16(100, pl + 4);
+	put_unaligned_le16(4 + slen, pl + 6);
+	memset(pl + 8, 0, 4);
+	memcpy(pl + 12, stamp, slen);
+
+	if (!zt_send(z, T_IPC, pl, 8 + 4 + slen))
+		z->last_hb = jiffies;
+}
+
+static void zt_hb_work(struct work_struct *w)
+{
+	struct zt_dev *z = container_of(to_delayed_work(w), struct zt_dev, hb_work);
+
+	if (!READ_ONCE(z->alive))
+		return;
+	mutex_lock(&z->lock);
+	if (READ_ONCE(z->alive) && z->rx_running)
+		zt_heartbeat(z);
+	mutex_unlock(&z->lock);
+	if (READ_ONCE(z->alive))
+		schedule_delayed_work(&z->hb_work, msecs_to_jiffies(HB_INTERVAL_MS));
+}
+
+/* ------------------------------------------------------------------ IPC 閸涙垝鎶?*/
+
+static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
+		  int want_cfm, int timeout_ms, u8 *resp, u16 *resp_len)
+{
+	u8 *msg = z->pl;
+	unsigned long end;
+	int ret;
+
+	put_unaligned_le16(id, msg + 0);
+	put_unaligned_le16(0, msg + 2);
+	put_unaligned_le16(100, msg + 4);
+	put_unaligned_le16(plen, msg + 6);
+	if (plen && params)
+		memcpy(msg + 8, params, plen);
+
+	ret = zt_send(z, T_IPC, msg, 8 + plen);
+	if (ret)
+		return ret;
+	if (want_cfm < 0)
+		return 0;
+
+	end = jiffies + msecs_to_jiffies(timeout_ms);
+	while (time_before(jiffies, end)) {
+		u16 type = 0;
+		int len = 0;
+
+		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
+			zt_heartbeat(z);
+
+		if (zt_recv(z, &type, &len, 100))
+			continue;
+		if (type != T_IPC || len < 8)
+			continue;
+		if (get_unaligned_le16(z->rx + 8) != (u16)want_cfm)
+			continue;
+		if (resp && resp_len) {
+			u16 rl = (len >= 16) ? get_unaligned_le16(z->rx + 14) : 0;
+
+			rl = min_t(u16, rl, (u16)(len - 16));
+			if (rl)
+				memcpy(resp, z->rx + 16, rl);
+			*resp_len = rl;
+		}
+		return 0;
+	}
+	dev_warn(&z->intf->dev, "timeout waiting for cfm %#06x\n", want_cfm);
+	return -ETIMEDOUT;
+}
+
+static int zt_run_init(struct zt_dev *z)
+{
+	static const u8 zeros13[13];
+	static const u8 five_e[4][12] = {
+		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x07 },
+		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01, 0x02 },
+		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x5e, 0x00, 0x02, 0x01, 0x02 },
+		{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2f, 0x00, 0x02, 0x01, 0x01 },
+	};
+	u8 addif[7] = { 0 };
+	u8 chan[12];
+	u8 resp[64];
+	u16 rlen = 0;
+	u8 one = 1, zero = 0, slottime = 0x14;
+	int i, ret;
+
+	dev_info(&z->intf->dev, "=== IPC init sequence ===\n");
+
+	/* MM_RESET閿涙艾娴愭禒璺哄灠閸氼垰濮╅弮璺哄讲閼冲€熺箷濞屸€冲櫙婢跺洤銈介幒銉︽暪閸涙垝鎶ら敍宀勫櫢鐠?3 濞?*/
+	for (i = 0; i < 3; i++) {
+		if (!zt_cmd(z, 0x0000, NULL, 0, 0x0001, 3000, NULL, NULL))
+			break;
+		dev_warn(&z->intf->dev, "MM_RESET no cfm, retry %d/3\n", i + 1);
+		msleep(200);
+	}
+	if (i == 3) {
+		dev_err(&z->intf->dev, "firmware not answering MM_RESET\n");
+		return -ETIMEDOUT;
+	}
+	ret = zt_cmd(z, 0x0004, NULL, 0, 0x0005, 3000, NULL, NULL);
+	if (ret)
+		return ret;
+
+	zt_cmd(z, 0x0102, &zero, 1, 0x0103, 3000, NULL, NULL);
+	zt_cmd(z, 0x010a, &zero, 1, 0x010b, 3000, NULL, NULL);
+	zt_cmd(z, 0x0112, &zero, 1, -1, 300, NULL, NULL);
+
+	rlen = 0;
+	if (!zt_cmd(z, 0x0100, &zero, 1, 0x0101, 3000, resp, &rlen) && rlen >= 6) {
+		memcpy(z->mac, resp, 6);
+		dev_info(&z->intf->dev, "MAC = %pM\n", z->mac);
+	} else {
+		eth_random_addr(z->mac);
+		dev_warn(&z->intf->dev, "no MAC from fw, using random %pM\n", z->mac);
+	}
+
+	dev_info(&z->intf->dev, "MM_START_REQ (rf init, waiting ~6.5s)\n");
+	ret = zt_cmd(z, 0x0002, zeros13, sizeof(zeros13), 0x0003, 15000, NULL, NULL);
+	if (ret) {
+		dev_err(&z->intf->dev, "MM_START_CFM not received\n");
+		return ret;
+	}
+	dev_info(&z->intf->dev, "MM_START_CFM received (firmware up)\n");
+
+	for (i = 0; i < 4; i++)
+		zt_cmd(z, 0x050E, five_e[i], sizeof(five_e[i]), -1, 0, NULL, NULL);
+	msleep(50);
+
+	zt_cmd(z, 0x0022, &one, 1, 0x0023, 3000, NULL, NULL);
+	memcpy(addif, z->mac, 6);
+	zt_cmd(z, 0x0006, addif, sizeof(addif), 0x0007, 3000, NULL, NULL);
+	zt_cmd(z, 0x0020, &slottime, 1, 0x0021, 3000, NULL, NULL);
+
+	memset(chan, 0, sizeof(chan));
+	put_unaligned_le16(2412, chan + 2);
+	put_unaligned_le16(2412, chan + 4);
+	put_unaligned_le16(0x14, chan + 10);
+	zt_cmd(z, 0x0010, chan, sizeof(chan), 0x0011, 3000, NULL, NULL);
+
+	dev_info(&z->intf->dev, "=== init done, firmware running ===\n");
+	return 0;
+}
+
+/* ------------------------------------------------------------------ 閸ヨ桨娆㈢憗鍛版祰 */
+
+static int zt_wait_fw_ack(struct zt_dev *z, u8 want_sub, int timeout_ms)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(timeout_ms);
+	u16 type = 0;
+	int l = 0;
+
+	while (time_before(jiffies, end)) {
+		if (zt_recv(z, &type, &l, 100))
+			continue;
+		if (type == T_FW_WRITE && l > 8 && z->rx[8] == want_sub)
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+static int zt_write_blocks(struct zt_dev *z, u32 addr, const u8 *data, u32 len)
+{
+	u32 nblk = (len + ZT_BLOCK_SIZE - 1) / ZT_BLOCK_SIZE;
+	u16 cs = zt_xor16(data, len);
+	u32 i;
+	int ret;
+
+	for (i = 0; i < nblk; i++) {
+		u32 off = i * ZT_BLOCK_SIZE;
+		u32 blen = min_t(u32, ZT_BLOCK_SIZE, len - off);
+
+		if (i == nblk - 1) {
+			z->pl[0] = SUB_FW_LAST;
+			put_unaligned_le32(addr, z->pl + 1);
+			put_unaligned_le16(cs, z->pl + 5);
+			put_unaligned_le32(off, z->pl + 7);
+			put_unaligned_le16((u16)blen, z->pl + 11);
+			memset(z->pl + 13, 0, 3);
+			memcpy(z->pl + 16, data + off, blen);
+			ret = zt_send(z, T_FW_WRITE_LAST, z->pl, 16 + blen);
+			if (ret)
+				return ret;
+			ret = zt_wait_fw_ack(z, SUB_FW_ACK, 2000);
+			if (ret) {
+				dev_warn(&z->intf->dev, "no ack for %#010x\n", addr);
+				return ret;
+			}
+		} else {
+			z->pl[0] = SUB_FW_BLOCK;
+			put_unaligned_le32(addr, z->pl + 1);
+			put_unaligned_le32(off, z->pl + 5);
+			put_unaligned_le16((u16)blen, z->pl + 9);
+			z->pl[11] = 0;
+			memcpy(z->pl + 12, data + off, blen);
+			ret = zt_send(z, T_FW_WRITE, z->pl, 12 + blen);
+			if (ret)
+				return ret;
+		}
+	}
+	dev_info(&z->intf->dev, "  wrote addr=%#010x len=%u (%u blocks) cs=%#06x\n",
+		 addr, len, nblk, cs);
+	return 0;
+}
+
+static int zt_boot(struct zt_dev *z)
+{
+	const struct firmware *fw, *st = NULL;
+	u8 run[2 + 6 * 11];
+	u32 run_len = 0;
+	int ret, count, i;
+
+	ret = request_firmware(&fw, "zt9612_fw.bin", &z->intf->dev);
+	if (ret) {
+		dev_err(&z->intf->dev, "request_firmware failed: %d\n", ret);
+		return ret;
+	}
+	if (fw->size < 9 || get_unaligned_le16(fw->data) != ZT_MAGIC) {
+		ret = -EINVAL;
+		goto out;
+	}
+	count = fw->data[8];
+	dev_info(&z->intf->dev, "firmware: pid=%#06x sections=%u size=%zu\n",
+		 get_unaligned_le32(fw->data + 4), count, fw->size);
+	if (count > 6 || fw->size < 9 + count * 19) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	z->pl[0] = SUB_FW_START;
+	for (i = 0; i < 3; i++) {
+		ret = zt_send(z, T_FW_START, z->pl, 1);
+		if (ret)
+			goto out;
+		if (!zt_wait_fw_ack(z, SUB_FW_READY, 3000)) {
+			dev_info(&z->intf->dev, "hello ack: yes (try %d)\n", i + 1);
+			break;
+		}
+		dev_warn(&z->intf->dev, "hello ack timeout (try %d/3)\n", i + 1);
+	}
+	if (i == 3) {
+		dev_err(&z->intf->dev, "device silent - wrong state? (needs fresh CD->wifi switch)\n");
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+
+	for (i = 0; i < count; i++) {
+		const u8 *e = fw->data + 9 + i * 19;
+		u32 addr = get_unaligned_le32(e + 7);
+		u32 len = get_unaligned_le32(e + 11);
+		u32 foff = get_unaligned_le32(e + 15);
+
+		if ((u64)foff + len > fw->size) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = zt_write_blocks(z, addr, fw->data + foff, len);
+		if (ret)
+			goto out;
+		put_unaligned_le32(addr, run + 2 + run_len * 11 + 0);
+		put_unaligned_le32(len, run + 2 + run_len * 11 + 4);
+		put_unaligned_le16(get_unaligned_le16(e + 1), run + 2 + run_len * 11 + 8);
+		run[2 + run_len * 11 + 10] = e[0];
+		run_len++;
+	}
+
+	ret = request_firmware(&st, "zt9612_settings.bin", &z->intf->dev);
+	if (!ret) {
+		ret = zt_write_blocks(z, SETTINGS_ADDR, st->data, st->size);
+		release_firmware(st);
+		if (ret)
+			goto out;
+	} else {
+		dev_warn(&z->intf->dev, "no settings firmware, skipping\n");
+		ret = 0;
+	}
+
+	run[0] = SUB_RUN;
+	run[1] = (u8)run_len;
+	dev_info(&z->intf->dev, "RUN (%u sections)\n", run_len);
+	ret = zt_send(z, T_FW_WRITE, run, 2 + run_len * 11);
+	if (ret)
+		goto out;
+
+	/* RUN 娑斿鎮楅崶杞版娴兼艾鍘涢崣鎴滅閺夆€虫儙閸斻劑鈧氨鐓￠敍鍧眣pe=0x0100, id=0x0200閿涘绱濈粵澶婄暊閸愬秴绱戞慨?IPC 閸掓繂顫愰崠鏍モ偓?	 * 閻劍鍩涢幀浣稿斧閸ㄥ鐤勫ù瀣剁窗娑撳秶鐡戦柅姘辩叀閻╁瓨甯撮崣?MM_RESET 娴兼碍鏁规稉宥呭煂 CFM閵?*/
+	{
+		unsigned long end = jiffies + msecs_to_jiffies(3000);
+		u16 type = 0;
+		int len = 0;
+
+		while (time_before(jiffies, end)) {
+			if (zt_recv(z, &type, &len, 100))
+				continue;
+			dev_info(&z->intf->dev, "boot notify: type=%#06x len=%d\n", type, len);
+			break;
+		}
+		msleep(50);
+	}
+out:
+	release_firmware(fw);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ 鏉╂劘顢戦弮鑸靛复閺€?*/
+
+static void zt_rx_complete(struct urb *urb)
+{
+	struct zt_dev *z = urb->context;
+	int len = urb->actual_length;
+
+	/* D9：卸载中（alive=0）不再碰任何缓冲，只回报回收完成 */
+	if (!READ_ONCE(z->alive)) {
+		complete(&z->rx_done);
+		return;
+	}
+	if (urb->status == 0 && len >= 8 && !memcmp(z->rx_buf, "WLAN", 4)) {
+		u16 flen = (u16)len;
+
+		if (kfifo_avail(&z->rx_fifo) >= flen + 2) {
+			kfifo_in(&z->rx_fifo, (u8 *)&flen, 2);
+			kfifo_in(&z->rx_fifo, z->rx_buf, flen);
+			wake_up_interruptible(&z->rx_wait);
+		}
+	}
+	if (z->rx_running)
+		usb_submit_urb(urb, GFP_ATOMIC);
+}
+
+static int zt_rx_start(struct zt_dev *z)
+{
+	z->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!z->rx_urb)
+		return -ENOMEM;
+	z->rx_buf = kmalloc(MAX_FRAME, GFP_KERNEL);
+	if (!z->rx_buf)
+		return -ENOMEM;
+
+	usb_fill_bulk_urb(z->rx_urb, z->udev, usb_rcvbulkpipe(z->udev, z->ep_in),
+			  z->rx_buf, MAX_FRAME, zt_rx_complete, z);
+	z->rx_running = true;
+	if (usb_submit_urb(z->rx_urb, GFP_KERNEL)) {
+		z->rx_running = false;	/* 未提交成功 → 不会有 completion */
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * D9：停止 RX 时绝不做无界等待。设备挂死时 usb_kill_urb() 会永久阻塞在
+ * 在途 URB 上，把卸载/拔出流程（甚至 xhci 内核线程）一起卡住 —— 现场表现
+ * 为整机失联、只能硬重启。这里改为：poison（拒绝重投 + 异步 unlink）
+ * 之后最多等 2 s 回收；超时就故意不释放，宁可泄漏也不 use-after-free。
+ * 返回 0 表示可安全释放，-ETIMEDOUT 表示实例已泄漏（调用者不要再 free）。
+ */
+static int zt_rx_stop(struct zt_dev *z)
+{
+	int ret = 0;
+
+	if (!z->rx_urb)
+		goto out;
+	if (READ_ONCE(z->rx_running)) {
+		WRITE_ONCE(z->rx_running, false);
+		usb_poison_urb(z->rx_urb);
+		if (!wait_for_completion_timeout(&z->rx_done, msecs_to_jiffies(2000))) {
+			dev_warn(&z->intf->dev,
+				 "rx urb 2s 未回收（设备可能已挂死），泄漏该实例以避免 UAF\n");
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+	}
+	usb_free_urb(z->rx_urb);
+	z->rx_urb = NULL;
+out:
+	if (!ret) {
+		kfree(z->rx_buf);
+		z->rx_buf = NULL;
+	}
+	return ret;
+}
+
+/* ------------------------------------------------------------------ /dev/zt9612 */
+
+static int zt_open(struct inode *inode, struct file *file)
+{
+	struct zt_dev *z = container_of(file->private_data, struct zt_dev, misc);
+
+	file->private_data = z;
+	return 0;
+}
+
+static ssize_t zt_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+	struct zt_dev *z = file->private_data;
+	u8 hdr[2];
+	u16 flen;
+	unsigned int copied = 0;
+	int ret;
+
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;
+	if (kfifo_len(&z->rx_fifo) < 2) {
+		if (file->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		ret = wait_event_interruptible_timeout(z->rx_wait,
+						       kfifo_len(&z->rx_fifo) >= 2 ||
+						       !READ_ONCE(z->alive),
+						       msecs_to_jiffies(3000));
+		if (!READ_ONCE(z->alive))
+			return -ENODEV;
+		if (ret == 0)
+			return -ETIMEDOUT;
+		if (ret < 0)
+			return ret;
+	}
+	if (kfifo_out(&z->rx_fifo, hdr, 2) != 2)
+		return -EIO;
+	flen = get_unaligned_le16(hdr);
+	if (flen > MAX_FRAME)
+		return -EIO;
+	if (count < flen)
+		return -EINVAL;
+	if (kfifo_to_user(&z->rx_fifo, buf, flen, &copied))
+		return -EFAULT;
+	return copied;
+}
+
+static ssize_t zt_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct zt_dev *z = file->private_data;
+	u8 *tmp;
+	int ret;
+
+	if (count < 8 || count > MAX_FRAME)
+		return -EINVAL;
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;
+	tmp = kmalloc(count, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	if (copy_from_user(tmp, buf, count)) {
+		kfree(tmp);
+		return -EFAULT;
+	}
+	if (memcmp(tmp, "WLAN", 4)) {
+		kfree(tmp);
+		return -EINVAL;
+	}
+	mutex_lock(&z->lock);
+	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, z->ep_out),
+			   tmp, count, NULL, 2000);
+	mutex_unlock(&z->lock);
+	kfree(tmp);
+	return ret ? ret : count;
+}
+
+static int zt_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static const struct file_operations zt_fops = {
+	.owner = THIS_MODULE,
+	.open = zt_open,
+	.read = zt_read,
+	.write = zt_write,
+	.release = zt_release,
+	.llseek = noop_llseek,
+};
+
+
+/* ================================================================== mac80211 (M3.1)
+ *
+ * 閻╊喗鐖ｉ敍姘暈閸?wiphy / mac80211閿涘矁顔€ wlan0 閸戣櫣骞囬敍鍦?.1閿涘鈧? * 閺佺増宓侀棃顫礄TX/RX閿涘娈忛張顏呭复闁熬绱皌x 閻╁瓨甯存稉銏犲瘶閿涘本澹傞幓蹇撶毣閺堫亜鐤勯悳甯礄M3.2 閸愬秴浠涢敍澶堚偓? */
+static struct ieee80211_channel zt_ch_2ghz[] = {
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .hw_value = 3,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .hw_value = 4,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .hw_value = 5,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .hw_value = 6,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .hw_value = 7,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .hw_value = 8,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .hw_value = 9,  .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .hw_value = 10, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .hw_value = 11, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .hw_value = 12, .max_power = 20 },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .hw_value = 13, .max_power = 20 },
+};
+
+static struct ieee80211_rate zt_rates_2ghz[] = {
+	{ .bitrate = 10,  .hw_value = 0 },
+	{ .bitrate = 20,  .hw_value = 1 },
+	{ .bitrate = 55,  .hw_value = 2 },
+	{ .bitrate = 110, .hw_value = 3 },
+};
+
+static struct ieee80211_supported_band zt_band_2ghz = {
+	.band = NL80211_BAND_2GHZ,
+	.channels = zt_ch_2ghz,
+	.n_channels = ARRAY_SIZE(zt_ch_2ghz),
+	.bitrates = zt_rates_2ghz,
+	.n_bitrates = ARRAY_SIZE(zt_rates_2ghz),
+};
+
+static struct zt_dev *zt_from_hw(struct ieee80211_hw *hw)
+{
+	return *(struct zt_dev **)hw->priv;
+}
+
+static int zt_mac_start(struct ieee80211_hw *hw)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+
+	dev_info(&z->intf->dev, "mac80211: start\n");
+	return 0;
+}
+
+static void zt_mac_stop(struct ieee80211_hw *hw, bool suspend)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+
+	dev_info(&z->intf->dev, "mac80211: stop\n");
+}
+
+static int zt_mac_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+
+	dev_info(&z->intf->dev, "mac80211: add_interface type=%d addr=%pM\n",
+		 vif->type, vif->addr);
+	return 0;
+}
+
+static void zt_mac_remove_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+
+	dev_info(&z->intf->dev, "mac80211: remove_interface\n");
+}
+
+static int zt_mac_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
+{
+	return 0;
+}
+
+/* M3.1閿涙瓖X 閺嗗倷绗夐幒銉р€栨禒璁圭礉閻╁瓨甯存稉銏犲瘶閿涘牆褰х紒鐔活吀閿涘绱滿3.4 閸愬秷藟 TX 閹诲繗鍫粭?*/
+static void zt_mac_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
+		      struct sk_buff *skb)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+
+	z->tx_dropped++;
+	ieee80211_free_txskb(hw, skb);
+}
+
+static void zt_mac_configure_filter(struct ieee80211_hw *hw, unsigned int changed_flags,
+				    unsigned int *total_flags, u64 multicast)
+{
+	/* M3.1: driver does no hardware filtering - let mac80211 filter in software */
+	*total_flags = 0;
+}
+
+/* M3.1: modern TX API is mandatory in this kernel; dequeue and drop for now (data path = M3.4) */
+static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+	struct sk_buff *skb;
+
+	while ((skb = ieee80211_tx_dequeue(hw, txq))) {
+		z->tx_dropped++;
+		ieee80211_free_txskb(hw, skb);
+	}
+}
+static const struct ieee80211_ops zt_mac_ops = {
+	.start = zt_mac_start,
+	.stop = zt_mac_stop,
+	.add_interface = zt_mac_add_interface,
+	.remove_interface = zt_mac_remove_interface,
+	.config = zt_mac_config,
+	.tx = zt_mac_tx,
+	.configure_filter = zt_mac_configure_filter,
+	.wake_tx_queue = zt_mac_wake_tx_queue,
+	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
+	.add_chanctx = ieee80211_emulate_add_chanctx,
+	.remove_chanctx = ieee80211_emulate_remove_chanctx,
+	.change_chanctx = ieee80211_emulate_change_chanctx,
+};
+
+static void zt_mac_register(struct zt_dev *z)
+{
+	struct ieee80211_hw *hw;
+	int ret;
+
+	hw = ieee80211_alloc_hw(sizeof(struct zt_dev *), &zt_mac_ops);
+	if (!hw) {
+		dev_err(&z->intf->dev, "mac80211: alloc_hw failed\n");
+		return;
+	}
+	*(struct zt_dev **)hw->priv = z;
+	z->hw = hw;
+
+	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	hw->wiphy->bands[NL80211_BAND_2GHZ] = &zt_band_2ghz;
+	hw->wiphy->max_scan_ssids = 1;
+	hw->queues = 4;
+	SET_IEEE80211_PERM_ADDR(hw, z->mac);
+
+	ret = ieee80211_register_hw(hw);
+	if (ret) {
+		dev_err(&z->intf->dev, "mac80211: register_hw failed: %d\n", ret);
+		ieee80211_free_hw(hw);
+		z->hw = NULL;
+		return;
+	}
+	dev_info(&z->intf->dev, "mac80211 registered (M3.1) - wlan0 should appear\n");
+}
+
+static void zt_mac_unregister(struct zt_dev *z)
+{
+	if (!z->hw)
+		return;
+	ieee80211_unregister_hw(z->hw);
+	ieee80211_free_hw(z->hw);
+	z->hw = NULL;
+}
+
+
+/* ------------------------------------------------------------------ probe */
+
+static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct usb_host_interface *alt = intf->cur_altsetting;
+	struct zt_dev *z;
+	int i, ret;
+
+	dev_info(&intf->dev, "probing %04x:%04x (iface %d)\n",
+		 le16_to_cpu(udev->descriptor.idVendor),
+		 le16_to_cpu(udev->descriptor.idProduct), alt->desc.bInterfaceNumber);
+
+	z = kzalloc(sizeof(*z), GFP_KERNEL);
+	if (!z)
+		return -ENOMEM;
+	z->udev = udev;
+	z->intf = intf;
+	z->mac = kmalloc(6, GFP_KERNEL);
+	if (!z->mac) {
+		kfree(z);
+		return -ENOMEM;
+	}
+	mutex_init(&z->lock);
+	init_waitqueue_head(&z->rx_wait);
+	init_completion(&z->rx_done);
+	z->alive = true;		/* 从这里开始才允许 USB IO */
+	INIT_DELAYED_WORK(&z->hb_work, zt_hb_work);
+
+	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
+
+		if (usb_endpoint_num(ep) == EP_OUT_NUM && usb_endpoint_dir_out(ep) &&
+		    usb_endpoint_is_bulk_out(ep))
+			z->ep_out = ep->bEndpointAddress;
+		if (usb_endpoint_num(ep) == EP_IN_NUM && usb_endpoint_dir_in(ep) &&
+		    usb_endpoint_is_bulk_in(ep))
+			z->ep_in = ep->bEndpointAddress;
+		dev_info(&intf->dev, "  ep %#04x %s\n", ep->bEndpointAddress,
+			 usb_endpoint_dir_in(ep) ? "IN" : "OUT");
+	}
+	if (!z->ep_out || !z->ep_in) {
+		ret = -ENODEV;
+		goto err;
+	}
+
+	z->tx = kmalloc(MAX_FRAME, GFP_KERNEL);
+	z->pl = kmalloc(MAX_PAYLOAD, GFP_KERNEL);
+	z->rx = kmalloc(MAX_FRAME, GFP_KERNEL);
+	if (!z->tx || !z->pl || !z->rx) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	ret = kfifo_alloc(&z->rx_fifo, RX_FIFO_SIZE, GFP_KERNEL);
+	if (ret)
+		goto err;
+
+	usb_set_intfdata(intf, z);
+
+	if (do_boot) {
+		ret = zt_boot(z);
+		if (ret) {
+			dev_err(&intf->dev, "firmware boot failed: %d\n", ret);
+			goto err_kfifo;
+		}
+		dev_info(&intf->dev, "firmware loaded\n");
+	} else {
+		dev_info(&intf->dev, "do_boot=0: reusing already running firmware\n");
+	}
+
+	if (do_init) {
+		ret = zt_run_init(z);
+		if (ret) {
+			dev_err(&intf->dev, "init sequence failed: %d\n", ret);
+			goto err_kfifo;
+		}
+	}
+
+	z->last_hb = jiffies;
+	ret = zt_rx_start(z);
+	if (ret) {
+		dev_err(&intf->dev, "rx urb start failed: %d\n", ret);
+		goto err_kfifo;
+	}
+	schedule_delayed_work(&z->hb_work, msecs_to_jiffies(HB_INTERVAL_MS));
+
+	z->misc.minor = MISC_DYNAMIC_MINOR;
+	z->misc.name = "zt9612";
+	z->misc.fops = &zt_fops;
+	z->misc.mode = 0660;
+	ret = misc_register(&z->misc);
+	if (ret)
+		dev_warn(&intf->dev, "misc_register failed: %d\n", ret);
+	else
+		z->misc_ok = true;
+
+	dev_info(&intf->dev, "M1+M2 done: firmware running, /dev/zt9612 %s\n",
+		 z->misc_ok ? "ready" : "unavailable");
+
+	zt_mac_register(z);
+	return 0;
+
+err_kfifo:
+	usb_set_intfdata(intf, NULL);
+	WRITE_ONCE(z->alive, false);
+	cancel_delayed_work_sync(&z->hb_work);
+	if (zt_rx_stop(z))		/* 泄漏实例，避免 use-after-free */
+		return ret;
+	kfifo_free(&z->rx_fifo);
+err:
+	kfree(z->tx);
+	kfree(z->pl);
+	kfree(z->rx);
+	kfree(z->mac);
+	kfree(z);
+	return ret;
+}
+
+static void zt_disconnect(struct usb_interface *intf)
+{
+	struct zt_dev *z = usb_get_intfdata(intf);
+
+	usb_set_intfdata(intf, NULL);
+	if (!z)
+		return;
+
+	/* 顺序很重要（D9）：
+	 * 1) 先置 alive=0 —— 此后 zt_send/zt_recv/heartbeat 一律不再发起 USB IO；
+	 * 2) 停后台工作；
+	 * 3) 撤掉用户态与 mac80211 入口；
+	 * 4) 回收 RX URB（有界等待，见 zt_rx_stop）。
+	 */
+	WRITE_ONCE(z->alive, false);
+	cancel_delayed_work_sync(&z->hb_work);
+	wake_up_interruptible_all(&z->rx_wait);	/* 唤醒阻塞中的 read() */
+
+	if (z->misc_ok) {
+		misc_deregister(&z->misc);
+		z->misc_ok = false;
+	}
+	zt_mac_unregister(z);
+
+	if (zt_rx_stop(z)) {
+		dev_warn(&intf->dev, "disconnected (teardown incomplete, instance leaked)\n");
+		return;
+	}
+	kfifo_free(&z->rx_fifo);
+	kfree(z->tx);
+	kfree(z->pl);
+	kfree(z->rx);
+	kfree(z->mac);
+	kfree(z);
+	dev_info(&intf->dev, "disconnected\n");
+}
+
+static const struct usb_device_id zt_id_table[] = {
+	{ USB_DEVICE(ZT_VID, ZT_PID) },
+	{ }
+};
+MODULE_DEVICE_TABLE(usb, zt_id_table);
+
+static struct usb_driver zt_driver = {
+	.name		= DRV_NAME,
+	.id_table	= zt_id_table,
+	.probe		= zt_probe,
+	.disconnect	= zt_disconnect,
+};
+
+module_usb_driver(zt_driver);
+
+MODULE_AUTHOR("Spkicn <Spkicn@users.noreply.github.com>");
+MODULE_DESCRIPTION("ZT9612U (ZTOP/ACEV100) WiFi driver - M1 firmware boot + M2 IPC init");
+MODULE_VERSION("0.1.0");
+MODULE_LICENSE("GPL");
+MODULE_FIRMWARE("zt9612_fw.bin");
+MODULE_FIRMWARE("zt9612_settings.bin");

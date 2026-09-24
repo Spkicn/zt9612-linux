@@ -1,0 +1,122 @@
+# =============================================================================
+# ZT9612U Linux driver - ignore rules
+#
+# 设计原则：**公开的只有驱动源码、构建/安装脚本与开源规范文档**；
+# 内部交接文档、逆向资料、运维脚本、厂商原始文件一律留在本地。
+# 需要把这部分也公开时，删掉对应行即可（并先做一次脱敏检查）。
+# =============================================================================
+
+# ---- 本地保留：内部资料（含测试机信息 / 凭据 / 逆向报告 / 抓包）-------------
+docs/
+re/
+tools/
+firmware_from_cd/
+vendor-request.txt
+
+# ---- 厂商二进制：版权原因不入库，用户需自备（见 firmware/README.md）--------
+*.bin
+*.sys
+*.inf
+*.cab
+*.exe
+*.dll
+*.cat
+*.msi
+*.fw
+*.hex
+*.img
+*.ucode
+vendor/
+windows/
+Windows/
+
+# ---- 抓包与逆向产物：可能含厂商可执行片段与设备唯一信息 --------------------
+*.pcap
+*.pcapng
+*.cap
+*.sal
+*.sr
+usbmon*
+captures/
+traces/
+*.ghidra
+*.gpr
+*.rep
+*.idb
+*.i64
+*.til
+*.r2
+*.bndb
+decompiled/
+disasm/
+ghidra*/
+ida*/
+
+# ---- 内核模块构建产物 -------------------------------------------------------
+*.o
+*.o.*
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.cmd
+.deps/
+.tmp_versions/
+Module.symvers
+modules.order
+*.symvers
+*.order
+
+# ---- 模块签名密钥（绝不入库） ----------------------------------------------
+MOK.*
+mok.key
+mok.pub
+*.priv
+*.pem
+*.der
+*.p12
+*.pfx
+signing_key.pem
+x509.genkey
+
+# ---- 凭据与私钥 -------------------------------------------------------------
+.ssh/
+id_rsa*
+id_ecdsa*
+id_ed25519*
+*.ppk
+*.key
+*.kdbx
+known_hosts*
+authorized_keys*
+.netrc
+.env
+.env.*
+secrets*
+credentials*
+*password*
+*passwd*
+*.ovpn
+
+# ---- 内部材料：交接文档 / 实验机清单 / 私有笔记 -----------------------------
+internal/
+private/
+HANDOVER*
+handover*
+REPORT*.md
+REPORT_*.md
+meeting-notes*
+testbed*
+lab-inventory*
+inventory*
+hosts.txt
+hosts.yml
+*.tfstate
+*.tfvars
+
+# ---- 编辑器 / 操作系统 ------------------------------------------------------
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
