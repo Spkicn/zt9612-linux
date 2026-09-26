@@ -128,6 +128,38 @@ module_param(tx_variant, int, 0644);
 MODULE_PARM_DESC(tx_variant, "TX frame variant for experiments (default 0)");
 
 /*
+ * v0.3 阶段 B：TX status 上报（默认关闭，用实验开关控制）。
+ *
+ * 背景：驱动发完帧直接释放 skb，mac80211 的速率控制（minstrel_ht）收不到任何反馈，
+ * 于是 `iw link` 恒报 1.0 Mbit/s。这个开关用来回答一个关键问题：
+ * **速率控制拿到反馈后，速率与实测吞吐会不会动？**
+ *
+ *   0 = 不上报（默认，与 v0.2.0 行为一致）
+ *   N = 上报；每 `tx_status_probe` 帧里把 1 帧标成"已被 ACK"，其余标成失败
+ *       （N 的数值本身不参与判断，只看是否为 0）
+ *
+ * 为什么默认不上报、且要留"乐观探测"：**我们并不知道帧是否真的被 ACK** ——
+ * USB 写入成功不等于空口成功，固件也没给我们确认通道。如果无条件上报
+ * "已 ACK"，就是在骗速率控制（会让它以为高数据率可用）。
+ * 因此：
+ *   * `ack` 只在每 `tx_status_probe` 帧里"乐观探测"一次（默认 100，
+ *     minstrel 的 ewma 约 100 帧半衰期，所以这个比例足以让它周期性往上试），
+ *   * 其余帧一律如实报 false —— 宁可在这一轮显得慢，也不给速率控制灌假数据。
+ *
+ * 判据（见 docs/09-v0.3-吞吐开发计划.md 阶段 B）：
+ *   * `iw link` 的 tx bitrate 开始变化 + 吞吐同步上升 ⇒ 主机速率进得去，走阶段 C；
+ *   * `iw link` 变了但吞吐不动 ⇒ 固件自己选速，转逆向（docs/09 §4）；
+ *   * 吞吐下降或出现重传/失败激增 ⇒ 立刻把开关调回 0。
+ */
+static int tx_status_on;		/* 0 = 关闭；非 0 = 开启上报 */
+module_param_named(tx_status, tx_status_on, int, 0644);
+MODULE_PARM_DESC(tx_status, "report TX status to mac80211: 0=off (default), non-zero=on");
+
+static int tx_status_probe = 100;
+module_param(tx_status_probe, int, 0644);
+MODULE_PARM_DESC(tx_status_probe, "when reporting, mark 1 frame in N as acknowledged (default 100)");
+
+/*
  * 调查用开关：把接下来 N 个收到的 USB 传输的长度打出来。
  *
  * 用法（可随时重置，不必重载模块）：
@@ -218,6 +250,10 @@ struct zt_dev {
 	struct sk_buff_head	txq;
 	struct work_struct	tx_work;
 	unsigned long		tx_path_frames;
+	/* v0.3 阶段 B：TX status 上报计数（观测用） */
+	unsigned long		tx_status_reports;
+	unsigned long		tx_status_ack;
+	bool			tx_status_last_ack;
 	/* wake_tx_queue 只登记"哪个队列有活"，提交在 tx_work 里做 */
 	struct ieee80211_txq	*txq_pend[ZT_MAX_PEND_TXQ];
 	int			txq_n;
@@ -1559,6 +1595,44 @@ static int zt_set_channel(struct zt_dev *z, u16 freq)
  * 都可能在软中断上下文里执行、不能直接 usb_bulk_msg()，所以两者都只做登记，
  * 真正的 USB 提交统一在 tx_work（进程上下文，可以睡眠）里做。
  */
+/*
+ * v0.3 阶段 B：把发送结果告诉 mac80211。
+ *
+ * 本内核（7.0）里 `ieee80211_tx_status_irqsafe()` 会把 skb 交给 mac80211 处理并释放，
+ * 因此**调用它之后不能再自己 free skb**（否则 double free）。
+ * 关掉开关时必须自己释放，两条路都要保证 skb 只被释放一次。
+ *
+ * ack 的取值见 tx_status 参数的说明：只有每 N 帧一次的"乐观探测"标 true，
+ * 其余如实标 false。
+ */
+static void zt_tx_report_status(struct zt_dev *z, struct ieee80211_hw *hw,
+				struct sk_buff *skb, bool legacy)
+{
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	bool ack;
+
+	if (!tx_status_on) {
+		if (legacy)
+			dev_kfree_skb_any(skb);
+		else
+			ieee80211_free_txskb(hw, skb);
+		return;
+	}
+
+	if (tx_status_probe > 0 && (z->tx_status_reports % tx_status_probe) == 0) {
+		ack = true;
+		info->flags |= IEEE80211_TX_STAT_ACK;
+		z->tx_status_ack++;
+	} else {
+		ack = false;
+		info->flags &= ~IEEE80211_TX_STAT_ACK;
+	}
+	/* 速率保持 mac80211 当初选的那个（info->control.rates[0]），不编造 */
+	z->tx_status_reports++;
+	z->tx_status_last_ack = ack;
+	ieee80211_tx_status_irqsafe(hw, skb);
+}
+
 static void zt_tx_one(struct zt_dev *z, struct ieee80211_hw *hw, struct sk_buff *skb,
 		      bool legacy)
 {
@@ -1576,7 +1650,7 @@ static void zt_tx_one(struct zt_dev *z, struct ieee80211_hw *hw, struct sk_buff 
 		return;
 	}
 	z->tx_path_frames++;
-	dev_kfree_skb_any(skb);
+	zt_tx_report_status(z, hw, skb, legacy);
 }
 
 static void zt_tx_work(struct work_struct *w)
@@ -1806,6 +1880,11 @@ out:
 		 done ? "完成" : "中止", z->tx_frames, z->tx_probes,
 		 z->scan_probe_skip, z->rx_beacons, z->rx_probe_resp,
 		 z->scan_ch_5g);
+	/* v0.3 阶段 B 观测：上报开关状态与计数（关掉时三项都是 0） */
+	dev_info(&z->intf->dev,
+		 "scan: TX status 上报 tx_status=%d probe=1/%d 已报=%lu 标ACK=%lu 末次ack=%d\n",
+		 tx_status_on, tx_status_probe, z->tx_status_reports,
+		 z->tx_status_ack, z->tx_status_last_ack);
 	dev_info(&z->intf->dev,
 		 "scan: RX type 0x0000=%lu 0x0004=%lu 0x0100=%lu 0x0300=%lu 其它=%lu(last=%#06x)\n",
 		 z->rx_type_cnt[0], z->rx_type_cnt[1], z->rx_type_cnt[2],
