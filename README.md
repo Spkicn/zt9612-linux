@@ -300,6 +300,37 @@ note: NetworkManager[1127] exited with irqs disabled
 `install-driver.sh` 仍然默认写入 `blacklist zt9612`，因为「干净开机自动加载」这条路径
 还没有重新跑过一次完整验证。确认没问题后可以用 `--enable-autoload`。
 
+### 每帧上限约 1 KB：默认 MTU 下大流量会停滞（需要手工设 MTU）
+
+这块设备每帧只能可靠处理约 1 KB。实测（禁止分片的 ping）：**905 字节 payload
+（IP 包 913）能通，920 字节必丢**，而有线对照 1472 字节正常——瓶颈在设备侧，
+算上 802.11 头（24）+ LLC/SNAP（8）+ CCMP（8）后约 1024 字节/帧。
+
+后果：接口默认 MTU 是 1500，TCP 会发 1500 字节的段，被设备**整帧丢弃**。
+现象很有迷惑性——**关联正常、`ping` 小包正常、HTTP 响应头也能回来（`HTTP/1.1 200 OK`），
+但下载随即停滞**。
+
+驱动已经在 `ieee80211_hw.max_mtu` 声明了 900，但**当前内核（7.0.0-31）并不采纳该字段**
+（设完之后 `ip link set mtu 1500` 依旧成功，`/sys/class/net/*/max_mtu` 也不存在，
+因为 `netdev->max_mtu` 归 mac80211 管理且没有被填充）。所以现在需要**手工设 MTU**：
+
+```bash
+# 推荐：写进 NetworkManager 连接配置，接口每次激活都带着它起来，重启也保留
+sudo nmcli connection modify "<你的连接名>" 802-11-wireless.mtu 900
+sudo nmcli connection up "<你的连接名>"
+cat /sys/class/net/<iface>/mtu        # 应为 900
+
+# 或者沿用 modprobe 风格的一次性设置（会在重连后失效）
+sudo ip link set <iface> mtu 900
+```
+
+不建议在运行期间反复改 MTU：实测会让接口短暂失去关联（丢 1~2 个 `ping`，
+NetworkManager 会重配），另有一次观察到接口消失约 2 分钟后由驱动重新装载并自动重连。
+两次 dmesg 都没有 Oops，机制尚未定位。
+
+`hw->max_mtu` 的声明本身仍然保留：语义正确，且将来内核若开始采纳就自动生效。
+这条限制记在 CHANGELOG 的 Known limitations 里。
+
 ### 芯片挂死后需要物理拔插
 
 出现 `-110`、`can't set config #1`、`Entity not found` 表示芯片已挂死，软件复位无效。
