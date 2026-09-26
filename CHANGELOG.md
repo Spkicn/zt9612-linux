@@ -47,8 +47,35 @@
   ⇒ **数据速率由固件自主决定，主机侧改速率表/上报 TX status 都不会改变实际发射速率**。
   因此 v0.3 的"吞吐优化"不能靠补速率表实现；有意义的方向是
   提高固件自身选速的空间（HT/VHT 能力声明）或改善空口条件。
+- **补充证据（固件静态分析，`re/REPORT_HOST_RATE.md`）**：
+  * `WLAN` 帧处理函数（VA `0x6108916C`）逐指令覆盖 148/148 后，**11 处访存全部落在
+    buf+0..+7（8 字节 WLAN 传输头）与 buf-0x20..buf-1（固件内部 32 字节结构）**，
+    `buf+8..buf+0x23` 这段**描述符窗口零访问** ⇒ 固件整段忽略 28 字节描述符
+    （**中-高**：该函数方向无法从静态代码确证，倾向主机→设备）。
+  * 固件自带速率控制模块：`arrm_rc.c`、`arrm.c`、`arrm_txmode.c`、`arrm_tpc.c`、
+    `rrm_rts.c`、`rrm_sr.c`、`rrm_common.c`、`rrm_cfg.c`、`phy_custom_rf.c`，
+    以及整套 `RRM_CFG_RATE_INFO/FEC_CODING/NTX_ANTANSET/TPC_CODE/PROT_MODE/STBC/SR/AMPDU_DUR`
+    （**确证**，字符串级）。固件内还有两张**自己的**短名表（MM 42 条、DBG 50 条），
+    其中含 `UPDATE_STA_RC`（rank 38）与 `RRM_CFG_RATE_INFO`（rank 30）
+    ⇒ 协议与固件两侧都有"主机可设速率"的入口，但**厂商从未使用**。
+  * 镜像内**不存在**经典速率表（10/20/55/110、1/2/5.5/11、MCS 序列等）——命中全为 0。
+
+### 仍在未确定状态的（别当成结论）
+- **速率控制算法本身**：`arrm_rc.c` 的代码**不在** `zt9612_fw.bin` 这 219 KB 里 ——
+  镜像自己的指针表指向 `0x610D7xxx`/`0x610E8xxx`（1484 个代码段 u32 里 1370 个越界，
+  连 `gp = 0x610CCC00` 都越界）。所以"表驱动 / 探测式 / 混合"无法从本文件判断。
+- **固件短名表的 rank 到 wire id 的映射**：实证 8 个 MM id 后确认
+  **rank ≠ wire id**，表是压紧的独立编号空间。想用 `MM_STA_RC_UPDATE_REQ`(0x0069) 或
+  `DBG_RRM_RATE_INFO_CFG_REQ`(0x0091) 就必须先解出这个映射（值得做的小任务：
+  用 `/dev/zt9612` 发候选 id，看哪个能收到 CFM —— 低成本、可证伪、不动内核）。
+  上游 [`re/REPORT_FW3_TXGATE.md`](../re/REPORT_FW3_TXGATE.md) §1.1 的
+  "表项索引即 id" 与 [`re/REPORT_FW2_DEOBF.md`](../re/REPORT_FW2_DEOBF.md) §4.2 的
+  "`0x19DAC` 是主机 TX 描述符解析点" 均已被本轮**推翻**，两份报告需带更正说明阅读。
 
 ### Planned
+- **解出固件短名表 rank → wire id 的映射**（低风险、可证伪）：解出后即可用
+  `MM_STA_RC_UPDATE_REQ` / `DBG_RRM_RATE_INFO_CFG_REQ` 试"主机是否能让固件换速率"，
+  这是目前**唯一**可能让主机重新影响速率的通道
 - **2.4 GHz 速率表补齐**：现在只有 4 个 CCK 速率（1/2/5.5/11 Mbps）。
   注意：据上面的结论，**补速率表本身不会提升实测吞吐**（固件自选速），
   但它能让 `iw` 侧的速率条目与真实能力一致、也让 `iw link` 的显示不再误导
