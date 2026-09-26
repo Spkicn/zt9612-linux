@@ -46,6 +46,11 @@
  */
 #define ZT_RX_BUF_SIZE	2048		/* RX URB 缓冲：覆盖 ~1950 字节的帧 */
 #define ZT_RX_MAX_FRAME	2048		/* 单帧硬上限（超过按脏帧丢弃） */
+/*
+ * 接口 MTU 上限：设备每帧只能可靠处理约 1 KB（见 zt_mac_register 的说明）。
+ * 实测 IP 包 913 字节可通、928 字节必丢，取 900 留余量。
+ */
+#define ZT_MAX_MTU	900
 #define RX_FIFO_SIZE	(64 * 1024)
 #define HB_INTERVAL_MS	5000
 
@@ -1855,6 +1860,22 @@ static void zt_mac_register(struct zt_dev *z)
 	hw->wiphy->bands[NL80211_BAND_5GHZ] = &zt_band_5ghz;
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
+	/*
+	 * 把真实的上限告诉 mac80211 / 上层。
+	 *
+	 * 设备每帧只能可靠处理约 1 KB：实测（2026-09-26）ping payload 905 字节
+	 * （IP 包 913）能通、920 字节必丢，而有线对照 1472 字节正常
+	 * ⇒ 瓶颈在设备侧，含 802.11 头 24 + LLC/SNAP 8 + CCMP 8 后约 1024 字节/帧。
+	 * 不声明这个上限的话内核按默认 1500 走：TCP 会发 1500 字节的段，
+	 * 被设备整帧丢弃，表现为"连得上但大流量停滞"（HTTP 200 之后收不到数据）。
+	 *
+	 * 注意：`hw->max_mtu` 在本内核（7.0.0-31）实测**不影响接口 MTU**
+	 * （设 900 后 `ip link set mtu 1500` 仍成功，/sys 也没有 max_mtu 属性），
+	 * 因为 `netdev->max_mtu` 由 mac80211 管理而它没有设置。这里保留该字段是为了
+	 * 语义正确与将来内核可用；**实际生效的 MTU 需要用户态设置**
+	 * （见 README「已知问题」与 tools/set_mtu.sh）。
+	 */
+	hw->max_mtu = ZT_MAX_MTU;
 	SET_IEEE80211_PERM_ADDR(hw, z->mac);
 	/*
 	 * D10 修复：必须设置 wiphy 的父设备。否则 wiphy_dev(wiphy) 为 NULL，
