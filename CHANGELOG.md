@@ -13,7 +13,9 @@
 > 完整报告见 `re/REPORT_V03_THROUGHPUT.md`。下面的条目仍是未完成的真正待办。
 
 ### Changed
-- 修正文档与代码不一致的历史遗留：`zt9612.conf` 补全全部 6 个模块参数并更新
+- 修正文档与代码不一致的历史遗留：`zt9612.conf` 补全全部 **9** 个模块参数
+  （`do_init`/`do_boot`/`scan_probe`/`tx_ep`/`tx_prep`/`tx_variant`/`rx_debug`/
+  `tx_status`/`tx_status_probe`）并更新
   `scan_probe` 说明（`2` 重放厂商 probe 已验证能收到 probe response，`1` 自建 probe 尚未单独复验）、
   `install-driver.sh` 的能力说明改为 v0.2.0 的真实状态（不再 grep `wlan0`，
   改为按实际接口名查找，因为接口名由 MAC 生成）、README 验收输出改用当前的 MAC 读取路径
