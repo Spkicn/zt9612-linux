@@ -37,6 +37,15 @@
 #define SETTINGS_ADDR	0x210CE700
 #define MAX_FRAME	1024
 #define MAX_PAYLOAD	(MAX_FRAME - 8)
+/*
+ * RX 缓冲必须容得下一个满尺寸的 802.11 数据帧，不能按"扫描帧都不大"来定。
+ * 实测（2026-09-26）：MAX_FRAME=1024 时，ping payload ≥ 900 字节（MPDU≈968）
+ * 的回复一个字节都上不了栈 —— 空口收到了，URB 缓冲装不下就直接丢，
+ * 表现为 TCP/TLS 大包完全不通（MTU 声明 1500，实际可用约 917）。
+ * 现在按最坏情况给：2304(MSDU 上限) + 24(MAC 头) + 8(LLC/SNAP) + 8(CCMP) + 8(WLAN 头)。
+ */
+#define ZT_RX_BUF_SIZE	2048		/* RX URB 缓冲：覆盖 ~1950 字节的帧 */
+#define ZT_RX_MAX_FRAME	2048		/* 单帧硬上限（超过按脏帧丢弃） */
 #define RX_FIFO_SIZE	(64 * 1024)
 #define HB_INTERVAL_MS	5000
 
@@ -228,7 +237,7 @@ static int zt_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
 	if (!READ_ONCE(z->alive))
 		return -ENODEV;
 	ret = usb_bulk_msg(z->udev, usb_rcvbulkpipe(z->udev, z->ep_in),
-			   z->rx, MAX_FRAME, &got, timeout_ms);
+			   z->rx, ZT_RX_BUF_SIZE, &got, timeout_ms);
 	if (ret)
 		return ret;
 	if (got < 8 || memcmp(z->rx, "WLAN", 4))
@@ -356,7 +365,7 @@ static int zt_kfifo_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
 		if (kfifo_out_peek(&z->rx_fifo, hdr, 2) != 2)
 			continue;
 		flen = (u16)hdr[0] | ((u16)hdr[1] << 8);
-		if (flen < 8 || flen > MAX_FRAME) {
+		if (flen < 8 || flen > ZT_RX_MAX_FRAME) {
 			unsigned int d = kfifo_out(&z->rx_fifo, hdr, 2);	/* 脏数据，丢弃 */
 
 			(void)d;
@@ -1176,12 +1185,12 @@ static int zt_rx_start(struct zt_dev *z)
 	z->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!z->rx_urb)
 		return -ENOMEM;
-	z->rx_buf = kmalloc(MAX_FRAME, GFP_KERNEL);
+	z->rx_buf = kmalloc(ZT_RX_BUF_SIZE, GFP_KERNEL);
 	if (!z->rx_buf)
 		return -ENOMEM;
 
 	usb_fill_bulk_urb(z->rx_urb, z->udev, usb_rcvbulkpipe(z->udev, z->ep_in),
-			  z->rx_buf, MAX_FRAME, zt_rx_complete, z);
+			  z->rx_buf, ZT_RX_BUF_SIZE, zt_rx_complete, z);
 	z->rx_running = true;
 	if (usb_submit_urb(z->rx_urb, GFP_KERNEL)) {
 		z->rx_running = false;	/* 未提交成功 → 不会有 completion */
@@ -1253,7 +1262,7 @@ static ssize_t zt_read(struct file *file, char __user *buf, size_t count, loff_t
 	for (;;) {
 		if (kfifo_out_peek(&z->rx_fifo, hdr, 2) == 2) {
 			flen = get_unaligned_le16(hdr);
-			if (flen > MAX_FRAME) {		/* 脏数据：丢掉长度头继续 */
+			if (flen > ZT_RX_MAX_FRAME) {	/* 脏数据：丢掉长度头继续 */
 				if (kfifo_out(&z->rx_fifo, junk, 2) != 2)
 					return -EIO;
 				continue;
@@ -1934,7 +1943,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 	z->tx = kmalloc(MAX_FRAME, GFP_KERNEL);
 	z->pl = kmalloc(MAX_PAYLOAD, GFP_KERNEL);
-	z->rx = kmalloc(MAX_FRAME, GFP_KERNEL);
+	z->rx = kmalloc(ZT_RX_BUF_SIZE, GFP_KERNEL);
 	z->txd = kmalloc(MAX_FRAME, GFP_KERNEL);
 	if (!z->tx || !z->pl || !z->rx || !z->txd) {
 		ret = -ENOMEM;
