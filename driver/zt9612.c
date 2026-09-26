@@ -127,6 +127,15 @@ static int tx_variant;			/* 0=正常 1=描述符+0x00 置 0 2=不带描述符 3=
 module_param(tx_variant, int, 0644);
 MODULE_PARM_DESC(tx_variant, "TX frame variant for experiments (default 0)");
 
+/*
+ * 调查用开关：把每个收到的 USB 传输的长度打出来（限量 60 条）。
+ * 用途：确认"大包不上栈"是设备只给了不够的字节，还是驱动自己丢的。
+ * 默认 0（关闭），不影响正常使用。
+ */
+static int rx_debug;
+module_param(rx_debug, int, 0644);
+MODULE_PARM_DESC(rx_debug, "log USB RX transfer lengths for the first 60 frames (default 0)");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -201,6 +210,8 @@ struct zt_dev {
 	unsigned long		txq_overflow;
 
 	struct mutex		lock;
+
+	int			rx_debug_left;	/* 诊断：还能打多少条 RX 长度日志 */
 };
 
 static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len);
@@ -1141,6 +1152,22 @@ static void zt_rx_complete(struct urb *urb)
 	struct zt_dev *z = urb->context;
 	int len = urb->actual_length;
 
+	/*
+	 * 临时诊断（默认关闭，诊断大包为何不上栈）：
+	 * 记录 USB 层实际收到的长度与实际载荷长度（相对 URB 缓冲）。
+	 * 用 modprobe zt9612 rx_debug=1 打开；日志限量 60 条，避免刷屏。
+	 */
+	if (rx_debug && z->rx_debug_left > 0 && urb->status == 0 && len >= 8 &&
+	    !memcmp(z->rx_buf, "WLAN", 4)) {
+		u16 dh = get_unaligned_le16(z->rx_buf + 4);
+		u16 dt = get_unaligned_le16(z->rx_buf + 6);
+
+		z->rx_debug_left--;
+		dev_info(&z->intf->dev,
+			 "rxdbg: usb_len=%d hlen=%u type=%#06x urb_buf=%d left=%d\n",
+			 len, dh, dt, ZT_RX_BUF_SIZE, z->rx_debug_left);
+	}
+
 	/* D9：卸载中（alive=0）不再碰任何缓冲，只回报回收完成 */
 	if (!READ_ONCE(z->alive)) {
 		complete(&z->rx_done);
@@ -1944,6 +1971,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	INIT_WORK(&z->tx_work, zt_tx_work);
 	skb_queue_head_init(&z->txq);
 	spin_lock_init(&z->txq_lock);
+	z->rx_debug_left = rx_debug ? 60 : 0;
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
