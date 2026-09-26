@@ -128,13 +128,28 @@ module_param(tx_variant, int, 0644);
 MODULE_PARM_DESC(tx_variant, "TX frame variant for experiments (default 0)");
 
 /*
- * 调查用开关：把每个收到的 USB 传输的长度打出来（限量 60 条）。
- * 用途：确认"大包不上栈"是设备只给了不够的字节，还是驱动自己丢的。
- * 默认 0（关闭），不影响正常使用。
+ * 调查用开关：把接下来 N 个收到的 USB 传输的长度打出来。
+ *
+ * 用法（可随时重置，不必重载模块）：
+ *   sudo sh -c 'echo 40 > /sys/module/zt9612/parameters/rx_debug'
+ *   ... 触发要观察的流量（例如 ping -s 1400 -M do <gw>）...
+ *   sudo journalctl -k --since '-1 min' | grep rxdbg
+ *
+ * 两个坑（都踩过）：
+ *   1) 别用 `echo N | sudo tee <file>` 写这个参数 —— tee 会把 stdin 吃光，
+ *      N 根本进不去（用 `sudo sh -c 'echo N > ...'`）；
+ *   2) 读日志用 journalctl -k：本机 `kernel.dmesg_restrict=1` 且 printk 级别低，
+ *      `dmesg` 直接读是空的。
+ *
+ * 2026-09-26 用它得到的结论：ping payload 900 时能看到 usb_len=1038 的回复帧，
+ * 而 payload 1400（100% 丢包）时整段窗口里 usb_len 最大只有 570（全是背景流量）
+ * ⇒ 设备对超过约 1030 字节的帧**直接丢弃、不报错**（不是截断）。
+ *
+ * 默认 0（关闭）。
  */
-static int rx_debug;
-module_param(rx_debug, int, 0644);
-MODULE_PARM_DESC(rx_debug, "log USB RX transfer lengths for the first 60 frames (default 0)");
+static int rx_debug_left;		/* >0 时继续打印，每条递减 */
+module_param_named(rx_debug, rx_debug_left, int, 0644);
+MODULE_PARM_DESC(rx_debug, "log the length of the next N received USB transfers (write N to start)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -210,8 +225,6 @@ struct zt_dev {
 	unsigned long		txq_overflow;
 
 	struct mutex		lock;
-
-	int			rx_debug_left;	/* 诊断：还能打多少条 RX 长度日志 */
 };
 
 static void zt_note_msg(struct zt_dev *z, const u8 *frame, int len);
@@ -1154,18 +1167,18 @@ static void zt_rx_complete(struct urb *urb)
 
 	/*
 	 * 临时诊断（默认关闭，诊断大包为何不上栈）：
-	 * 记录 USB 层实际收到的长度与实际载荷长度（相对 URB 缓冲）。
-	 * 用 modprobe zt9612 rx_debug=1 打开；日志限量 60 条，避免刷屏。
+	 * 记录 USB 层实际收到的长度与帧头里的 hlen。计数由模块参数 rx_debug 控制，
+	 * 可随时 `sudo sh -c 'echo N > .../parameters/rx_debug'` 重新开始。
 	 */
-	if (rx_debug && z->rx_debug_left > 0 && urb->status == 0 && len >= 8 &&
+	if (rx_debug_left > 0 && urb->status == 0 && len >= 8 &&
 	    !memcmp(z->rx_buf, "WLAN", 4)) {
 		u16 dh = get_unaligned_le16(z->rx_buf + 4);
 		u16 dt = get_unaligned_le16(z->rx_buf + 6);
 
-		z->rx_debug_left--;
+		rx_debug_left--;
 		dev_info(&z->intf->dev,
-			 "rxdbg: usb_len=%d hlen=%u type=%#06x urb_buf=%d left=%d\n",
-			 len, dh, dt, ZT_RX_BUF_SIZE, z->rx_debug_left);
+			 "rxdbg: usb_len=%d hlen=%u type=%#06x left=%d\n",
+			 len, dh, dt, rx_debug_left);
 	}
 
 	/* D9：卸载中（alive=0）不再碰任何缓冲，只回报回收完成 */
@@ -1971,7 +1984,6 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	INIT_WORK(&z->tx_work, zt_tx_work);
 	skb_queue_head_init(&z->txq);
 	spin_lock_init(&z->txq_lock);
-	z->rx_debug_left = rx_debug ? 60 : 0;
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
