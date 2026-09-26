@@ -300,36 +300,34 @@ note: NetworkManager[1127] exited with irqs disabled
 `install-driver.sh` 仍然默认写入 `blacklist zt9612`，因为「干净开机自动加载」这条路径
 还没有重新跑过一次完整验证。确认没问题后可以用 `--enable-autoload`。
 
-### 每帧上限约 1 KB：默认 MTU 下大流量会停滞（需要手工设 MTU）
+### 大流量停滞的真正原因：接收缓冲过小（v0.2.0 已修）
 
-这块设备每帧只能可靠处理约 1 KB。实测（禁止分片的 ping）：**905 字节 payload
-（IP 包 913）能通，920 字节必丢**，而有线对照 1472 字节正常——瓶颈在设备侧，
-算上 802.11 头（24）+ LLC/SNAP（8）+ CCMP（8）后约 1024 字节/帧。
+**症状**：关联正常、`ping` 正常、HTTP 响应头也能回来（`HTTP/1.1 200 OK`），
+但下载随即停滞——很有迷惑性。
 
-后果：接口默认 MTU 是 1500，TCP 会发 1500 字节的段，被设备**整帧丢弃**。
-现象很有迷惑性——**关联正常、`ping` 小包正常、HTTP 响应头也能回来（`HTTP/1.1 200 OK`），
-但下载随即停滞**。
+**根因**：接收用的 URB 缓冲原来固定为 1024 字节（`MAX_FRAME`），
+装不下满尺寸的 802.11 数据帧（要算上 MAC 头 24 + LLC/SNAP 8 + CCMP 8），
+超出的帧被**整帧丢弃**。判据很干净：ping payload ≥900 字节时，
+接口层 `rx_bytes` 增量为 **0**，而 mac80211 的 station 计数仍在增长
+（那是重传的广播流量）⇒ 帧到了芯片却没到协议栈。
 
-驱动已经在 `ieee80211_hw.max_mtu` 声明了 900，但**当前内核（7.0.0-31）并不采纳该字段**
-（设完之后 `ip link set mtu 1500` 依旧成功，`/sys/class/net/*/max_mtu` 也不存在，
-因为 `netdev->max_mtu` 归 mac80211 管理且没有被填充）。所以现在需要**手工设 MTU**：
+**修复**：接收路径改用独立常量并把缓冲提到 2048 字节
+（`ZT_RX_BUF_SIZE` / `ZT_RX_MAX_FRAME`），发送与调试路径仍用 1024。
+修复后实测（默认 MTU 1500）HTTPS 下载中位数约 **4.2 Mbit/s**，
+对比修复前的"收不到数据"。
 
-```bash
-# 推荐：写进 NetworkManager 连接配置，接口每次激活都带着它起来，重启也保留
-sudo nmcli connection modify "<你的连接名>" 802-11-wireless.mtu 900
-sudo nmcli connection up "<你的连接名>"
-cat /sys/class/net/<iface>/mtu        # 应为 900
+> 记录一个走错的方向：一开始把 1 KB 现象归因成"设备帧长上限"，
+> 还把 `ieee80211_hw.max_mtu` 设成了 900。实测证明既没必要也有害——
+> MTU=900 时吞吐约 3.2 Mbit/s，**低于** 1500 下的约 4.2 Mbit/s；
+> 而且 MTU 上限低于 1280 会让 **IPv6 完全不可用**（IPv6 与 mac80211 都要求 ≥1280）。
+> 上限已改回 1500。
 
-# 或者沿用 modprobe 风格的一次性设置（会在重连后失效）
-sudo ip link set <iface> mtu 900
-```
+**仍然存在的小问题**：禁止分片的 `ping` 在 payload >905 字节（IP 包 913）时失败，
+而有线对照 1472 字节正常；TCP 数据面不受影响，原因待查。
 
-不建议在运行期间反复改 MTU：实测会让接口短暂失去关联（丢 1~2 个 `ping`，
+**关于改 MTU**：运行期 `ip link set mtu` 会让接口短暂失去关联（丢 1~2 个 `ping`，
 NetworkManager 会重配），另有一次观察到接口消失约 2 分钟后由驱动重新装载并自动重连。
-两次 dmesg 都没有 Oops，机制尚未定位。
-
-`hw->max_mtu` 的声明本身仍然保留：语义正确，且将来内核若开始采纳就自动生效。
-这条限制记在 CHANGELOG 的 Known limitations 里。
+两次 `dmesg` 都没有 Oops，机制尚未定位，因此不建议在运行期反复改。
 
 ### 芯片挂死后需要物理拔插
 
