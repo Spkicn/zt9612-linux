@@ -183,6 +183,30 @@ static int rx_debug_left;		/* >0 时继续打印，每条递减 */
 module_param_named(rx_debug, rx_debug_left, int, 0644);
 MODULE_PARM_DESC(rx_debug, "log the length of the next N received USB transfers (write N to start)");
 
+/*
+ * 实验开关（默认关闭）：给 5GHz band 声明 HT 能力。
+ *
+ * 背景：v0.3.1 修好 5GHz 之后，同一张卡实测 9~12 Mbit/s，而厂商 Windows 驱动
+ * 在 5GHz 上是 13.4~18.2 Mbit/s，且厂商驱动跑的是 802.11ax / 573~1201 Mbps PHY。
+ * 本驱动此前不声明 band->ht_cap，mac80211 只能跑 legacy OFDM（6~54 Mbps）。
+ *
+ * 实测结论（2026-09-27，同一张卡 + 同一个 5GHz BSS + 同一 URL，10s x 3 中位数，
+ * A/B/A 共 5 臂 —— 详见 re/EXPERIMENT_HT_VHT.md）：
+ *   - 声明 HT：15.71 / 14.28 Mbit/s；不声明：12.91 / 14.29 / 12.27 Mbit/s
+ *     ⇒ 约 1.14x，**与同臂内的漂移（~15%）同量级，收益不成立**；
+ *   - 机制：即使协商上 HT，`station dump` 的速率也停在 **MCS 0**（6.5 MBit/s）——
+ *     驱动不上报 TX status（tx_status 默认关），mac80211 的速率控制拿不到反馈、爬不上去；
+ *   - **副作用**：声明后 mac80211 会尝试发起 TX Block-Ack 会话，而本驱动没有
+ *     `ampdu_action`，触发 `WARNING: net/mac80211/agg-tx.c:623`（docs/09 阶段 D 预警过的风险）。
+ *
+ * ⇒ 默认保持关闭；要继续走这条路，得先补 `ampdu_action` + 真实 TX 反馈，
+ *   而不是只声明能力位。声明范围刻意保守：只 5GHz、只 HT20（不含 40MHz）、
+ *   不声明聚合相关 hw 标志。
+ */
+static int ht_cap_enable;
+module_param(ht_cap_enable, int, 0644);
+MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (default 0; measured no throughput gain and triggers an agg-tx WARNING - see re/EXPERIMENT_HT_VHT.md)");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -1529,6 +1553,24 @@ static struct ieee80211_supported_band zt_band_5ghz = {
 	.n_bitrates = ARRAY_SIZE(zt_rates_5ghz),
 };
 
+/*
+ * 实验用 HT 能力（见 ht_cap_enable 的说明）。
+ * 保守声明：HT20（不含 SUP_WIDTH_20_40）+ SGI_20 + MCS 0~15（2 空间流，本卡 2T2R）、
+ * 不声明聚合相关的 hw 标志，因此 mac80211 只用 HT 速率、不做 A-MPDU。
+ * 射频的真实能力未从固件确证，故先按"能协商上"的最小集合试；若实测无收益即回退。
+ */
+static const struct ieee80211_sta_ht_cap zt_ht_cap_5ghz = {
+	.ht_supported = true,
+	.cap = IEEE80211_HT_CAP_SGI_20,
+	.ampdu_factor = IEEE80211_HT_MAX_AMPDU_8K,
+	.ampdu_density = IEEE80211_HT_MPDU_DENSITY_NONE,
+	.mcs = {
+		.rx_mask = { 0xff, 0xff, 0, 0 },
+		.rx_highest = cpu_to_le16(144),	/* HT20/2SS/SGI ≈ 144.4 Mbps */
+		.tx_params = IEEE80211_HT_MCS_TX_DEFINED,
+	},
+};
+
 static struct zt_dev *zt_from_hw(struct ieee80211_hw *hw)
 {
 	return *(struct zt_dev **)hw->priv;
@@ -1993,6 +2035,11 @@ static void zt_mac_register(struct zt_dev *z)
 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	hw->wiphy->bands[NL80211_BAND_2GHZ] = &zt_band_2ghz;
 	hw->wiphy->bands[NL80211_BAND_5GHZ] = &zt_band_5ghz;
+	if (ht_cap_enable) {
+		zt_band_5ghz.ht_cap = zt_ht_cap_5ghz;
+		dev_info(&z->intf->dev,
+			 "experimental: 5GHz HT cap 已声明（HT20/SGI，MCS0-15，未开聚合）\n");
+	}
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
 	/*
