@@ -694,14 +694,35 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
 }
 
 /*
- * MM_STA_ADD_REQ(0x0A) 的 48 字节载荷模板 —— **占位，尚未回填**。
- * 逆向结论（re/REPORT_STA_ADD_LAYOUT.md §2/§3）：+0x14~+0x2F 是"电台速率配置(RC)块"的
- * 原样拷贝，+0x00~+0x13 是按站点能力算出的类型/标志/索引；载荷里**没有** MAC/AID。
- * 真值必须来自 P0-A 抓包（或把那个 0x108 字节源结构逆向到底）——**不要靠猜**：
- * 实测全 0 与"合理 RC 值"两种猜测都让固件断言在 rc.c 并掉线。
+ * MM_STA_ADD_REQ(0x0A) 的 48 字节载荷模板。
+ *
+ * 偏移与语义来自 `re/REPORT_STA_ADD_STRUCT.md`（指令级逆向：RC 字段在**头部**
+ * +0x00~+0x13，尾部 +0x14~+0x2F 是 A-MPDU 上限/标志/站点键），
+ * 数值来自 2026-09-27 的**用户态实测**（`tools/sta_add_probe.py --layout rc --format 0`）：
+ * 固件回了 `MM_STA_ADD_CFM(0x0B)` = `{sta_idx, pm_state, status}` 且 status=0，
+ * 链路与上网不受影响（复现两次，sta_idx=0 / 1）。
+ *
+ *   +0x00 format=0（**关键**：早期发 2 会被固件在 rc.c:676 断言）
+ *   +0x01 mcs_max=7   +0x02 r_idx_min=0   +0x03 r_idx_max=7
+ *   +0x04 rate_map[4]=ff 00 00 00         +0x08 rate_map_l(u16)=0x00ff
+ *   +0x0a bw_max=0    +0x0b no_ss=1       +0x0c short_gi=0
+ *   +0x14 flags=0     +0x18 he_max_ampdu=0x000FFFFF
+ *   +0x1c vht_max_ampdu=0x1FFF            +0x24 ht_max_ampdu=0x1FFF
+ *   +0x2a AID=0（逆向指向 params+0x1c=AID；实测填 0 即可被接受，故暂不填 aid）
+ *   +0x2c min_ampdu=1 +0x2d 站点键=0
+ *
+ * 仍未证实的只有"哪些字段会被固件严格校验"：本模板是**实测可用**的那一份，
+ * 改任何一个字节都要按"一次一个变量 + 看 0x0B / 0x0600"重新验证。
  */
 #define ZT_STA_ADD_LEN	48
-static const u8 zt_sta_add_tmpl[ZT_STA_ADD_LEN] = { 0 };
+static const u8 zt_sta_add_tmpl[ZT_STA_ADD_LEN] = {
+	0x00, 0x07, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00,
+	0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xff, 0xff, 0x0f, 0x00, 0xff, 0x1f, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0xff, 0x1f, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+};
 
 /*
  * 关联后发 MM_STA_ADD_REQ，并记下 CFM 返回的 sta_idx 供描述符使用。
@@ -2164,13 +2185,17 @@ static void zt_mac_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vi
 	/*
 	 * 实验（sta_add_en，默认 0）：关联完成后把站点注册给固件，
 	 * 让数据帧描述符能带上固件分配的 sta_idx（见 re/REPORT_TX_SESSION.md）。
+	 * 注意：**断开的清理不受开关影响** —— 否则运行期把 sta_add_en 改成 0 再重连，
+	 * 会留下一个"仍然有效"的本地会话（sta_valid=true），描述符继续带旧 sta_idx。
 	 */
-	if (!sta_add_en || !(changed & BSS_CHANGED_ASSOC))
+	if (!(changed & BSS_CHANGED_ASSOC))
 		return;
-	if (vif->cfg.assoc)
-		zt_sta_add(z, vif->cfg.aid, info->bssid);
-	else
+	if (vif->cfg.assoc) {
+		if (sta_add_en)
+			zt_sta_add(z, vif->cfg.aid, info->bssid);
+	} else {
 		zt_sta_del(z);
+	}
 }
 /* ------------------------------------------------------------------ M3.2 扫描 */
 
