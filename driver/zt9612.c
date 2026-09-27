@@ -2230,7 +2230,7 @@ module_usb_driver(zt_driver);
 
 MODULE_AUTHOR("Spkicn <Spkicn@users.noreply.github.com>");
 MODULE_DESCRIPTION("ZT9612U (ZTOP/ACEV100) USB WiFi driver - mac80211 station: 2.4/5 GHz scan, connect, WPA2");
-MODULE_VERSION("0.2.0");
+MODULE_VERSION("0.3.0");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("zt9612_fw.bin");
 MODULE_FIRMWARE("zt9612_settings.bin");

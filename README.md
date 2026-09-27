@@ -8,8 +8,9 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 
 ## 项目状态
 
-当前版本 0.2.0：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
-端到端联网（DHCP + `ping` 外网）均已实机验证。
+当前版本 0.3.0：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
+端到端联网（DHCP + `ping` 外网）均已实机验证；吞吐里程碑（v0.3）亦已完成，实测
+4.2~4.7 Mbit/s（见下表与「已知问题」）。
 
 | 里程碑 | 状态 |
 |---|---|
@@ -146,7 +147,7 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 ```bash
 sudo dkms install .                          # add、build、install 一步完成
 dkms status
-sudo dkms remove zt9612/0.2.0 --all
+sudo dkms remove zt9612/0.3.0 --all
 ```
 
 手动编译的等价流程：
