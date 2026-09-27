@@ -244,20 +244,27 @@ module_param(ntf_log, int, 0644);
 MODULE_PARM_DESC(ntf_log, "experimental: log the next N EP2-IN TX notifications (0 = off; the channel is always read)");
 
 /*
- * 实验开关（默认关闭 = 与 0.3.x 行为完全一致）：数据帧描述符模板。
+ * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：数据帧描述符的**字段级**模板。
  *
- * 背景（re/EXPERIMENT_TX_RATE.md §5）：厂商上传时的 USB 抓包显示，厂商对**数据帧**用的是
- * 与**管理帧**不同的一套描述符常量；我们此前把管理帧模板用在了所有帧上。实测差异：
- *   同一链路、同一帧长：管理模板 6.32 Mbit/s → 数据模板 161.68 Mbit/s（25.6 倍）。
- * 但把它用到真实数据路径后，**DHCP 拿不到地址**（关联与四次握手正常），原因未定位 ——
- * 因此先做成开关，默认关闭，等定位清楚再决定是否默认开启。
+ * 背景（re/EXPERIMENT_TX_RATE.md §5~6）：厂商上传时的 USB 抓包显示，厂商对**数据帧**用的
+ * 描述符常量与我们不同 —— 我们的值全部抄自**管理帧**（扫描 probe request）。
+ * 逐字段二分（裸 TX 微基准，同一链路、1436 字节传输）：
  *
- * 0 = 全部帧用管理帧模板（默认，行为与 0.3.x 一致）
- * 1 = 加密单播数据帧用厂商数据模板，其余仍用管理帧模板
+ *   mask=0x00（全管理，基线） 6.67 Mbit/s
+ *   mask=0x02 仅 +0x08=0x0000   → 178.88 Mbit/s   ← 关键字段（我们发 0xff00）
+ *   其余单字段（0x01/0x04/0x08/0x10/0x20）→ 5.0~6.5 Mbit/s，**无效果**
+ *   mask=0x3F（全部）           → 195~243 Mbit/s
+ *
+ * 位定义（仅作用于**加密单播数据帧**）：
+ *   bit0 +0x06=0x0000   bit1 +0x08=0x0000   bit2 +0x0a=0x1312
+ *   bit3 +0x0c=0x0040   bit4 +0x14=0x0200   bit5 +0x1a=0x7540
+ *
+ * 之所以做成位掩码而不是直接改常量：把全部字段都换成数据模板时 **DHCP 拿不到地址**
+ * （关联与四次握手正常）。需要逐字段找出"提速必需"与"断网元凶"分别是哪个。
  */
-static int tx_desc_mode;
-module_param(tx_desc_mode, int, 0644);
-MODULE_PARM_DESC(tx_desc_mode, "experimental: 1 = vendor DATA-frame descriptor template for protected unicast data frames (default 0)");
+static int tx_desc_mask;
+module_param(tx_desc_mask, int, 0644);
+MODULE_PARM_DESC(tx_desc_mask, "experimental: bitmask of vendor DATA-frame descriptor fields to apply to protected unicast data frames (0 = off; bit1 = +0x08, the one that matters)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -1018,22 +1025,30 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		memset(d, 0, TX_DESC_LEN);
 		put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
 		put_unaligned_le16(flen, d + 4);
-		if (tx_desc_mode && is_data && protected && !mcast) {
-			/* 厂商数据帧模板（vendor_upload.pcap 中 96107/96107 条一致的部分） */
-			put_unaligned_le16(0x0000, d + 6);
-			put_unaligned_le16(0x0000, d + 8);
-			put_unaligned_le16(0x1312, d + 10);
-			put_unaligned_le16(0x0040, d + 12);
-			put_unaligned_le16(z->tx_seq++, d + 14);
-			put_unaligned_le16(0x0200, d + 20);
-			put_unaligned_le16(0x7540, d + 26);
-		} else {
-			/* 厂商管理帧模板（原样保留：association / auth 等仍走这条） */
-			put_unaligned_le16(0x0700, d + 6);
-			put_unaligned_le16(0xff00, d + 8);
-			put_unaligned_le16(0x0005, d + 10);
-			put_unaligned_le16(z->tx_seq++, d + 14);
-			put_unaligned_le16(0x003f, d + 26);
+		/* 先按厂商管理帧模板（我们一直以来的行为） */
+		put_unaligned_le16(0x0700, d + 6);
+		put_unaligned_le16(0xff00, d + 8);
+		put_unaligned_le16(0x0005, d + 10);
+		put_unaligned_le16(z->tx_seq++, d + 14);
+		put_unaligned_le16(0x003f, d + 26);
+		/*
+		 * 实验：加密单播数据帧按位采用厂商**数据帧**的字段值（见 tx_desc_mask 注释）。
+		 * 广播/组播仍用管理模板：厂商抓包里 96107 条数据帧全是单播，且实测加密广播
+		 * （DHCP DISCOVER）用数据模板会拿不到地址。EAPOL 等未加密数据帧同理不动。
+		 */
+		if (tx_desc_mask && is_data && protected && !mcast) {
+			if (tx_desc_mask & 0x01)
+				put_unaligned_le16(0x0000, d + 6);
+			if (tx_desc_mask & 0x02)
+				put_unaligned_le16(0x0000, d + 8);
+			if (tx_desc_mask & 0x04)
+				put_unaligned_le16(0x1312, d + 10);
+			if (tx_desc_mask & 0x08)
+				put_unaligned_le16(0x0040, d + 12);
+			if (tx_desc_mask & 0x10)
+				put_unaligned_le16(0x0200, d + 20);
+			if (tx_desc_mask & 0x20)
+				put_unaligned_le16(0x7540, d + 26);
 		}
 		memcpy(d + TX_DESC_LEN, frame, flen);
 
