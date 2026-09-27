@@ -9,23 +9,6 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
-### Fixed
-- **5 GHz 扫描的 band 标志写死成 0（导致 5 GHz 完全不可用）**：`zt_scan_work()` 的逐信道
-  `MM_SET_CHANNEL` 参数里 `band` 恒为 `0`，等于给 5 GHz 信道发"2.4 GHz band + 5 GHz 频率"
-  这种自相矛盾的请求 —— 固件照样回 `MM_SET_CHANNEL_CFM`，但无线电不会真的切过去。
-  后果：5 GHz 扫描恒 `beacon=0`、5 GHz 关联从未发生，mac80211 里出现的"5 GHz BSS"
-  其实是频点被错误标注的 2.4 GHz 帧（实测：`freq=5745` 的条目却带
-  `DS Parameter set: channel 11` / `ERP` / `Country: Channels [1-13]`）。
-  修好后 5 GHz 扫描一次可见 29 个真实 BSS，并且**首次在本项目历史上完成 5 GHz 关联与数据面**。
-  - ground truth：厂商抓包 81/81 条 `SET_CHANNEL` 满足 `band = (freq>2500) ? 1 : 0`
-    （2484→0、5180→1），见 `re/REPORT_5GHZ.md` §1.1；同文件的 `zt_set_channel()` 一直是对的，
-    只有扫描循环漏了。
-  - 实测收益（同一张卡、同一 URL、10 s×3 取中位数）：同 SSID 下 **2.4 GHz 4.16 Mbit/s →
-    5 GHz 9.00 Mbit/s**；强信号 5 GHz BSS 上 **12.10 Mbit/s**（2.2~2.9 倍）。
-  - 对照：同一张卡在厂商 Windows 驱动下 5 GHz 为 13.37~18.21 Mbit/s。
-  - **同时更正两条旧结论**：M3.5 的"5 GHz 已实机验证"当时证据不成立（是错误标注的产物）；
-    v0.3 的"驱动侧无可改之处"**只在 2.4 GHz 范围内成立**。
-
 ### Planned
 - **厂商渠道（最高优先级）**：索取官方 Linux 驱动包，或**含 RAM 段代码的完整固件** ——
   现有 219 KB 镜像里没有速率控制代码（指针表指向段外），这是唯一还能打开
@@ -38,6 +21,44 @@
 - **可选（仅为显示一致性，不提升吞吐）**：2.4 GHz 补 OFDM 速率表、声明 HT/VHT
   —— 两者都**不会**改变实测吞吐（见 [0.3.0] 的结论）
 - 清理驱动源码中历史遗留的乱码注释（必须与实机编译验证一起做）
+
+## [0.3.1] - 2026-09-27
+
+> **5 GHz 修复版**：v0.3.0 发布当天，用"同一张卡、同一个 AP、同一个 URL"的差分实验
+> （厂商 Windows 驱动 vs 本驱动）发现 **5 GHz 一直完全不可用**，并定位到一行 bug。
+> 修复后同一张卡实测吞吐 2.4 GHz 4.16 Mbit/s → 5 GHz **9.00 Mbit/s**，
+> 强信号 5 GHz BSS 上 **12.10 Mbit/s**。
+
+### Fixed
+- **5 GHz 扫描的 band 标志写死成 0（导致 5 GHz 完全不可用）**：`zt_scan_work()` 的逐信道
+  `MM_SET_CHANNEL` 参数里 `band` 恒为 `0`，等于给 5 GHz 信道发"2.4 GHz band + 5 GHz 频率"
+  这种自相矛盾的请求 —— 固件照样回 `MM_SET_CHANNEL_CFM`（所以驱动以为切成功了），
+  但无线电不会真的切过去。
+  - **症状**：5 GHz 扫描恒 `beacon=0`（2.4 GHz 是 `beacon=32~56`）；`iw scan` 里冒出的
+    "5 GHz BSS"经不起检查 —— 例如 `freq: 5745` 的条目却带 `DS Parameter set: channel 11`、
+    `ERP`、`Country: Channels [1-13]`（都是 2.4 GHz 专有元素），同一个 BSSID 还会同时
+    以 2462 MHz 与 5745 MHz 出现。
+  - **ground truth**：厂商抓包 81/81 条 `SET_CHANNEL` 满足 `band = (freq>2500) ? 1 : 0`
+    （2484→0、5180→1，见 `re/REPORT_5GHZ.md` §1.1）。同一文件里的 `zt_set_channel()`
+    一直是对的，只有扫描循环漏了。**这也是"逆向厂商驱动"最实际的用法：把它的抓包当标准答案
+    逐字段对照，而不是照抄代码。**
+  - **实机验证**（Ubuntu 24.04 / 内核 `7.0.0-31-generic`，同一张 ZT9612U，10 s×3 取中位数）：
+    5 GHz 扫描从 `beacon=0` 恢复正常、真实 5 GHz BSS 由 1 个（自相矛盾项）变为 **29 个**；
+    完成本项目历史上**第一次真正的 5 GHz 关联**（5 GHz BSS，ch153，−54 dBm）；
+    吞吐 2.4 GHz 4.16 → 5 GHz **9.00 Mbit/s**，强信号 5 GHz BSS（−26 dBm）**12.10 Mbit/s**。
+  - **对照**：同一张卡在厂商 Windows 驱动下 5 GHz 为 13.37~18.21 Mbit/s（本版仍略低，
+    候选原因是本驱动未声明 HT/VHT；**尚未验证**）。
+- **同时更正两条旧结论**（README 已同步）：
+  - M3.5「5 GHz 已完成并实机验证」当时的证据（"59 个 BSS 中 7 个在 5GHz"）是频点错误标注的产物，
+    5 GHz 关联在此之前从未发生过；
+  - v0.3「驱动侧无可改之处」**只在 2.4 GHz 范围内成立** —— 5 GHz 是一条值 2~3 倍的
+    driver-side 杠杆，此前完全没被看见。
+
+### 诊断工具（本次实验新增，本地未入库）
+- `tools/win_diff_run.ps1`：Windows 侧测量器，自动识别被测网卡并用**网卡计数增量**核对出口
+  （Windows 是弱主机模型，只绑源地址不保证走哪块网卡）。
+- `tools/win_connect_bssid.ps1`：用 `WlanConnect` 的 desired-BSSID 列表把网卡锁到指定 BSS
+  （`netsh` 做不到），用于逼厂商驱动上 2.4 GHz（结果：它拒绝，直接失败断开）。
 
 ## [0.3.0] - 2026-09-27
 
@@ -361,7 +382,8 @@ ARRM 更大选速空间，是唯一剩下的驱动侧手段"，随后论证为**
 - `driver/zt9612.c` 中部分中文注释在早期编辑中损坏成乱码（不影响编译），待清理
 - 只支持 2.4G 频段、STA 模式；无蓝牙、无 AP / 监听模式
 
-[Unreleased]: https://github.com/Spkicn/zt9612-linux/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Spkicn/zt9612-linux/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Spkicn/zt9612-linux/releases/tag/v0.1.0
