@@ -8,9 +8,9 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 
 ## 项目状态
 
-当前版本 0.3.0：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
-端到端联网（DHCP + `ping` 外网）均已实机验证；吞吐里程碑（v0.3）亦已完成，实测
-4.2~4.7 Mbit/s（见下表与「已知问题」）。
+当前版本 0.3.1：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
+端到端联网（DHCP + `ping` 外网）均已实机验证；v0.3.1 修掉了"5 GHz 一直不可用"的一行 bug，
+5 GHz 现可关联并实测 **9~12 Mbit/s**（2.4 GHz 约 4 Mbit/s，见下表与「已知问题」）。
 
 | 里程碑 | 状态 |
 |---|---|
@@ -147,7 +147,7 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 ```bash
 sudo dkms install .                          # add、build、install 一步完成
 dkms status
-sudo dkms remove zt9612/0.3.0 --all
+sudo dkms remove zt9612/0.3.1 --all
 ```
 
 手动编译的等价流程：
@@ -362,9 +362,9 @@ put_unaligned_le16(f > 2500 ? 1 : 0, ...);    /* 修复后 */
 
 | 场景 | 修复前 | 修复后 |
 |---|---|---|
-| 2.4 GHz（IVT-WiFi ch6，−52 dBm） | 4.16 Mbit/s | — |
-| 5 GHz（IVT-WiFi ch153，−54 dBm） | 收不到 | **9.00 Mbit/s** |
-| 5 GHz（TP-LINK_85E8 ch149，−26 dBm） | 收不到 | **12.10 Mbit/s** |
+| 2.4 GHz（ch6，−52 dBm） | 4.16 Mbit/s | — |
+| 5 GHz（ch153，−54 dBm） | 收不到 | **9.00 Mbit/s** |
+| 5 GHz（ch149，−26 dBm，强信号） | 收不到 | **12.10 Mbit/s** |
 | 同一张卡的厂商 Windows 驱动（5 GHz 对照） | — | 13.37~18.21 Mbit/s |
 
 扫描侧同时恢复正常：一次扫描可见 **29 个真实 5 GHz BSS**（此前 1 个且自相矛盾）。
