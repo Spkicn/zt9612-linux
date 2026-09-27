@@ -1921,8 +1921,20 @@ static void zt_tx_work(struct work_struct *w)
 		if (!n)
 			return;
 		for (i = 0; i < n; i++) {
-			while ((skb = ieee80211_tx_dequeue(z->hw, pend[i])))
+			/*
+			 * 进程上下文必须用 _ni 版本：7.0 的
+			 * ieee80211_tx_dequeue() 带 in_softirq 断言
+			 * （踩坑记录见 docs/04 的 D14）。
+			 * RCU 只护"出队"这一步 —— 之后 USB 传输会睡眠。
+			 */
+			while (1) {
+				rcu_read_lock();
+				skb = ieee80211_tx_dequeue_ni(z->hw, pend[i]);
+				rcu_read_unlock();
+				if (!skb)
+					break;
 				zt_tx_one(z, z->hw, skb, false);
+			}
 		}
 	}
 }
