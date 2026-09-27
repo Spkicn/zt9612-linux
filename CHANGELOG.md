@@ -33,6 +33,15 @@
   `re/tx_frames.py`、`re/desc_cmp.py`；抓包 `re/captures/vendor_upload.pcap`（281 MB，本地）。
 
 ### Fixed
+- **进程上下文误用 `ieee80211_tx_dequeue()`（7.0 内核上首帧 TX 触发 `net/mac80211/tx.c:3832`
+  WARNING）**：该函数要求调用者**已关 softirq**（反汇编 WARN 点可见条件是
+  `testl $0xff00,%gs:__preempt_count`），而 `zt_tx_work` 是工作队列（进程上下文）。
+  现改用头文件指定的 `ieee80211_tx_dequeue_ni()`（内部 `local_bh_disable/enable`），
+  并按 API 要求用 `rcu_read_lock()` 只护住"出队"这一步 —— 随后的 USB 传输会睡眠，
+  不能长期持有 RCU（CCMP 由 mac80211 软件完成，skb 到手时已加密）。
+  实测 `7.0.0-34-generic`：首帧 TX 的 WARNING 由 1 条降为 **0**，且经历一次
+  固件断言 → USB 重枚举 → 重灌固件的循环后仍为 0；功能无回退。
+  （`7.0.0-31` 上无此断言，属"换内核才现形"的问题；定位过程见 `docs/04` D14。）
 - **三个"原始帧 TX 通道"的帧长上限仍是 1024 字节**（`ZT_IOC_TXRAW`、
   debugfs `tx_raw`、`/dev/zt9612` 的 `write()`）：0.3.2 只放宽了 mac80211 主 TX 路径
   （到 2012），这些调试通道漏了，导致**帧长相关的实验会直接 `EINVAL` 且看不出原因**
