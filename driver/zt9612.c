@@ -841,7 +841,7 @@ static long zt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -ENODEV;
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
-	if (req.len < 9 || req.len > MAX_FRAME)
+	if (req.len < 9 || req.len > ZT_TX_BUF_SIZE)
 		return -EINVAL;
 	buf = memdup_user((void __user *)(unsigned long)req.data, req.len);
 	if (IS_ERR(buf))
@@ -871,7 +871,7 @@ static ssize_t zt_dbg_tx_write(struct file *f, const char __user *ubuf,
 
 	if (!z || !READ_ONCE(z->alive))
 		return -ENODEV;
-	if (count < 9 || count > MAX_FRAME)
+	if (count < 9 || count > ZT_TX_BUF_SIZE)
 		return -EINVAL;
 	buf = memdup_user(ubuf, count);
 	if (IS_ERR(buf))
@@ -1443,7 +1443,7 @@ static ssize_t zt_write(struct file *file, const char __user *buf, size_t count,
 	u8 *tmp;
 	int ret;
 
-	if (count < 8 || count > MAX_FRAME)
+	if (count < 8 || count > ZT_TX_BUF_SIZE)
 		return -EINVAL;
 	if (!READ_ONCE(z->alive))
 		return -ENODEV;
