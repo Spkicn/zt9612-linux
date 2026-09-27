@@ -266,6 +266,22 @@ static int tx_desc_mask;
 module_param(tx_desc_mask, int, 0644);
 MODULE_PARM_DESC(tx_desc_mask, "experimental: bitmask of vendor DATA-frame descriptor fields to apply to protected unicast data frames (0 = off; bit1 = +0x08, the one that matters)");
 
+/*
+ * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：**固件站点会话**。
+ *
+ * 背景（re/REPORT_TX_SESSION.md）：厂商 Windows 驱动在关联完成后发
+ * MM_STA_ADD_REQ(0x0A, 48 字节) 让固件分配 sta_idx，之后数据帧描述符 +0x09 带上它，
+ * 同一链路上传 95.3 Mbit/s；本驱动从不发这条消息（所有帧 staid=0xff）⇒ 上传 3.7 Mbit/s。
+ *
+ * 现状：**骨架 + 尚未回填的 48 字节模板**（逆向见 re/REPORT_STA_ADD_LAYOUT.md）。
+ * 实测两次盲发（全 0 / 合理 RC 值）都让固件断言在 rc.c 并 USB 掉线，
+ * 因此模板真值必须来自厂商侧"启动→关联→传输"的 USB 抓包（P0-A）或更深的静态逆向，
+ * **不要靠猜**。打开本开关会真的发这条消息 ⇒ 默认关闭；打开前先确认模板已回填。
+ */
+static int sta_add_en;
+module_param(sta_add_en, int, 0644);
+MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and carry the assigned sta_idx in data-frame descriptors (0 = off; the 48-byte payload template is still a placeholder - see re/REPORT_STA_ADD_LAYOUT.md)");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -320,6 +336,13 @@ struct zt_dev {
 	u8			*txd;
 	u16			tx_seq;
 	unsigned long		tx_frames;
+	/* 实验：固件站点会话（见 sta_add_en / re/REPORT_STA_ADD_LAYOUT.md） */
+	u8			sta_idx;	/* MM_STA_ADD_CFM 分配的站点索引 */
+	bool			sta_valid;
+	u16			sta_aid;
+	u8			sta_bssid[6];
+	unsigned long		sta_add_ok;
+	unsigned long		sta_add_fail;
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -615,6 +638,120 @@ static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	}
 	dev_warn(&z->intf->dev, "scan: timeout waiting for cfm %#06x\n", want_cfm);
 	return -ETIMEDOUT;
+}
+
+/*
+ * 与 zt_cmd_fifo() 相同（运行时 RX URB 在跑，只能从 kfifo 取帧），区别是**把 CFM 的
+ * 载荷拷回 resp** —— STA_ADD 的 3 字节结果（sta_idx/pm_state/status）就在这里。
+ * 帧布局：z->rx = WLAN 头(8) + lmac_msg{id@8, dest@10, src@12, param_len@14} + 载荷@16。
+ */
+static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
+			    int want_cfm, int timeout_ms, u8 *resp, u16 *resp_len)
+{
+	u8 *msg = z->pl;
+	unsigned long end;
+	int ret;
+
+	put_unaligned_le16(id, msg + 0);
+	put_unaligned_le16(id >> 10, msg + 2);	/* dest = task 字段，见 zt_cmd 注释 */
+	put_unaligned_le16(100, msg + 4);
+	put_unaligned_le16(plen, msg + 6);
+	if (plen && params)
+		memcpy(msg + 8, params, plen);
+
+	ret = zt_send(z, T_IPC, msg, 8 + plen);
+	if (ret)
+		return ret;
+	if (want_cfm < 0)
+		return 0;
+
+	end = jiffies + msecs_to_jiffies(timeout_ms);
+	while (time_before(jiffies, end)) {
+		u16 type = 0;
+		int len = 0;
+
+		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
+			zt_heartbeat(z);
+
+		if (zt_kfifo_recv(z, &type, &len, 50))
+			continue;
+		if (type != T_IPC || len < 8)
+			continue;
+		if (get_unaligned_le16(z->rx + 8) != (u16)want_cfm)
+			continue;
+		if (resp && resp_len) {
+			u16 rl = (len >= 16) ? get_unaligned_le16(z->rx + 14) : 0;
+
+			rl = min_t(u16, rl, (u16)(len - 16));
+			if (rl)
+				memcpy(resp, z->rx + 16, rl);
+			*resp_len = rl;
+		}
+		return 0;
+	}
+	dev_warn(&z->intf->dev, "sta: timeout waiting for cfm %#06x\n", want_cfm);
+	return -ETIMEDOUT;
+}
+
+/*
+ * MM_STA_ADD_REQ(0x0A) 的 48 字节载荷模板 —— **占位，尚未回填**。
+ * 逆向结论（re/REPORT_STA_ADD_LAYOUT.md §2/§3）：+0x14~+0x2F 是"电台速率配置(RC)块"的
+ * 原样拷贝，+0x00~+0x13 是按站点能力算出的类型/标志/索引；载荷里**没有** MAC/AID。
+ * 真值必须来自 P0-A 抓包（或把那个 0x108 字节源结构逆向到底）——**不要靠猜**：
+ * 实测全 0 与"合理 RC 值"两种猜测都让固件断言在 rc.c 并掉线。
+ */
+#define ZT_STA_ADD_LEN	48
+static const u8 zt_sta_add_tmpl[ZT_STA_ADD_LEN] = { 0 };
+
+/*
+ * 关联后发 MM_STA_ADD_REQ，并记下 CFM 返回的 sta_idx 供描述符使用。
+ * 约定：① 调用者处于进程上下文（bss_info_changed 是），本函数会睡眠等 CFM；
+ *       ② 心跳在本函数内部维持（与 zt_cmd_fifo 同）；
+ *       ③ 与并发扫描的 zt_cmd_fifo 争抢 kfifo 的风险存在（实验开关，默认关）。
+ */
+static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
+{
+	u8 resp[8];
+	u16 rlen = 0;
+
+	z->sta_aid = aid;
+	memcpy(z->sta_bssid, bssid, sizeof(z->sta_bssid));
+
+	if (zt_cmd_fifo_resp(z, 0x000a, zt_sta_add_tmpl, ZT_STA_ADD_LEN,
+			     0x000b, 1000, resp, &rlen)) {
+		z->sta_add_fail++;
+		dev_warn(&z->intf->dev,
+			 "STA_ADD: no CFM (template not confirmed; see re/REPORT_STA_ADD_LAYOUT.md)\n");
+		return;
+	}
+	/*
+	 * 厂商侧解包顺序（re/REPORT_TX_SESSION.md §1）：out[0]=cfm[2]=status、
+	 * out[1]=cfm[0]=sta_idx、out[2]=cfm[1]=pm_state —— 仍待抓包复核。
+	 */
+	if (rlen >= 3 && resp[2] == 0) {
+		z->sta_idx = resp[0];
+		z->sta_valid = true;
+		z->sta_add_ok++;
+		dev_info(&z->intf->dev,
+			 "STA_ADD_CFM: status=0 sta_idx=%u pm_state=%u (aid=%u)\n",
+			 z->sta_idx, resp[1], aid);
+		return;
+	}
+	z->sta_add_fail++;
+	dev_warn(&z->intf->dev, "STA_ADD_CFM: unexpected result (len=%u status=%u)\n",
+		 rlen, rlen >= 3 ? resp[2] : 0xff);
+}
+
+/* 断开时只清本地状态：MM_STA_DEL_REQ(0x0C) 的参数布局尚未证实，不猜着发。 */
+static void zt_sta_del(struct zt_dev *z)
+{
+	if (!z->sta_valid)
+		return;
+	dev_info(&z->intf->dev,
+		 "STA_DEL: clear local sta_idx=%u (no IPC sent; layout unconfirmed)\n",
+		 z->sta_idx);
+	z->sta_valid = false;
+	z->sta_idx = 0;
 }
 
 static int zt_run_init(struct zt_dev *z)
@@ -1027,7 +1164,16 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		put_unaligned_le16(flen, d + 4);
 		/* 先按厂商管理帧模板（我们一直以来的行为） */
 		put_unaligned_le16(0x0700, d + 6);
-		put_unaligned_le16(0xff00, d + 8);
+		/*
+		 * +0x08 = vif_idx、+0x09 = staid（re/REPORT_TX_SESSION.md §4：
+		 * 厂商 TX 路径把固件分配的 sta_idx 写在这里，无站点时是 0xff）。
+		 * 只有**有会话的加密单播数据帧**填 sta_idx，其余保持"无站点"，
+		 * 避免把第四条实验通道（广播/DHCP、EAPOL）带进未验证的路径。
+		 */
+		if (z->sta_valid && is_data && protected && !mcast)
+			put_unaligned_le16((u16)z->sta_idx, d + 8);
+		else
+			put_unaligned_le16(0xff00, d + 8);
 		put_unaligned_le16(0x0005, d + 10);
 		put_unaligned_le16(z->tx_seq++, d + 14);
 		put_unaligned_le16(0x003f, d + 26);
@@ -2014,6 +2160,17 @@ static void zt_mac_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vi
 
 	dev_info(&z->intf->dev, "bss_info: changed=%#llx assoc=%d aid=%u bssid=%pM\n",
 		 changed, vif->cfg.assoc, (unsigned int)vif->cfg.aid, info->bssid);
+
+	/*
+	 * 实验（sta_add_en，默认 0）：关联完成后把站点注册给固件，
+	 * 让数据帧描述符能带上固件分配的 sta_idx（见 re/REPORT_TX_SESSION.md）。
+	 */
+	if (!sta_add_en || !(changed & BSS_CHANGED_ASSOC))
+		return;
+	if (vif->cfg.assoc)
+		zt_sta_add(z, vif->cfg.aid, info->bssid);
+	else
+		zt_sta_del(z);
 }
 /* ------------------------------------------------------------------ M3.2 扫描 */
 
