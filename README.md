@@ -90,7 +90,8 @@ DHCP 与外网访问都已实机验证。
 
 | 项目 | 值 |
 |---|---|
-| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64） |
+| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）：功能全通、0 Oops、0 WARNING |
+| 功能已验证 | `7.0.0-34-generic`（2026-09-27 复测）：固件装载、IPC 初始化、双频扫描、5 GHz 关联、DHCP、外网 `ping`、`ping -M do 1472` 全部通过；但**首帧 TX 会触发一次** `WARNING: net/mac80211/tx.c:3832`（`ieee80211_tx_dequeue` ← `zt_tx_work`，只出现一次、不影响功能，待修） |
 | 已验证可编译 | `6.17.0-1022-azure`（CI，ubuntu-24.04 runner，无告警）；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
 | 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h` |
 | 未验证区间 | 6.12–6.16 能否正常工作未验证；mac80211 ops 签名只在 6.17 及以上确认匹配 |
@@ -143,8 +144,15 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 ```
 
 默认行为是安装模块到 `/lib/modules/$(uname -r)/extra/`，并写入
-`/etc/modprobe.d/zt9612-blacklist.conf`。该文件只阻止自动加载，手动 `modprobe`
-仍然可用。
+`/etc/modprobe.d/zt9612-blacklist.conf`。**该文件同时挡住自动加载和 `modprobe zt9612`**
+（里面有一条 `install zt9612 /bin/true`），所以要手动加载请用：
+
+```bash
+sudo modprobe --ignore-install zt9612
+```
+
+> 实测（2026-09-27，内核 7.0.0-34）：直接 `sudo modprobe zt9612` 会静默返回 0 且什么都不做 ——
+> 这是 `install` 守卫在起作用，不是加载失败。
 
 也可以直接用 DKMS：
 
@@ -271,6 +279,10 @@ sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 期望 40 个以上（双频）
   详见 CHANGELOG 与 `re/EXPERIMENT_TX_RATE.md` §5~7。
 - **做 TX 实验必须带功能判据**：`usb_bulk_msg` 完成得快**不等于**帧发出去了
   （本项目自己踩过这个坑）。请用 `tools/arp_oracle.py`（发 ARP 请求看网关回不回）作为必跑项。
+  ⚠️ **但它只在开放网络上有效**：该工具用 `ZT_IOC_TXRAW` 发**未加密**数据帧，
+  在 WPA/WPA2 链路上会被 AP 直接丢弃（2026-09-27 实测：同一链路上普通 `ping` 的
+  ARP 正常、邻居表能学到网关 MAC，而 oracle 恒判"没发出"）。加密链路上请改用
+  开放测试 AP，或用 probe request → probe response 这类不需加密的判据。
 - **运行期改 MTU 会让接口短暂失去关联**（丢 1–2 个 `ping`，NetworkManager 会重配）；
   请勿在运行期反复改。
 - **芯片挂死后需要物理拔插**：出现 `-110`、`can't set config #1` 表示芯片已挂死，
