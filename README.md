@@ -8,36 +8,42 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 
 ## 项目状态
 
-当前版本 0.3.2：固件装载、IPC 初始化、mac80211 接口、双频扫描、关联、WPA2-PSK 加密与
-端到端联网（DHCP + `ping` 外网）均已实机验证。v0.3.1 修掉了"5 GHz 一直不可用"的一行 bug
-（5 GHz 现可关联并实测 **9~12 Mbit/s**）；v0.3.2 修掉了 TX 侧 988 字节的帧长上限，
-**上传此前基本不可用**（现在近端 3.72 Mbit/s、`ping -M do` 1472 正常）。
+当前版本 **0.3.2**。得到的是一个 managed 模式的无线接口：双频扫描、WPA2-PSK 关联与加密、
+DHCP 与外网访问都已实机验证。
 
 | 里程碑 | 状态 |
 |---|---|
 | 硬件识别与协议分析 | 完成 |
 | M1 内核态固件装载 | 完成，已实机验证 |
-| M2 IPC 初始化与 `/dev/zt9612` | 完成，已实机验证（IPC 往返成功） |
-| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（接口按真实 MAC 命名为 `wlx` + MAC 十六进制） |
-| M3.2 扫描 | 完成，已实机验证（`iw scan` 实测 40+ 个 BSS） |
-| M3.3 关联 | 完成，已实机验证（`iw connect` 关联开放 AP，`assoc=1`、接口 `LOWER_UP`） |
-| M3.4 数据面 | 完成，已实机验证（关联后广播 ARP 出网并收到网关应答、单播回包正常回收）；IP 地址取决于 AP 是否提供 DHCP |
-| M3.5 5GHz | **完成（2026-09-27 修正后才是真的）**：`iw phy info` 列出 2.4G 14 信道 + 5G 25 信道。注意：5 GHz 的**扫描/关联在 2026-09-27 之前一直不可用**（扫描 band 标志 bug，见「已知问题」），此前的"59 个 BSS 中 7 个在 5GHz"是频点错误标注的产物；修复后一次扫描可见 **29 个真实 5GHz BSS**，并首次完成 5 GHz 关联与数据面（实测 9~12 Mbit/s） |
-| WPA2 关联与加密 | 完成，已实机验证（WPA2-PSK 热点：关联 226 ms、四次握手 344 ms、`PTK=CCMP GTK=CCMP`、DHCP 拿到租约、`ping` 外网 3/3） |
-| v0.3 吞吐 | **2.4GHz 口径内已定案**：修掉 RX 缓冲缺陷后实测 **4.2~4.7 Mbit/s**；速率由固件内 ARRM 自主决定。**注意口径**：该结论只在 2.4 GHz 成立——5 GHz 当时根本不可用；修好 5 GHz 后，同一张卡实测 **9~12 Mbit/s（2~3 倍）**，见「已知问题」 |
+| M2 IPC 初始化与 `/dev/zt9612` | 完成，已实机验证 |
+| M3.1 mac80211 注册（网络接口） | 完成，已实机验证（接口名按 MAC 生成） |
+| M3.2 扫描 | 完成，已实机验证（双频，一轮 40 个以上 BSS，含真实信号强度） |
+| M3.3 关联 | 完成，已实机验证（`assoc=1`、接口 `LOWER_UP`） |
+| M3.4 数据面 | 完成，已实机验证（DHCP 租约、`ping` 网关与公网） |
+| M3.5 5 GHz | 完成（0.3.1 起才真正可用，见「版本要点」） |
+| WPA2-PSK 加密 | 完成，已实机验证（四次握手 `PTK=CCMP GTK=CCMP`，CCMP 由 mac80211 软件加解密） |
+| 吞吐 | 见下表；速率由固件内部决定，主机侧无法影响 |
 
-加载驱动后可以得到一个 managed 模式的无线接口（名字按 MAC 生成，例如 `wlxb4011aXXXXXX`），
-`iw dev`、`iw scan`、`iw connect`、`ethtool -i`、`/dev/zt9612` 都可用。扫描覆盖 2.4 GHz 与
-5 GHz，能列出周围 AP（含 SSID、信道、加密、HT/VHT 能力与**真实信号强度**）。关联、加密与
-数据面均已走通：WPA2-PSK 热点下四次握手到 `COMPLETED`（`PTK=CCMP GTK=CCMP`，CCMP 由
-mac80211 软件加解密），DHCP 能拿到租约，`ping` 网关与公网均通。WPA2-Enterprise（802.1X）
-的代码路径**未验证**——当前实验环境里没有任何 802.1X AP。
+实测吞吐（同一张卡，HTTPS，10 s × 3 取中位数）：
 
-> 扫描支持被动与主动两种：模块参数 `scan_probe` 控制是否由驱动自己发 probe request
-> （`0`=被动，`1`=自建 probe，`2`=逐字节重放厂商 probe）；mac80211 触发的扫描走同一条 TX 路径。
+| 方向 | 2.4 GHz | 5 GHz |
+|---|---|---|
+| 下载 | 约 4 Mbit/s | **9–13 Mbit/s** |
+| 上传 | — | 3.7–4.7 Mbit/s |
 
-这块网卡在 Windows 下工作正常。本项目的目标是在 Linux 下把它跑起来。厂商没有公开
-发布 Linux 驱动，但存在内部版本，向厂商索取是更省力的路线。
+> `iw link` 里的速率数字（1.0 Mbit/s 之类）**不是**真实发射速率，只是主机侧记账，
+> 不要用它衡量性能。
+
+### 版本要点
+
+- **0.3.0**：修掉 RX 缓冲过小导致"HTTP 200 之后收不到数据"的缺陷
+- **0.3.1**：修掉扫描时 5 GHz 信道的 band 标志写死成 0 —— **5 GHz 在此之前一直不可用**
+  （`iw scan` 里那些"5G BSS"其实是频点被错误标注的 2.4 GHz 帧）。修好后首次完成
+  5 GHz 关联，吞吐约为 2.4 GHz 的 2–3 倍
+- **0.3.2**：修掉 TX 侧 988 字节的帧长上限 —— **上传在此之前基本不可用**
+  （满尺寸 TCP 段全部被驱动静默丢弃）。修复后 `ping -M do` 1472 正常、上传可用
+
+改动细节与实测数据见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 硬件
 
@@ -48,7 +54,7 @@ mac80211 软件加解密），DHCP 能拿到租约，`ping` 网关与公网均�
 | 芯片平台 | ACEV100（自研 Wi-Fi 6 2T2R SoC，非 Realtek / MediaTek 方案） |
 | 网卡模式 | `350b:9612`，bcdDevice `0x0200`，iProduct `802.11ax 2x2 WLAN Adapter` |
 | 光盘模式 | `350b:f179`（USB CD-ROM，卷标 "Wi-Fi6 Adapter"） |
-| 接口 | 1 个，class `FF/FF/FF`，5 个 512 字节批量端点（EP4-IN / EP5~8-OUT） |
+| 接口 | 1 个，class `FF/FF/FF`，5 个 512 字节批量端点（EP4-IN / EP5-8-OUT） |
 | 固件 | `zt9612_fw.bin`（219,076 字节）+ `zt9612_settings.bin`（212 字节） |
 
 支持范围与 ID 判定方法见 [supported-device-IDs](supported-device-IDs)。同厂其它型号
@@ -59,38 +65,32 @@ mac80211 软件加解密），DHCP 能拿到租约，`ping` 网关与公网均�
 已实现：
 
 - 把设备从驱动光盘模式切到网卡模式（标准 SCSI 弹出，不是厂商私有命令）
-- 完整复现固件下载协议：hello 握手、488 字节分块写入、末块整段 XOR16 校验、
-  配置块、RUN（实机验证：449 块，校验值 `0x2d14`）
+- 完整复现固件下载协议：hello 握手、488 字节分块写入、末块整段 XOR16 校验、配置块、RUN
 - 同步 IPC 初始化：`MM_RESET`、`MM_VERSION`、厂商私有段、`MM_START`（约 6.5 秒）、
   `MM_SET_IDLE`、`MM_ADD_IF`、`MM_SET_SLOTTIME`、`MM_SET_CHANNEL`
 - 5 秒心跳维持固件存活；`/dev/zt9612` 上收发原始 `WLAN` 帧
-- 注册 mac80211：出现 managed 模式的无线接口，**2.4 GHz 14 个信道（含 2484）+ 5 GHz 25 个信道**，
-  `iw dev`、`iw phy`、`ethtool -i` 均可正常读取
-- **扫描**：实现 `hw_scan` 与 RX 数据路径，mac80211 会把一次 `iw scan` 按频段拆成两段
-  （2.4 GHz 14 信道 + 5 GHz 25 信道）；实机实测一轮 59 个 BSS，其中 7 个在 5 GHz
-- **关联与数据面**：`iw connect` 关联开放 AP 成功，TX/RX 双向正常，`iw link` 计数增长
-- **WPA2-PSK 加密**：四次握手到 `wpa_state=COMPLETED`（`PTK=CCMP GTK=CCMP`），DHCP 拿到
-  租约并 `ping` 通网关与公网；驱动不实现 `set_key`，CCMP 由 mac80211 走软件加解密
+- mac80211：managed 接口、**2.4 GHz 14 个信道（含 2484）+ 5 GHz 25 个信道**、
+  `hw_scan`（双频）、关联、WPA2-PSK、数据面（TCP/UDP/IPv6 均正常）
+- 扫描结果带**真实信号强度**（RX 描述符里的 int8 dBm，实测 −94 至 −23 dBm）
 
 尚未实现：
 
-- WPA2-Enterprise（802.1X）：代码路径未验证（实验环境无 802.1X AP；`wpa_supplicant`
-  的 EAP 配置与 PSK 路径共用同一条数据面）
-- 主动扫描默认关闭（`scan_probe=0` 为被动）：`scan_probe=2` 的厂商 probe 回放已实测能收到
-  probe response，且主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道
-- 吞吐：**速率由固件内部的 ARRM 模块自主决定**，主机侧无法影响（描述符无速率字段、
-  厂商驱动从不发速率消息、`iw set bitrates` 只改主机侧掩码）。实测吞吐 **4.2~4.7 Mbit/s**，
-  而 `iw link` 报的 1.0 Mbit/s **不是真实发射速率**
+- WPA2-Enterprise（802.1X）：代码路径未验证（当前实验环境没有 802.1X AP）
+- 主动扫描默认关闭（`scan_probe=0` 为被动）；`scan_probe=2` 的厂商 probe 回放已验证可用
 - AP 模式、蓝牙、40/80 MHz 带宽
+- 提高实测吞吐：TX 速率由固件内部决定，主机侧改不了（见「实现要点」）
+
+这块网卡在 Windows 下工作正常。厂商没有公开发布 Linux 驱动，但存在内部版本，
+**向厂商索取是更省力的路线**。
 
 ## 兼容性
 
 | 项目 | 值 |
 |---|---|
-| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）：M1–M3.5 + WPA2-PSK 全部通过（固件装载、IPC、mac80211、双频扫描、关联、DHCP 与公网 `ping`） |
+| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64） |
 | 已验证可编译 | `6.17.0-1022-azure`（CI，ubuntu-24.04 runner，无告警）；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
-| 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h`，CI 上 6.8 内核即因缺该头文件失败 |
-| 未验证区间 | 6.12~6.16 能否正常工作未验证；mac80211 ops 签名只在 6.17 及以上确认匹配 |
+| 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h` |
+| 未验证区间 | 6.12–6.16 能否正常工作未验证；mac80211 ops 签名只在 6.17 及以上确认匹配 |
 | 构建依赖 | `build-essential`、`linux-headers-$(uname -r)` |
 
 驱动使用了较新的 mac80211 ops 签名，例如
@@ -102,7 +102,7 @@ mac80211 软件加解密），DHCP 能拿到租约，`ping` 网关与公网均�
 
 ### 1. 准备固件
 
-固件版权属于厂商，本仓库不再分发。请从自己网卡的配套驱动盘中取得
+固件版权属于厂商，本仓库不分发。请从自己网卡的配套驱动盘中取得
 （Windows 下运行 `auto_load.exe` 后，在安装目录中找 `zt9612_fw.bin` 与
 `zt9612_settings.bin`），或向厂商索取。取得后执行：
 
@@ -166,9 +166,7 @@ sudo modprobe zt9612
 ### 4. Secure Boot 签名
 
 Secure Boot 打开时内核处于 `lockdown=integrity`，会拒绝未签名模块。有两种办法：
-
-- 在 BIOS 中关闭 Secure Boot
-- 生成 MOK 密钥并注册（一次性）
+在 BIOS 中关闭 Secure Boot，或生成 MOK 密钥并注册（一次性）：
 
 ```bash
 cd driver
@@ -183,11 +181,9 @@ make sign
 `install-driver.sh` 检测到 Secure Boot 且没有密钥时，会引导完成上述步骤。
 `MOK.*` 已被 `.gitignore` 排除，不要提交。
 
-**DKMS + Secure Boot 实测注意（2026-09-24，dkms 3.0.11 / Ubuntu 24.04 / 模块压缩为 `.ko.zst`）**：
-`dkms add/build/install` 本身正常（`dkms status` 显示 `zt9612/0.2.0, <kernel>, x86_64: installed`），
-但在 `/etc/dkms/framework.conf` 里指定已注册的 `mok_signing_key` / `mok_certificate` 之后，
-DKMS 虽然打印 `Signing module …`，**安装到 `/lib/modules/$(uname -r)/updates/dkms/zt9612.ko.zst`
-的产物仍然没有签名**，`modprobe` 会以 `Key was rejected by service` 失败。就地补签即可：
+**DKMS 已知坑**：dkms 3.0.11 即使配好了 `mok_signing_key` / `mok_certificate`，
+也**不会给压缩后的 `.ko.zst` 签名**，`modprobe` 会以 `Key was rejected by service` 失败。
+就地补签即可：
 
 ```bash
 KVER=$(uname -r); KO=/lib/modules/$KVER/updates/dkms/zt9612.ko.zst
@@ -198,8 +194,8 @@ sudo depmod -a && sudo modprobe zt9612
 modinfo -k $KVER zt9612 | grep signer      # 应显示已注册的签名者
 ```
 
-补签后 `dkms status` 会提示 `WARNING! Diff between built and installed module!`（安装产物被重签过），
-属预期现象；下一次 `dkms install` 会再次覆盖成未签名版本，需要重复上面这一步。
+补签后 `dkms status` 会提示 `WARNING! Diff between built and installed module!`，属预期现象；
+下一次 `dkms install` 会再次覆盖成未签名版本，需要重复这一步。
 
 ## 验收
 
@@ -223,25 +219,19 @@ zt9612 1-9:1.0: boot notify: type=0x0100 len=16
 zt9612 1-9:1.0: firmware loaded
 zt9612 1-9:1.0: === IPC init sequence ===
 zt9612 1-9:1.0: fw 0x0101: status=0 mac=XX:XX:XX:XX:XX:XX
-zt9612 1-9:1.0: MAC = XX:XX:XX:XX:XX:XX
-zt9612 1-9:1.0: MM_START_REQ (rf init, waiting ~6.5s)
+zt9612 1-9:1.0: MM_START_REQ (rf init, waiting 约 6.5s)
 zt9612 1-9:1.0: MM_START_CFM received (firmware up)
 zt9612 1-9:1.0: MM_ADD_IF_CFM: status=0 inst_nbr=0
 zt9612 1-9:1.0: M1+M2 done: firmware running, /dev/zt9612 ready
 zt9612 1-9:1.0: mac80211 registered (M3.1) - wlan0 should appear
 zt9612 1-9:1.0 wlxXXXXXXXXXXXX: renamed from wlan0
-zt9612 1-9:1.0: mac80211: start
-zt9612 1-9:1.0: mac80211: add_interface type=2 addr=XX:XX:XX:XX:XX:XX
 ```
 
 > 上面的 MAC 与接口名已用 `XX` 隐去（驱动实际打印的是内核 `%pM` 格式的地址）。
 > 接口名是 systemd 按 MAC 生成的可预测名（`wlx` + 12 位十六进制），
-> 所以**不要**假设它叫 `wlan0`。早期版本读 MAC 时错位（少读一个 status 字节），
-> 打印出来的是整体左移一字节、末字节被 0 顶掉的值。若你看到的是那样的值，
-> 说明模块来自 v0.2.0 之前的代码：此时 TX 帧会被固件静默丢弃、单播 RX 也会被过滤掉
-> （见 CHANGELOG 的 Fixed 一节）。
+> 所以**不要**假设它叫 `wlan0`。
 
-再做一次 IPC 往返自测（M2 验收）：
+再做 IPC 往返自测：
 
 ```bash
 sudo python3 scripts/zt9612-devtest.py
@@ -249,204 +239,44 @@ sudo python3 scripts/zt9612-devtest.py
 sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳定性
 ```
 
-M3.1 已在 `7.0.0-31-generic` 上实机验证：`iw dev` 能看到 managed 接口，`iw phy phy0 info`
-列出 2.4 GHz **14** 个信道（含 2484）+ 5 GHz **25** 个信道（5180–5825），`ethtool -i`
-返回 `driver: zt9612`。
-注意接口名不一定叫 `wlan0`：systemd 会按 MAC 生成可预测名（形如 `wlxb4011aXXXXXX`），
-用 `ls /sys/class/net | grep -E '^(wlx|wlan)'` 或 `iw dev` 查实际名字。
+接口与无线验收：
+
+```bash
+IFACE=$(ls /sys/class/net | grep -E '^(wlx|wlan)' | head -1)
+iw dev ; iw phy "$(iw dev "$IFACE" info | awk '/wiphy/{print "phy"$2}')" info | head -40
+ethtool -i "$IFACE" | head -2                 # 期望 driver: zt9612
+sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 期望 40 个以上（双频）
+```
 
 ## 已知问题
 
-### 反复 rmmod / insmod 会泄漏实例（已实测，可重载）
+- **反复 `rmmod` / `insmod` 会泄漏实例**：卸载时设备不应答在途 bulk-IN，驱动按设计
+  "宁可泄漏也不 UAF"。实测 12 次卸载里 11 次如此。**换模块优先重启机器。**
+- **默认不自动加载**：`install-driver.sh` 默认写 `blacklist zt9612`。原因是历史上
+  "开机自动加载"曾导致机器失联（根因是漏设 wiphy 父设备，已在 v0.2.0 修复），
+  但**"插卡 + 开机自动加载"这条完整路径还没有重新复验过**。确认可用后加
+  `--enable-autoload` 即可。
+- **上传吞吐低于下载**（3.7–4.7 vs 7–13 Mbit/s）：TX 是一帧一条同步 `usb_bulk_msg`，
+  没有做 URB 流水线。尚未定位到确切瓶颈，见 CHANGELOG 的 Planned。
+- **运行期改 MTU 会让接口短暂失去关联**（丢 1–2 个 `ping`，NetworkManager 会重配）；
+  请勿在运行期反复改。
+- **芯片挂死后需要物理拔插**：出现 `-110`、`can't set config #1` 表示芯片已挂死，
+  软件复位无效。拔下等 10 秒再插上。
+- **设备可能自行回到光盘模式**：固件看门狗复位（主机超过 5 秒没有发心跳）。内核驱动用
+  `delayed_work` 每 5 秒发一次；自写用户态脚本需要自己维持心跳。
+- **WPA2-Enterprise（802.1X）未验证**：实验环境没有 802.1X AP。
+- 驱动源码中部分中文注释在早期编辑中损坏成乱码，不影响编译，待清理。
+- 0.x 阶段的接口（模块参数、`/dev` 协议）可能变化。
 
-2026-09-24 的稳定性回归（v0.2.0，10 轮 rmmod/insmod）实测：**12 次卸载里 11 次**出现
-`rx urb 2s 未回收（设备可能已挂死），泄漏该实例以避免 UAF` +
-`disconnected (teardown incomplete, instance leaked)`（唯一一次干净卸载紧跟在另一次干净
-卸载之后，设备还没进入"不再应答在途 URB"的状态）。
-
-- 原因不是死锁：卸载时设备不再回应在途的 bulk-IN，`usb_poison_urb()` 之后 2 秒内收不到
-  completion，驱动按 D9 设计**故意泄漏该实例**（宁可泄漏也不 use-after-free）。
-- 之后 USB 会自行重新枚举（`350b:f179` 光驱 → `350b:9612` 网卡，约 8–11 秒），
-  所以重新加载必须等 ~20 秒；本轮 10/10 轮重新加载成功，接口与扫描全部恢复。
-- 同一轮回归的其他项目全部干净：20 次接口 up/down + 每次 `iw scan`（rc=0，51–58 个 BSS）、
-  10 分钟 NetworkManager 长跑（含自动扫描）、3 轮热点断连重连（3/3 重新 `COMPLETED` 并
-  拿到 DHCP 租约、`ping` 通网关）——全程 **0 Oops / 0 BUG / 0 WARNING**，
-  `rx.c:5475` 始终为 0，也没有再出现「能 ping 不能 SSH」的失联。
-- 代价：每次卸载泄漏一个实例（KB 级）；阶段 1 的 Slab 从 424.3 MB 涨到 425.5 MB
-  （含扫描等噪声，未做严格归因）。
-
-结论：**可以重载（等 20 秒），但每次卸载都有泄漏**。彻底消除需要在卸载前让固件停下来
-或更可靠地回收 URB，留作后续任务；在此之前「换模块优先重启」仍是更保险的做法，
-`uninstall-driver.sh` 也继续默认不执行 `rmmod`。
-
-### 开机自动加载曾导致失联，根因已定位并修复
-
-这一条此前是未定位问题：模块经 USB modalias 在开机时自动加载后，机器会变成「能 ping、
-能连 22 端口，但 SSH 读不到 banner」，只能硬重启。现在原因已经查清，是驱动的缺陷：
-
-驱动注册 wiphy 时没有设置父设备（缺少 `SET_IEEE80211_DEV()`），于是 `wiphy_dev(wiphy)`
-为 `NULL`。无线接口出现后 NetworkManager 立即通过 `SIOCETHTOOL` 查询驱动信息，
-`cfg80211_get_drvinfo()` 解引用空指针，在关闭中断的状态下崩溃，用户态随之卡死。
-实测崩溃现场：
-
-```
-BUG: kernel NULL pointer dereference, address: 0000000000000068
-CPU: 16 PID: 1127 Comm: NetworkManager  Tainted: G  O  7.0.0-31-generic
-RIP: 0010:cfg80211_get_drvinfo+0x27/0x1c0 [cfg80211]
-Call Trace: ethtool_get_drvinfo → __dev_ethtool → dev_ioctl
-note: NetworkManager[1127] exited with irqs disabled
-```
-
-修复是在 `ieee80211_register_hw()` 之前加上 `SET_IEEE80211_DEV(hw, &z->intf->dev)`。
-修复后已在实机复测：`ethtool -i` 正常返回，NetworkManager、sshd 全程存活，`dmesg`
-无 oops。
-
-`install-driver.sh` 仍然默认写入 `blacklist zt9612`，因为「干净开机自动加载」这条路径
-还没有重新跑过一次完整验证。确认没问题后可以用 `--enable-autoload`。
-
-### 大流量停滞的真正原因：接收缓冲过小（已修）
-
-**症状**：关联正常、`ping` 正常、HTTP 响应头也能回来（`HTTP/1.1 200 OK`），
-但下载随即停滞——很有迷惑性。**修好后实测吞吐 4.2~4.7 Mbit/s**（默认 MTU 1500）。
-
-**根因**：接收用的 URB 缓冲原来固定为 1024 字节（`MAX_FRAME`），
-装不下满尺寸的 802.11 数据帧（要算上 MAC 头 24 + LLC/SNAP 8 + CCMP 8），
-超出的帧被**整帧丢弃**。判据很干净：ping payload ≥900 字节时，
-接口层 `rx_bytes` 增量为 **0**，而 mac80211 的 station 计数仍在增长
-（那是重传的广播流量）⇒ 帧到了芯片却没到协议栈。
-
-**修复**：接收路径改用独立常量并把缓冲提到 2048 字节
-（`ZT_RX_BUF_SIZE` / `ZT_RX_MAX_FRAME`），发送与调试路径仍用 1024。
-修复后实测（默认 MTU 1500）HTTPS 下载中位数约 **4.2 Mbit/s**，
-对比修复前的"收不到数据"。
-
-> 记录一个走错的方向：一开始把 1 KB 现象归因成"设备帧长上限"，
-> 还把 `ieee80211_hw.max_mtu` 设成了 900。实测证明既没必要也有害——
-> MTU=900 时吞吐约 3.2 Mbit/s，**低于** 1500 下的约 4.2 Mbit/s；
-> 而且 MTU 上限低于 1280 会让 **IPv6 完全不可用**（IPv6 与 mac80211 都要求 ≥1280）。
-> 上限已改回 1500。
-
-**仍然存在的小问题**：禁止分片的 `ping` 在 payload >905 字节（IP 包 913）时失败，
-而有线对照 1472 字节正常；TCP 数据面不受影响。详见下一节。
-
-**关于改 MTU**：运行期 `ip link set mtu` 会让接口短暂失去关联（丢 1~2 个 `ping`，
-NetworkManager 会重配），另有一次观察到接口消失约 2 分钟后由驱动重新装载并自动重连。
-两次 `dmesg` 都没有 Oops，机制尚未定位，因此不建议在运行期反复改。
-（曾把上限设成 900 想规避大帧，实测**反而更慢**（约 3.2 Mbit/s）且让 IPv6 不可用——
-IPv6 要求 MTU ≥1280，已改回 1500。）
-
-### 5 GHz 曾经完全不可用：扫描的 band 标志写死成 0（已修，2026-09-27）
-
-**症状**：`iw phy info` 明明列出 25 个 5 GHz 信道，`iw scan` 里也会冒出几个"5G BSS"，
-但它们经不起检查——例如某条 `freq: 5745` 的条目却带着 `DS Parameter set: channel 11`、
-`ERP`、`Country: Channels [1-13]`（全是 2.4 GHz 专有元素）；同一个 BSSID 会同时以
-2462 MHz 和 5745 MHz 出现。真相是 5 GHz **从来没有收到过任何东西**：
-驱动日志里 5 GHz 扫描恒为 `beacon=0`，而 2.4 GHz 扫描是 `beacon=32~56`。
-
-**根因（一行）**：扫描循环里逐信道发 `MM_SET_CHANNEL` 时，12 字节参数的 `band` 字段
-被写死为 `0`：
-
-```c
-put_unaligned_le16(0, chan + 0);              /* 5 GHz 也发 0 ← bug */
-put_unaligned_le16(f > 2500 ? 1 : 0, ...);    /* 修复后 */
-```
-
-于是给 5 GHz 信道发的是"2.4 GHz band + 5 GHz 频率"这种自相矛盾的请求。固件**照样回
-`MM_SET_CHANNEL_CFM`**（所以驱动以为切成功了），但无线电不会真的切过去。
-`zt_set_channel()`（连接/切信道路径）一直是对的，只有扫描路径漏了。
-
-**ground truth 来自厂商驱动抓包**：81/81 条 `SET_CHANNEL` 都满足
-`band = (freq > 2500) ? 1 : 0`（2484→0、5180→1）。这也是"逆向厂商 Windows 驱动"最实际的用法——
-不是照抄代码，而是把它 46,182 包的抓包当标准答案来逐字段对照。
-
-**修复后实测**（同一张卡、同一 URL、10 s×3 取中位数）：
-
-| 场景 | 修复前 | 修复后 |
-|---|---|---|
-| 2.4 GHz（ch6，−52 dBm） | 4.16 Mbit/s | — |
-| 5 GHz（ch153，−54 dBm） | 收不到 | **9.00 Mbit/s** |
-| 5 GHz（ch149，−26 dBm，强信号） | 收不到 | **12.10 Mbit/s** |
-| 同一张卡的厂商 Windows 驱动（5 GHz 对照） | — | 13.37~18.21 Mbit/s |
-
-扫描侧同时恢复正常：一次扫描可见 **29 个真实 5 GHz BSS**（此前 1 个且自相矛盾）。
-
-> 因此：**「驱动侧无可改之处」这条结论只在 2.4 GHz 范围内成立**。
-> 残余差距（12.10 vs 13.37~18.21）的候选原因是本驱动未声明 HT/VHT（mac80211 只跑
-> legacy OFDM，`iw link` 报 6.0 Mbit/s），而厂商驱动在 5 GHz 上跑 802.11ax —— **尚未验证**。
-
-### ~~设备收帧上限约 1030 字节~~ → **已更正：是驱动 TX 侧的上限（0.3.2 修复）**
-
-> 这一节原先把 ~1030 字节的阈值记成"设备限制、驱动已尽力"。**2026-09-27 查明是误诊**，
-> 真正的根因在驱动自己的发送路径，且影响的是**上传方向**。
-
-**真正的根因**：TX 路径沿用了 `MAX_FRAME = 1024`，于是帧长上限是
-`1024 - 28(描述符) - 8(WLAN 头) = 988` 字节，超过的帧被驱动**直接丢弃**
-（`tx_dropped++`）且不报错。MTU 1500 的满尺寸段在 802.11 层约 1534 字节 ⇒ **发不出去**。
-
-**当初为什么会误判成"设备"**：证据全部来自"ping 大包不通 + `rx_debug` 看不到大帧"。
-但 ping 大包不通是**请求发不出去**（TX 被丢），自然也就没有回复帧可收 —— 结论下反了。
-真正的接收侧完全正常：下载时用 `rx_debug` 采样 14095 帧，**98.9% 都 >1030 字节，
-主峰 1558 字节**（满尺寸数据帧），设备根本没在限制接收帧长。
-
-**修复**（[driver/zt9612.c](driver/zt9612.c)）：TX 单独给 2048 字节缓冲
-（`ZT_TX_BUF_SIZE`，上限 2012 字节），RX 保持 2048。
-
-**修复前后实测**（同一张卡、同一 5 GHz 链路）：
-
-| 观测 | 修复前 | 修复后 |
-|---|---|---|
-| `ping -M do` payload 1000 / 1200 / 1400 / **1472** | **100% 丢包** | **0% 丢包** |
-| 上传（Cloudflare 测速口，RTT 213 ms） | **0.05 Mbit/s**（送出一个窗口就卡死） | 0.86 Mbit/s |
-| 上传（近端 TCP sink，同网段） | — | **3.72 Mbit/s**（3 流 4.73） |
-| 下载（同口径对照） | 10.48 Mbit/s | 13.30 Mbit/s |
-
-> 也就是说：**这一版之前，这块卡的上传基本上是坏的**。此前的"TCP 数据面不受影响"
-> 只验证了下载方向，没有测过上传。
-
-**仍然存在的上行不对称**（未修，记录在案）：上传约 3.7~4.7 Mbit/s，约为下载的一半。
-候选原因是本驱动的 TX 是**一帧一条同步 `usb_bulk_msg`**（`zt_tx_work` 串行发送），
-按每帧 ~2.5 ms 估算正好落在 4~5 Mbit/s —— **未验证**；要提升需改成 URB 队列/多帧并发。
-
-```bash
-# 自己复核：写 N 让驱动记录接下来 N 帧的 USB 长度，然后打大包
-sudo sh -c 'echo 200 > /sys/module/zt9612/parameters/rx_debug'
-ping -c 3 -W 3 -s 1400 -M do <网关>
-sudo journalctl -k --since '-1 min' | grep rxdbg     # 注意：本机 dmesg 直读为空
-```
-
-> 两个坑：写该参数**不能用 `echo N | sudo tee`**（tee 会吞掉 stdin）；
-> 读日志用 `journalctl -k`（`kernel.dmesg_restrict=1` 时 `dmesg` 直读为空）。
-
-### 芯片挂死后需要物理拔插
-
-出现 `-110`、`can't set config #1`、`Entity not found` 表示芯片已挂死，软件复位无效。
-常见触发原因：固件运行期间重复灌固件、切模式后拖延过久、不等 CFM 就连发 IPC 导致固件
-断言崩溃（事件中会出现 `macif.c` 字样）。处理办法是拔下网卡等待 10 秒再插上。
-
-### 设备可能自行回到光盘模式
-
-固件看门狗复位，原因是主机超过 5 秒没有发送心跳。内核驱动用 `delayed_work` 每 5 秒发送
-一次；如果自行编写用户态脚本，需要自己维持心跳。
-
-### 其它
-
-- 扫描结果的 `signal` 是**描述符里的真值**（int8 dBm，实测 −94…−23 dBm；同 AP 同信道组内
-  极差 ≤2 dB），`iw scan` 可直接用于判断远近
-- **`iw link` 的 tx bitrate 不可当作性能指标**：它只是主机侧速率掩码/记账（报 1.0 Mbit/s），
-  实测吞吐是它的 4 倍以上
-- **上传吞吐低于下载**（约 3.7~4.7 vs 7~13 Mbit/s）：驱动 TX 是一帧一条同步 `usb_bulk_msg`，
-  未做 URB 流水线；**未定位**，见「已知问题」里那一节
-- ~~设备收帧上限约 1030 字节~~ **已更正**：那条限制其实是驱动 TX 侧的 988 字节帧长上限
-  （影响上传，0.3.2 修复）；接收侧完全正常，下载时 98.9% 的帧 >1030 字节、主峰 1558 字节
-- 驱动源码中部分中文注释在早期编辑中损坏成乱码，不影响编译，待清理
-- 支持 2.4 GHz + 5 GHz、STA 模式；AP 模式与蓝牙未实现
-- 0.x 阶段的接口（模块参数、`/dev` 协议）可能变化
+已修复的历史问题（过程与数据见 [CHANGELOG.md](CHANGELOG.md)）：RX 缓冲过小导致下载停滞、
+5 GHz 扫描 band 标志错误导致 5 GHz 完全不可用、TX 帧长上限导致上传不可用、
+`max_mtu` 曾被设成 900 的弯路、开机自动加载的空指针崩溃。
 
 ## 调试
 
 ```bash
 sudo dmesg -C && sudo modprobe zt9612 && sudo dmesg | tail -30
-ls -l /dev/zt9612                        # M2 的原始 IPC 通道
+ls -l /dev/zt9612                        # 原始 IPC 通道
 cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 ```
 
@@ -456,28 +286,37 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 |---|---|---|
 | `do_init` | 1 | 固件装载后是否执行同步初始化序列；`0` 表示只装载固件 |
 | `do_boot` | 1 | 是否下载固件；`0` 表示复用已在运行的固件，只做 IPC 初始化 |
-| `scan_probe` | 0 | 扫描时是否主动发送 probe request：`0` 被动（默认），`1` 自建 probe（尚未单独复验），`2` 逐字节重放厂商 probe（**已验证能收到 probe response**）。主动探测会跳过 cfg80211 标记 `NO_IR`/`RADAR` 的信道 |
-| `tx_ep` | 5 | TX 端点号（实验开关，一般不用改） |
+| `scan_probe` | 0 | 扫描是否主动发 probe request：`0` 被动（默认）、`1` 自建、`2` 逐字节重放厂商 probe（已验证）。主动探测会跳过 `NO_IR`/`RADAR` 信道 |
+| `tx_ep` | 5 | TX 端点号（实验开关） |
 | `tx_prep` | 1 | 切换信道前是否重放厂商的使能序列 |
-| `tx_variant` | 0 | TX 帧变体实验开关（一般不用改） |
+| `tx_variant` | 0 | TX 帧变体实验开关 |
 | `rx_debug` | 0 | 诊断：写 N 即记录接下来 N 个接收 USB 传输的长度（`journalctl -k \| grep rxdbg`） |
-| `tx_status` | 0 | 实验开关：是否把发送结果上报给 mac80211（`0` 关闭；**实测不提吞吐**，仅让速率控制记账更真实） |
-| `tx_status_probe` | 100 | 开启上报时，每 N 帧标 1 帧为"已 ACK"，其余如实报失败（因为无法得知是否真被 ACK） |
+| `tx_status` | 0 | 实验开关：把发送结果上报给 mac80211（实测不提吞吐，只让记账更真实） |
+| `tx_status_probe` | 100 | 开启上报时每 N 帧标 1 帧为"已 ACK"，其余如实报失败 |
+| `ht_cap_enable` | 0 | 实验开关：给 5 GHz band 声明 HT。**实测无收益且会触发 mac80211 聚合 WARNING**，见 CHANGELOG |
 
 `/dev/zt9612` 的接口约定（调试通道，非数据面）：
 
 | 操作 | 语义 |
 |---|---|
-| `write()` | 传入完整 `WLAN` 帧（`"WLAN" + u16 hlen + u16 type + payload`），原样发往 EP8 |
-| `read()` | 返回一条设备发来的完整帧，阻塞等待且 3 秒超时，支持 `O_NONBLOCK`；保证整帧，半帧不会错位 |
+| `write()` | 传入完整 `WLAN` 帧（`"WLAN" + u16 hlen + u16 type + payload`），原样发往 TX 端点 |
+| `read()` | 返回一条设备发来的完整帧，阻塞等待且 3 秒超时，支持 `O_NONBLOCK`；保证整帧 |
 | `poll()` | 支持 `select()`/`poll()` 等待可读 |
-| ioctl `ZT_IOC_TXRAW` | 把一条完整 `WLAN` 帧直接交给 TX 端点，用于**不重载模块**就试验 TX 描述符与时序 |
-| debugfs `zt9612/tx_raw` | 同上，走写入方式（Secure Boot 的 `lockdown=integrity` 下 debugfs 不可写，通常用 ioctl） |
+| ioctl `ZT_IOC_TXRAW` | 把一条完整 `WLAN` 帧直接交给 TX 端点，用于**不重载模块**就试验描述符与时序 |
+| debugfs `zt9612/tx_raw` | 同上，走写入方式（`lockdown=integrity` 下 debugfs 不可写，通常用 ioctl） |
 
-内核 taint 提示：任何外部模块加载后内核都会被标记 `O`，未签名模块再加 `E`。
-因此 `cat /proc/sys/kernel/tainted` 非 0，以及 `dmesg` 中的
-`loading out-of-tree module taints kernel`，都是预期现象。只有 `P`（专有模块）才代表
-许可证问题，本驱动是 GPL 兼容的，不会出现。
+看 RX 帧长分布（写参数不能用 `echo N | sudo tee`，tee 会吞掉 stdin；
+`kernel.dmesg_restrict=1` 时用 `journalctl -k` 读日志）：
+
+```bash
+sudo sh -c 'echo 2000 > /sys/module/zt9612/parameters/rx_debug'
+# 期间做一次下载，然后：
+sudo journalctl -k --since '-2 min' | grep rxdbg
+```
+
+内核 taint 提示：加载外部模块后内核会被标记 `O`，未签名模块再加 `E`。因此
+`cat /proc/sys/kernel/tainted` 非 0、`dmesg` 里出现 `loading out-of-tree module taints kernel`
+都是预期现象。只有 `P`（专有模块）才代表许可证问题，本驱动是 GPL 兼容的，不会出现。
 
 其它问题先看 [FAQ.md](FAQ.md)。
 
@@ -485,15 +324,15 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 
 | 步骤 | 目标 | 状态 |
 |---|---|---|
-| M3.1 | 注册 mac80211 并出现无线接口 | 已完成并实机验证 |
-| M3.2 | `iw dev <iface> scan` 能扫到 AP | 已完成并实机验证（双频，一轮 59 个 BSS） |
-| M3.3 | 关联（开放 AP 与 WPA2-PSK） | 已完成并实机验证 |
-| M3.4 | 数据面与联网 | 已完成并实机验证（DHCP 租约 + `ping` 网关与公网） |
-| M3.5 | 5 GHz 频段 | 已完成并实机验证 |
-| v0.3 | 速率与吞吐 | **已完成并定案**：修掉 RX 缓冲缺陷后实测 **4.2~4.7 Mbit/s**；速率由固件内 ARRM 自主决定，主机侧无可改之处（见「已知问题」） |
-| 下一步 | WPA2-Enterprise（802.1X） | 代码路径未验证（实验环境无 802.1X AP） |
-| 收尾 | 协议细节 | `0x0104`、`0x0105`、`0x050e` 的精确语义（`0x020c` 已定案：是"刚离开的信道"回显，可忽略） |
-| 可选 | 扩展 | AP 模式、40/80 MHz、蓝牙（同芯片 BT 功能，属复合接口） |
+| M3.1–M3.5 | 接口 / 双频扫描 / 关联 / 数据面 / 5 GHz | 完成并实机验证（5 GHz 自 0.3.1 起真正可用） |
+| v0.3 | 吞吐判定 | 完成：速率由固件内 ARRM 自主决定，主机侧改不了；过程中修掉 RX 缓冲缺陷 |
+| v0.3.1 / v0.3.2 | 5 GHz 与上传修复 | 完成（见「版本要点」） |
+| 下一步 | TX 上行吞吐 | 改成 URB 队列 / 多帧并发，目标把上传从 4 提到接近下载水平 |
+| 下一步 | 速率控制反馈 | 补 `ampdu_action` 与真实 TX 反馈，让速率控制能爬升（当前停在 MCS 0） |
+| 待办 | 干净开机自动加载复验 | 通过后才能把 `install-driver.sh` 的默认 blacklist 去掉 |
+| 待办 | WPA2-Enterprise（802.1X） | 代码路径未验证 |
+| 收尾 | 协议细节 | `0x0104`、`0x0105`、`0x050e` 的精确语义（`0x020c` 已定案，可忽略） |
+| 可选 | 扩展 | AP 模式、40/80 MHz、蓝牙 |
 
 更省力的替代路线是向厂商索取官方 Linux 驱动
 （`ZTOP_ACEV100_Android_wifi_bt_*.tar.gz`，内含 `build_linux.sh`）。取得后本仓库可以转为
@@ -510,12 +349,15 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
   校验是对整段数据做 XOR16，不是每块
 - 同步语义：RUN 之后必须等到固件启动通知（`type=0x0100`）再发 `MM_RESET_REQ`，否则消息
   丢失且永远等不到 CFM；每条 IPC 都要等到对应 CFM 才能发下一条
+- **TX 速率由固件决定**：28 字节 TX 描述符里没有速率/MCS 字段，厂商驱动也从不发速率消息，
+  因此主机侧补速率表、上报 TX status、声明 HT/VHT 都不改变实测吞吐
 - 厂商私有消息段（`0x01xx`、`0x02xx`、`0x05xx`）不在开源枚举中，实现上按实测序列
   原样重放，不推测结构
 
 ## 参与贡献
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。目前最需要的是实机测试反馈，以及 M3 未知项的突破。
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。目前最需要的是实机测试反馈（不同主板、不同内核，
+失败的 dmesg 同样有价值），以及向厂商索取官方 Linux 驱动包。
 
 ## 来源与许可
 
