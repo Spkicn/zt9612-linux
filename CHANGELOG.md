@@ -9,6 +9,23 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+### Fixed
+- **5 GHz 扫描的 band 标志写死成 0（导致 5 GHz 完全不可用）**：`zt_scan_work()` 的逐信道
+  `MM_SET_CHANNEL` 参数里 `band` 恒为 `0`，等于给 5 GHz 信道发"2.4 GHz band + 5 GHz 频率"
+  这种自相矛盾的请求 —— 固件照样回 `MM_SET_CHANNEL_CFM`，但无线电不会真的切过去。
+  后果：5 GHz 扫描恒 `beacon=0`、5 GHz 关联从未发生，mac80211 里出现的"5 GHz BSS"
+  其实是频点被错误标注的 2.4 GHz 帧（实测：`freq=5745` 的条目却带
+  `DS Parameter set: channel 11` / `ERP` / `Country: Channels [1-13]`）。
+  修好后 5 GHz 扫描一次可见 29 个真实 BSS，并且**首次在本项目历史上完成 5 GHz 关联与数据面**。
+  - ground truth：厂商抓包 81/81 条 `SET_CHANNEL` 满足 `band = (freq>2500) ? 1 : 0`
+    （2484→0、5180→1），见 `re/REPORT_5GHZ.md` §1.1；同文件的 `zt_set_channel()` 一直是对的，
+    只有扫描循环漏了。
+  - 实测收益（同一张卡、同一 URL、10 s×3 取中位数）：同 SSID 下 **2.4 GHz 4.16 Mbit/s →
+    5 GHz 9.00 Mbit/s**；强信号 5 GHz BSS 上 **12.10 Mbit/s**（2.2~2.9 倍）。
+  - 对照：同一张卡在厂商 Windows 驱动下 5 GHz 为 13.37~18.21 Mbit/s。
+  - **同时更正两条旧结论**：M3.5 的"5 GHz 已实机验证"当时证据不成立（是错误标注的产物）；
+    v0.3 的"驱动侧无可改之处"**只在 2.4 GHz 范围内成立**。
+
 ### Planned
 - **厂商渠道（最高优先级）**：索取官方 Linux 驱动包，或**含 RAM 段代码的完整固件** ——
   现有 219 KB 镜像里没有速率控制代码（指针表指向段外），这是唯一还能打开
