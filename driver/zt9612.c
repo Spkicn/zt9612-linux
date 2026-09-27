@@ -35,8 +35,26 @@
 
 #define ZT_BLOCK_SIZE	488
 #define SETTINGS_ADDR	0x210CE700
-#define MAX_FRAME	1024
+#define MAX_FRAME	1024		/* /dev 调试通道与内部接收缓冲的帧上限 */
 #define MAX_PAYLOAD	(MAX_FRAME - 8)
+/*
+ * TX 缓冲必须容得下满尺寸的 802.11 数据帧。
+ *
+ * 实测教训（2026-09-27，长期被误判为"设备限制"）：
+ *   TX 路径沿用了 MAX_FRAME=1024，于是 `zt_tx_frame()` 的上限是
+ *   1024 - 28(描述符) - 8(WLAN 头) = **988 字节**；超过的帧被驱动**直接丢弃**
+ *   （`tx_dropped++`，见 zt_tx_one()），而且不报错。
+ *   后果：主机发不出满尺寸段（MTU 1500 → 802.11 帧 ≈1534 字节）——
+ *   下载方向看不出来（主机只回 ACK），但**上传几乎完全不通**：
+ *   实测修复前 upload 0.05 Mbit/s vs download 10.48 Mbit/s（Cloudflare 测速口同口径）。
+ *   同一条 ~1030 字节阈值也被误记成"设备收帧上限"：其实设备**完全能**收大帧——
+ *   下载时 rxdbg 采样 14095 帧里 98.9% >1030 字节、主峰 1558 字节（满尺寸数据帧）。
+ *   ping payload ≥1000 的 100% 丢包是**发不出去**（请求被丢），不是收不回来。
+ *
+ * 因此 TX 单独给 2048：最大帧 = 2048 - 28 - 8 = 2012 字节，足够放下 1500 MTU 的段。
+ */
+#define ZT_TX_BUF_SIZE	2048		/* TX 缓冲（z->tx / z->txd） */
+#define ZT_TX_MAX_FRAME	(ZT_TX_BUF_SIZE - TX_DESC_LEN - 8)
 /*
  * RX 缓冲必须容得下一个满尺寸的 802.11 数据帧，不能按"扫描帧都不大"来定。
  * 实测（2026-09-26）：MAX_FRAME=1024 时，ping payload ≥ 900 字节（MPDU≈968）
@@ -55,8 +73,9 @@
  *     比 900 下的 3.2 Mbit/s 还高）；
  *   * 而 MTU 上限 900 会让 **IPv6 完全不可用**（IPv6 要求 MTU ≥1280，
  *     也是 mac80211 的硬下限），接口再也拿不到 IPv6 地址。
- * 因此上限回到标准值：不做设备特有限制。ping 的 905 字节天花板另有原因
- * （见 re/ 的后续分析），不影响 TCP 数据面。
+ * 因此上限回到标准值：不做设备特有限制。
+ * 那段 905 字节天花板已于 2026-09-27 定案：是**驱动自己 TX 侧的上限**（见 ZT_TX_BUF_SIZE 注释），
+ * 与设备无关，也不影响 TCP 数据面。
  */
 #define ZT_MAX_MTU	1500
 #define RX_FIFO_SIZE	(64 * 1024)
@@ -902,7 +921,7 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 
 	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
 		return -ENODEV;
-	if (flen < 10 || flen > MAX_FRAME - TX_DESC_LEN - 8)
+	if (flen < 10 || flen > ZT_TX_MAX_FRAME)
 		return -EINVAL;
 
 	if (tx_variant == 2) {
@@ -2142,10 +2161,10 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (!z->ep_tx)
 		dev_warn(&intf->dev, "未找到 EP%u-OUT，TX 数据路径不可用\n", EP_TX_NUM);
 
-	z->tx = kmalloc(MAX_FRAME, GFP_KERNEL);
+	z->tx = kmalloc(ZT_TX_BUF_SIZE, GFP_KERNEL);
 	z->pl = kmalloc(MAX_PAYLOAD, GFP_KERNEL);
 	z->rx = kmalloc(ZT_RX_BUF_SIZE, GFP_KERNEL);
-	z->txd = kmalloc(MAX_FRAME, GFP_KERNEL);
+	z->txd = kmalloc(ZT_TX_BUF_SIZE, GFP_KERNEL);
 	if (!z->tx || !z->pl || !z->rx || !z->txd) {
 		ret = -ENOMEM;
 		goto err;
@@ -2285,7 +2304,7 @@ module_usb_driver(zt_driver);
 
 MODULE_AUTHOR("Spkicn <Spkicn@users.noreply.github.com>");
 MODULE_DESCRIPTION("ZT9612U (ZTOP/ACEV100) USB WiFi driver - mac80211 station: 2.4/5 GHz scan, connect, WPA2");
-MODULE_VERSION("0.3.1");
+MODULE_VERSION("0.3.2");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("zt9612_fw.bin");
 MODULE_FIRMWARE("zt9612_settings.bin");
