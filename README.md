@@ -322,6 +322,7 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 | `tx_desc_mask` | 0 | 实验开关：加密单播数据帧按位采用**厂商数据帧的描述符字段值**（bit1 = `+0x08`，就是那个会大幅改变微基准读数的字段）。**实测会断 DHCP，默认必须为 0**；微基准读数不等于空口吞吐，别被它骗 |
 | `ntf_log` | 0 | 实验开关：打印 EP2-IN 通知内容。实测本设备没有 EP2-IN（只有 EP4-IN + EP5-8-OUT），该通道恒为空 |
 | `sta_add_en` | 0 | 实验开关：关联后给固件发 `MM_STA_ADD_REQ`，并把固件分配的 `sta_idx` 写进数据帧描述符 `+0x09`（其余帧保持"无站点"）。**载荷已实测被固件接受**（`STA_ADD_CFM status=0`），但只带 `sta_idx` 未见到吞吐提升（上传 0.38 vs 0.33 Mbit/s，噪声内）；默认仍为 0 |
+| `ampdu_en` | 0 | 实验开关：A-MPDU 聚合。声明 `AMPDU_AGGREGATION`（**mac80211 组帧**）、TX 缓冲提到 16 KB、实现 `ampdu_action`（`MM_BA_ADD_REQ`/`MM_BA_DEL_REQ`）。用户态已验证两条消息可用（`BA_ADD_CFM status=0`）；**端到端尚未验证**（测试机设备需物理拔插），默认 0 |
 
 `/dev/zt9612` 的接口约定（调试通道，非数据面）：
 
