@@ -32,6 +32,7 @@
 #define ZT_PID		0x9612
 #define EP_OUT_NUM	8
 #define EP_IN_NUM	4
+#define EP_NTF_NUM	2		/* EP2-IN：厂商 TX 期间每次都在读的 6 字节通知通道（见 ntf_log） */
 
 #define ZT_BLOCK_SIZE	488
 #define SETTINGS_ADDR	0x210CE700
@@ -226,6 +227,38 @@ static int ht_cap_enable;
 module_param(ht_cap_enable, int, 0644);
 MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (default 0; measured no throughput gain and triggers an agg-tx WARNING - see re/EXPERIMENT_HT_VHT.md)");
 
+/*
+ * 实验开关（默认关闭）：打印接下来 N 条 EP2-IN 通知的内容。
+ *
+ * 背景：厂商 Windows 驱动在**每一次** EP5-OUT 前后都在读 EP2-IN 上的 6 字节通知
+ * （抓包：`ep=0x82 dlen=6`，内容如 `00fbffffff00` / `00fcff000000`，随 TX 推进变化，
+ * 像"已完成 TX 序号 / 队列水位"），而本驱动此前**完全没有接管这条通道**
+ * （见 re/REPORT_TX_RE.md 的 C1）。同一台机器实测：厂商驱动上传 95.3 Mbit/s、
+ * 本驱动 3.65 Mbit/s —— 差 26 倍。待验证的假设是"固件要等主机把通知取走才放行下一帧"。
+ *
+ * 无论本开关是否为 0，这条通道都会被**持续读取**（计数见 debugfs `zt9612/ntf_count`）；
+ * 本开关只决定是否把内容打进 dmesg。
+ */
+static int ntf_log;
+module_param(ntf_log, int, 0644);
+MODULE_PARM_DESC(ntf_log, "experimental: log the next N EP2-IN TX notifications (0 = off; the channel is always read)");
+
+/*
+ * 实验开关（默认关闭 = 与 0.3.x 行为完全一致）：数据帧描述符模板。
+ *
+ * 背景（re/EXPERIMENT_TX_RATE.md §5）：厂商上传时的 USB 抓包显示，厂商对**数据帧**用的是
+ * 与**管理帧**不同的一套描述符常量；我们此前把管理帧模板用在了所有帧上。实测差异：
+ *   同一链路、同一帧长：管理模板 6.32 Mbit/s → 数据模板 161.68 Mbit/s（25.6 倍）。
+ * 但把它用到真实数据路径后，**DHCP 拿不到地址**（关联与四次握手正常），原因未定位 ——
+ * 因此先做成开关，默认关闭，等定位清楚再决定是否默认开启。
+ *
+ * 0 = 全部帧用管理帧模板（默认，行为与 0.3.x 一致）
+ * 1 = 加密单播数据帧用厂商数据模板，其余仍用管理帧模板
+ */
+static int tx_desc_mode;
+module_param(tx_desc_mode, int, 0644);
+MODULE_PARM_DESC(tx_desc_mode, "experimental: 1 = vendor DATA-frame descriptor template for protected unicast data frames (default 0)");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -244,6 +277,23 @@ struct zt_dev {
 	bool			alive;		/* 拔出/卸载后置 0，停止一切 USB IO */
 	bool			mac_started;	/* hw 是否已 start（drv_start/drv_stop），RX 注入的门控 */
 	struct completion	rx_done;	/* 在途 rx_urb 回收信号（D9） */
+
+	/*
+	 * 实验（对应 re/REPORT_TX_RE.md 的 C1）：EP2-IN 的 6 字节通知通道。
+	 * 厂商驱动在每一次 EP5-OUT 前后都在读它；本驱动此前完全没有接管。
+	 * 假设：固件要等主机取走通知才放行下一帧 —— 若是这样，仅"读起来"就能提高 TX 吞吐
+	 * （实测厂商 Windows 驱动上传 95.3 Mbit/s vs 本驱动 3.65 Mbit/s）。
+	 */
+	u8			ep_ntf;
+	bool			ntf_is_int;
+	u8			ntf_interval;
+	struct urb		*ntf_urb;
+	u8			*ntf_buf;
+	bool			ntf_running;
+	struct completion	ntf_done;
+	unsigned long		ntf_count;
+	unsigned long		ntf_bytes;
+	unsigned long		ntf_log_left;
 
 	struct delayed_work	hb_work;
 	unsigned long		last_hb;
@@ -904,6 +954,9 @@ static void zt_dbg_init(struct zt_dev *z)
 		return;
 	debugfs_create_file("tx_raw", 0200, zt_dbg_root, z, &zt_dbg_tx_fops);
 	debugfs_create_u32("tx_frames", 0400, zt_dbg_root, (u32 *)&z->tx_frames);
+	/* C1 观测：EP2-IN 通知通道的计数（低 32 位） */
+	debugfs_create_u32("ntf_count", 0400, zt_dbg_root, (u32 *)&z->ntf_count);
+	debugfs_create_u32("ntf_bytes", 0400, zt_dbg_root, (u32 *)&z->ntf_bytes);
 }
 
 /*
@@ -932,15 +985,56 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		memcpy(buf + 8, frame, flen);
 		total = 8 + flen;
 	} else {
+		/*
+		 * 描述符按 802.11 帧类型选模板（2026-09-27 定案，见 re/EXPERIMENT_TX_RATE.md）：
+		 *
+		 * 这里的常量此前全部抄自厂商的**管理帧**（扫描 probe request），却被用于**所有**帧，
+		 * 包括数据帧。厂商上传时的 USB 抓包（re/captures/vendor_upload.pcap，96107 条数据帧）
+		 * 显示厂商对数据帧用的是**另一套常量**。实测差异巨大：
+		 *   同一段链路、同一帧长（1436 字节传输）：
+		 *     管理帧模板 →  6.32 Mbit/s
+		 *     数据帧模板 → 161.68 Mbit/s     （25.6 倍，与"厂商上传 95.3 vs 我们 3.65"吻合）
+		 * 机制推测：固件按描述符把帧归类，管理帧走的是逐帧确认的慢速路径。
+		 */
+		bool is_data = (frame[0] & 0x0c) == 0x08;	/* 802.11 type == data */
+		/*
+		 * 只对**已加密**的数据帧用厂商的数据模板。
+		 *
+		 * 依据：厂商抓包里 96107 条数据帧**全部**带 Protected 位（FC[1] & 0x40），
+		 * 而我们抓不到它发 EAPOL 的样子。实测教训：一开始对所有数据帧都用数据模板，
+		 * 结果四次握手（EAPOL 是**未加密**的数据帧）失败、关联不上。
+		 * 因此：加密数据帧走数据模板，其余（管理帧、EAPOL、未加密数据）沿用原管理模板。
+		 */
+		bool protected = (flen >= 2) && (frame[1] & 0x40);
+		/*
+		 * 广播/组播帧仍走管理模板：厂商抓包里 96107 条数据帧**全是单播**
+		 * （addr1 恒为 AP 的 BSSID），我们没有它发广播帧的样本；而实测发现
+		 * 加密广播（DHCP DISCOVER 就是）用数据模板会拿不到地址。
+		 * addr1 在 frame[4]，其最低位是组播位。
+		 */
+		bool mcast = (flen >= 5) && (frame[4] & 0x01);
+
 		d = buf + 8;
 		memset(d, 0, TX_DESC_LEN);
 		put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
 		put_unaligned_le16(flen, d + 4);
-		put_unaligned_le16(0x0700, d + 6);
-		put_unaligned_le16(0xff00, d + 8);
-		put_unaligned_le16(0x0005, d + 10);
-		put_unaligned_le16(z->tx_seq++, d + 14);
-		put_unaligned_le16(0x003f, d + 26);
+		if (tx_desc_mode && is_data && protected && !mcast) {
+			/* 厂商数据帧模板（vendor_upload.pcap 中 96107/96107 条一致的部分） */
+			put_unaligned_le16(0x0000, d + 6);
+			put_unaligned_le16(0x0000, d + 8);
+			put_unaligned_le16(0x1312, d + 10);
+			put_unaligned_le16(0x0040, d + 12);
+			put_unaligned_le16(z->tx_seq++, d + 14);
+			put_unaligned_le16(0x0200, d + 20);
+			put_unaligned_le16(0x7540, d + 26);
+		} else {
+			/* 厂商管理帧模板（原样保留：association / auth 等仍走这条） */
+			put_unaligned_le16(0x0700, d + 6);
+			put_unaligned_le16(0xff00, d + 8);
+			put_unaligned_le16(0x0005, d + 10);
+			put_unaligned_le16(z->tx_seq++, d + 14);
+			put_unaligned_le16(0x003f, d + 26);
+		}
 		memcpy(d + TX_DESC_LEN, frame, flen);
 
 		memcpy(buf, "WLAN", 4);
@@ -1364,8 +1458,84 @@ out:
 	return ret;
 }
 
-/* ------------------------------------------------------------------ /dev/zt9612 */
+/*
+ * EP2-IN 的 6 字节通知通道（re/REPORT_TX_RE.md 的 C1）。
+ *
+ * 厂商驱动在每一次 EP5-OUT 前后都在读这条通道，本驱动此前完全没有接管它；
+ * 同一台机器上厂商上传 95.3 Mbit/s、本驱动 3.65 Mbit/s。假设是"固件要等主机把
+ * 完成通知取走才放行下一帧"。这里先把它**持续读起来**并计数，用 ntf_log 看内容，
+ * 再看 TX 吞吐是否变化 —— 先验证，不预设结论。
+ */
+static void zt_ntf_complete(struct urb *urb)
+{
+	struct zt_dev *z = urb->context;
 
+	if (urb->status == 0 && urb->actual_length) {
+		unsigned int n = min_t(unsigned int, urb->actual_length, 8);
+
+		z->ntf_count++;
+		z->ntf_bytes += urb->actual_length;
+		if (z->ntf_log_left > 0) {
+			z->ntf_log_left--;
+			dev_info(&z->intf->dev, "ntf: len=%u %*phN left=%lu\n",
+				 urb->actual_length, (int)n, z->ntf_buf, z->ntf_log_left);
+		}
+	}
+	if (READ_ONCE(z->ntf_running) && READ_ONCE(z->alive))
+		usb_submit_urb(urb, GFP_ATOMIC);
+	else
+		complete(&z->ntf_done);
+}
+
+static int zt_ntf_start(struct zt_dev *z)
+{
+	if (!z->ep_ntf)
+		return 0;
+	z->ntf_buf = kmalloc(64, GFP_KERNEL);
+	z->ntf_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!z->ntf_buf || !z->ntf_urb)
+		return -ENOMEM;
+	if (z->ntf_is_int)
+		usb_fill_int_urb(z->ntf_urb, z->udev,
+				 usb_rcvintpipe(z->udev, z->ep_ntf),
+				 z->ntf_buf, 64, zt_ntf_complete, z,
+				 z->ntf_interval ? z->ntf_interval : 1);
+	else
+		usb_fill_bulk_urb(z->ntf_urb, z->udev,
+				  usb_rcvbulkpipe(z->udev, z->ep_ntf),
+				  z->ntf_buf, 64, zt_ntf_complete, z);
+	z->ntf_log_left = ntf_log > 0 ? (unsigned long)ntf_log : 0;
+	WRITE_ONCE(z->ntf_running, true);
+	if (usb_submit_urb(z->ntf_urb, GFP_KERNEL)) {
+		WRITE_ONCE(z->ntf_running, false);
+		return -EIO;
+	}
+	dev_info(&z->intf->dev, "ntf: EP%u-IN 通知通道已接管（%s, interval=%u）\n",
+		 EP_NTF_NUM, z->ntf_is_int ? "interrupt" : "bulk", z->ntf_interval);
+	return 0;
+}
+
+/* 与 zt_rx_stop 同一套纪律：poison + 有界等待，超时宁可泄漏也不 UAF */
+static int zt_ntf_stop(struct zt_dev *z)
+{
+	if (!z->ntf_urb)
+		return 0;
+	if (READ_ONCE(z->ntf_running)) {
+		WRITE_ONCE(z->ntf_running, false);
+		usb_poison_urb(z->ntf_urb);
+		if (!wait_for_completion_timeout(&z->ntf_done, msecs_to_jiffies(2000))) {
+			dev_warn(&z->intf->dev, "ntf urb 2s 未回收，泄漏该实例\n");
+			return -ETIMEDOUT;
+		}
+	}
+	usb_free_urb(z->ntf_urb);
+	z->ntf_urb = NULL;
+	kfree(z->ntf_buf);
+	z->ntf_buf = NULL;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ /dev/zt9612 */
 static int zt_open(struct inode *inode, struct file *file)
 {
 	struct zt_dev *z = container_of(file->private_data, struct zt_dev, misc);
@@ -2131,6 +2301,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	mutex_init(&z->lock);
 	init_waitqueue_head(&z->rx_wait);
 	init_completion(&z->rx_done);
+	init_completion(&z->ntf_done);
 	z->alive = true;		/* 从这里开始才允许 USB IO */
 	INIT_DELAYED_WORK(&z->hb_work, zt_hb_work);
 	INIT_WORK(&z->scan_work, zt_scan_work);
@@ -2151,6 +2322,12 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		if (usb_endpoint_num(ep) == EP_TX_NUM && usb_endpoint_dir_out(ep) &&
 		    usb_endpoint_is_bulk_out(ep))
 			z->ep_tx = ep->bEndpointAddress;
+		/* C1：EP2-IN 的通知通道（厂商 TX 期间一直在读） */
+		if (usb_endpoint_num(ep) == EP_NTF_NUM && usb_endpoint_dir_in(ep)) {
+			z->ep_ntf = ep->bEndpointAddress;
+			z->ntf_is_int = usb_endpoint_xfer_int(ep);
+			z->ntf_interval = ep->bInterval;
+		}
 		dev_info(&intf->dev, "  ep %#04x %s\n", ep->bEndpointAddress,
 			 usb_endpoint_dir_in(ep) ? "IN" : "OUT");
 	}
@@ -2200,6 +2377,9 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		dev_err(&intf->dev, "rx urb start failed: %d\n", ret);
 		goto err_kfifo;
 	}
+	if (zt_ntf_start(z))
+		dev_warn(&intf->dev, "EP%u-IN 通知通道启动失败（继续，但 TX 吞吐可能受影响）\n",
+			 EP_NTF_NUM);
 	schedule_delayed_work(&z->hb_work, msecs_to_jiffies(HB_INTERVAL_MS));
 
 	z->misc.minor = MISC_DYNAMIC_MINOR;
@@ -2225,6 +2405,7 @@ err_kfifo:
 	z->scan_aborted = true;
 	cancel_work_sync(&z->scan_work);
 	cancel_delayed_work_sync(&z->hb_work);
+	zt_ntf_stop(z);
 	if (zt_rx_stop(z))		/* 泄漏实例，避免 use-after-free */
 		return ret;
 	kfifo_free(&z->rx_fifo);
@@ -2273,6 +2454,7 @@ static void zt_disconnect(struct usb_interface *intf)
 	}
 	zt_mac_unregister(z);
 
+	zt_ntf_stop(z);		/* 通知通道：同样有界等待 */
 	if (zt_rx_stop(z)) {
 		dev_warn(&intf->dev, "disconnected (teardown incomplete, instance leaked)\n");
 		return;
