@@ -57,6 +57,12 @@
 #define ZT_TX_BUF_SIZE	2048		/* TX 缓冲（z->tx / z->txd） */
 #define ZT_TX_MAX_FRAME	(ZT_TX_BUF_SIZE - TX_DESC_LEN - 8)
 /*
+ * 聚合实验（ampdu_en）用的更大缓冲：mac80211 自己组 A-MPDU 后，一次
+ * `ieee80211_tx_dequeue()` 可能给出多个 MPDU（最大由 max_tx_aggregation_subframes 决定）。
+ */
+#define ZT_AGG_BUF_SIZE		16384
+#define ZT_AGG_SUBFRAMES	8
+/*
  * RX 缓冲必须容得下一个满尺寸的 802.11 数据帧，不能按"扫描帧都不大"来定。
  * 实测（2026-09-26）：MAX_FRAME=1024 时，ping payload ≥ 900 字节（MPDU≈968）
  * 的回复一个字节都上不了栈 —— 空口收到了，URB 缓冲装不下就直接丢，
@@ -280,7 +286,29 @@ MODULE_PARM_DESC(tx_desc_mask, "experimental: bitmask of vendor DATA-frame descr
  */
 static int sta_add_en;
 module_param(sta_add_en, int, 0644);
-MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and carry the assigned sta_idx in data-frame descriptors (0 = off; the 48-byte payload template is still a placeholder - see re/REPORT_STA_ADD_LAYOUT.md)");
+MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and put the sta_idx into data descriptors (0=off; see re/REPORT_STA_ADD_LAYOUT.md)");
+
+/*
+ * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：**A-MPDU 聚合**。
+ *
+ * 背景：`re/REPORT_TX_SESSION.md` 指出厂商快路径 = ①固件站点会话 ②描述符带 sta_idx
+ * ③聚合（`MM_BA_ADD_REQ` 由 mac80211 的 ampdu_action 触发）。前两步已在
+ * `sta_add_en` 里打通，但只带 sta_idx **没有提升吞吐**（见 CHANGELOG）⇒ 本轮补第三步。
+ *
+ * 打开后会做三件事（都在注册/加载期生效，运行期改无效）：
+ *   ① `ieee80211_hw_set(hw, AMPDU_AGGREGATION)` + `hw->max_tx_aggregation_subframes`
+ *      —— 此后 **mac80211 自己组 A-MPDU**（见 mac80211.h 对该字段的说明），
+ *      驱动从 `ieee80211_tx_dequeue()` 拿到的是**聚合后的 skb**；
+ *   ② TX 缓冲从 2 KB 提到 `ZT_AGG_BUF_SIZE`（否则聚合帧会被我们自己的长度检查丢掉）；
+ *   ③ 实现 `.ampdu_action`：TX_START 时发 `MM_BA_ADD_REQ`(0x28) 等 CFM 0x29，
+ *      成功再回调 `ieee80211_start_tx_ba_cb_irqsafe()`；停止时发 `MM_BA_DEL_REQ`(0x2A)。
+ *
+ * 用户态已经把两条消息都验证过了（`MM_BA_ADD_CFM` 返回 status=0；`MM_BA_DEL_CFM` 返回 5
+ * 但不断言）。**默认关闭**：聚合会改变 TX 缓冲与 mac80211 的行为，先按 A/B 验证再考虑默认开。
+ */
+static int ampdu_en;
+module_param(ampdu_en, int, 0644);
+MODULE_PARM_DESC(ampdu_en, "experimental: enable A-MPDU aggregation (AMPDU_AGGREGATION + ampdu_action + MM_BA_ADD_REQ, 16KB TX buffer); 0=off");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -343,6 +371,14 @@ struct zt_dev {
 	u8			sta_bssid[6];
 	unsigned long		sta_add_ok;
 	unsigned long		sta_add_fail;
+	/* 实验：A-MPDU 聚合（见 ampdu_en） */
+	u16			tx_buf_size;	/* 运行期 TX 缓冲长度（聚合时更大） */
+	u8			ba_tid;
+	bool			ba_valid;
+	unsigned long		ba_add_ok;
+	unsigned long		ba_add_fail;
+	unsigned long		ba_rx_start;
+	unsigned long		ba_rx_stop;
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -742,7 +778,7 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 			     0x000b, 1000, resp, &rlen)) {
 		z->sta_add_fail++;
 		dev_warn(&z->intf->dev,
-			 "STA_ADD: no CFM (template not confirmed; see re/REPORT_STA_ADD_LAYOUT.md)\n");
+			 "STA_ADD: no CFM (see re/REPORT_STA_ADD_LAYOUT.md)\n");
 		return;
 	}
 	/*
@@ -774,6 +810,70 @@ static void zt_sta_del(struct zt_dev *z)
 	z->sta_valid = false;
 	z->sta_idx = 0;
 }
+
+/*
+ * A-MPDU 聚合：向固件登记 / 注销 BA 会话（`MM_BA_ADD_REQ` 0x28 / `MM_BA_DEL_REQ` 0x2A）。
+ * 参数布局【证据，re/REPORT_TX_SESSION.md §1】：
+ *   0x28：8 字节 {u8 type; u8 sta_idx; u8 tid; u8 pad; u16 A; u16 B}，等 CFM 0x29
+ *   0x2A：3 字节 {u8 type; u8 sta_idx; u8 tid}，等 CFM 0x2B
+ * 用户态实测（2026-09-27）：type=0、sta_idx=会话值、tid=0、A=64、B=0 时
+ * `MM_BA_ADD_CFM` 返回 status=0（不断言）；同参数发 0x2A 返回 5，语义仍待确认 ——
+ * 这里只发不解释。
+ */
+static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
+{
+	u8 params[8];
+	u8 resp[4];
+	u16 rlen = 0;
+
+	if (!z->sta_valid)
+		return -EINVAL;
+	/* type：BA_AGMT_TX/RX 的取值未定；0 实测被接受 */
+	params[0] = 0;
+	params[1] = z->sta_idx;
+	params[2] = tid;
+	params[3] = 0;
+	put_unaligned_le16(bufsz, params + 4);	/* A：候选 bufsz */
+	put_unaligned_le16(ssn, params + 6);	/* B：候选 ssn */
+
+	if (zt_cmd_fifo_resp(z, 0x0028, params, sizeof(params), 0x0029, 1000, resp, &rlen)) {
+		z->ba_add_fail++;
+		dev_warn(&z->intf->dev, "BA_ADD: no CFM (tid=%u)\n", tid);
+		return -EIO;
+	}
+	if (rlen >= 1 && resp[0] != 0) {
+		z->ba_add_fail++;
+		dev_warn(&z->intf->dev, "BA_ADD_CFM: status=%u (tid=%u)\n", resp[0], tid);
+		return -EIO;
+	}
+	z->ba_valid = true;
+	z->ba_tid = tid;
+	z->ba_add_ok++;
+	dev_info(&z->intf->dev,
+		 "BA_ADD_CFM: status=0 sta_idx=%u tid=%u (bufsz=%u ssn=%u)\n",
+		 z->sta_idx, tid, bufsz, ssn);
+	return 0;
+}
+
+static void zt_ba_del(struct zt_dev *z, u8 tid)
+{
+	u8 params[3];
+	u8 resp[4];
+	u16 rlen = 0;
+
+	if (!z->ba_valid)
+		return;
+	params[0] = 0;
+	params[1] = z->sta_idx;
+	params[2] = tid;
+	if (zt_cmd_fifo_resp(z, 0x002a, params, sizeof(params), 0x002b, 1000, resp, &rlen))
+		dev_warn(&z->intf->dev, "BA_DEL: no CFM (tid=%u)\n", tid);
+	else
+		dev_info(&z->intf->dev, "BA_DEL_CFM: status=%u (tid=%u)\n",
+			 rlen >= 1 ? resp[0] : 0xff, tid);
+	z->ba_valid = false;
+}
+/* `zt_mac_ampdu_action()` 定义在 `zt_from_hw()` 之后（ops 结构体前）。 */
 
 static int zt_run_init(struct zt_dev *z)
 {
@@ -1139,7 +1239,7 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 
 	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
 		return -ENODEV;
-	if (flen < 10 || flen > ZT_TX_MAX_FRAME)
+	if (flen < 10 || flen > (int)(z->tx_buf_size - TX_DESC_LEN - 8))
 		return -EINVAL;
 
 	if (tx_variant == 2) {
@@ -2391,6 +2491,47 @@ static int zt_mac_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	return 0;
 }
 
+/*
+ * mac80211 的 ampdu_action。契约（mac80211.h @ampdu_action）：
+ * TX_START 时必须先准备好会话，再调 `ieee80211_start_tx_ba_cb_irqsafe()`；
+ * TX_STOP_CONT 之后调 `ieee80211_stop_tx_ba_cb_irqsafe()`；FLUSH 不需要回调。
+ * RX 方向由固件自己管，这里只回成功（回错误会让 mac80211 认为设备不支持聚合）。
+ */
+static int zt_mac_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			       struct ieee80211_ampdu_params *params)
+{
+	struct zt_dev *z = zt_from_hw(hw);
+	struct ieee80211_sta *sta = params->sta;
+
+	switch (params->action) {
+	case IEEE80211_AMPDU_TX_START:
+		if (zt_ba_add(z, (u8)params->tid, params->buf_size, params->ssn))
+			return -EIO;
+		ieee80211_start_tx_ba_cb_irqsafe(vif, sta->addr, params->tid);
+		return 0;
+	case IEEE80211_AMPDU_TX_STOP_CONT:
+		zt_ba_del(z, (u8)params->tid);
+		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, params->tid);
+		return 0;
+	case IEEE80211_AMPDU_TX_STOP_FLUSH:
+	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
+		zt_ba_del(z, (u8)params->tid);
+		return 0;
+	case IEEE80211_AMPDU_TX_OPERATIONAL:
+		dev_info(&z->intf->dev, "AMPDU operational (tid=%u bufsz=%u)\n",
+			 params->tid, params->buf_size);
+		return 0;
+	case IEEE80211_AMPDU_RX_START:
+		z->ba_rx_start++;
+		return 0;
+	case IEEE80211_AMPDU_RX_STOP:
+		z->ba_rx_stop++;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct ieee80211_ops zt_mac_ops = {
 	.start = zt_mac_start,
 	.stop = zt_mac_stop,
@@ -2404,6 +2545,8 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.bss_info_changed = zt_mac_bss_info_changed,
 	/* M3.2：被动扫描（只听 beacon），probe request 的 TX 留到 M3.4 */
 	.hw_scan = zt_mac_hw_scan,
+	/* 实验：A-MPDU 聚合（ampdu_en=1 时才会被 mac80211 调用） */
+	.ampdu_action = zt_mac_ampdu_action,
 	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
@@ -2437,6 +2580,19 @@ static void zt_mac_register(struct zt_dev *z)
 		zt_band_5ghz.ht_cap = zt_ht_cap_5ghz;
 		dev_info(&z->intf->dev,
 			 "experimental: 5GHz HT cap 已声明（HT20/SGI，MCS0-15，未开聚合）\n");
+	}
+	if (ampdu_en) {
+		/*
+		 * 打开后 **mac80211 自己组 A-MPDU**（见 mac80211.h 对
+		 * max_tx_aggregation_subframes 的说明），驱动拿到的是聚合 skb ⇒
+		 * TX 缓冲已在 probe 里同步放大。真正开始聚合还需要与 AP 协商出
+		 * BA 会话：`ht_cap_enable=1`（要有 HT 能力）+ 我们实现 ampdu_action。
+		 */
+		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+		hw->max_tx_aggregation_subframes = ZT_AGG_SUBFRAMES;
+		dev_info(&z->intf->dev,
+			 "experimental: A-MPDU 聚合已启用（mac80211 组帧，TX 缓冲 %u 字节，最多 %u 子帧）\n",
+			 z->tx_buf_size, ZT_AGG_SUBFRAMES);
 	}
 	hw->wiphy->max_scan_ssids = 1;
 	hw->queues = 4;
@@ -2547,10 +2703,11 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (!z->ep_tx)
 		dev_warn(&intf->dev, "未找到 EP%u-OUT，TX 数据路径不可用\n", EP_TX_NUM);
 
-	z->tx = kmalloc(ZT_TX_BUF_SIZE, GFP_KERNEL);
+	z->tx_buf_size = ampdu_en ? ZT_AGG_BUF_SIZE : ZT_TX_BUF_SIZE;
+	z->tx = kmalloc(z->tx_buf_size, GFP_KERNEL);
 	z->pl = kmalloc(MAX_PAYLOAD, GFP_KERNEL);
 	z->rx = kmalloc(ZT_RX_BUF_SIZE, GFP_KERNEL);
-	z->txd = kmalloc(ZT_TX_BUF_SIZE, GFP_KERNEL);
+	z->txd = kmalloc(z->tx_buf_size, GFP_KERNEL);
 	if (!z->tx || !z->pl || !z->rx || !z->txd) {
 		ret = -ENOMEM;
 		goto err;

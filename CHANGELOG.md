@@ -10,6 +10,17 @@
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
 ### Added
+- **实验开关 `ampdu_en`（默认 0 = 行为与 0.3.2 完全一致）—— A-MPDU 聚合（厂商快路径第三步）**：
+  打开后：① `ieee80211_hw_set(hw, AMPDU_AGGREGATION)` + `max_tx_aggregation_subframes=8`
+  ⇒ **mac80211 自己组 A-MPDU**（见 mac80211.h 对该字段的说明），驱动从
+  `ieee80211_tx_dequeue()` 拿到的是**聚合后的 skb**；② TX 缓冲 2 KB → **16 KB**
+  （否则聚合帧会被我们自己的长度检查丢掉）；③ 实现 `.ampdu_action`：
+  `TX_START` 时发 `MM_BA_ADD_REQ`(0x28) 等 CFM 0x29、成功再回调
+  `ieee80211_start_tx_ba_cb_irqsafe()`，停止时发 `MM_BA_DEL_REQ`(0x2A)。
+  - 用户态已把两条消息验证过：**`MM_BA_ADD_CFM` 返回 status=0**（type=0、sta_idx=会话值、
+    tid=0、A=64、B=0，不断言）；`MM_BA_DEL_CFM` 返回 5（语义未定，但同样不断言）。
+  - **端到端尚未验证**：上机时设备进入 D6 挂死态（`hello ack timeout` ⇒ `firmware boot
+    failed: -110`，USB 接口都没枚举出来），需**物理拔插**后才能测；开关默认关闭。
 - **实验开关 `sta_add_en`（默认 0 = 行为与 0.3.2 完全一致）—— 固件站点会话已打通**：
   关联完成后发 `MM_STA_ADD_REQ`(0x0A)、记下 CFM 返回的 `sta_idx`，并让**加密单播数据帧**的
   描述符 `+0x09` 带上它（管理帧/广播/EAPOL 仍保持 `staid=0xff`）；断开时清理本地会话。
