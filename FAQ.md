@@ -24,7 +24,7 @@ WPA2-PSK 加密、DHCP 与外网 `ping`。实测吞吐：**5 GHz 9~12 Mbit/s**�
 
 所以现在能得到的是一块**可用的 managed 模式无线网卡**：双频（2.4G + 5G）扫描、
 WPA2-PSK 关联与加密、DHCP 拿地址、能访问外网；也可以通过 `/dev/zt9612` 收发原始帧。
-版本为 `0.3.1`。已知限制见 README「已知问题」（设备收帧上限约 1030 字节、
+版本为 `0.3.2`。已知限制见 README「已知问题」（上传吞吐低于下载、
 改 MTU 会短暂断联、2.4G 速率表只有 4 个 CCK）。
 
 -----
@@ -144,7 +144,7 @@ sudo ./install-driver.sh --dkms
 sudo dkms install .                  # 等价的手动方式
 ```
 
-`dkms.conf` 位于仓库根目录，版本为 `0.3.1`，安装到
+`dkms.conf` 位于仓库根目录，版本为 `0.3.2`，安装到
 `/lib/modules/<kernel>/updates/dkms/`。内核升级后 DKMS 会自动重建。Secure Boot 机器需要
 先配置好 MOK，否则新模块没有签名。
 
