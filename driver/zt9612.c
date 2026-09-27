@@ -1839,7 +1839,15 @@ static void zt_scan_work(struct work_struct *w)
 			break;
 		}
 		memset(chan, 0, sizeof(chan));
-		put_unaligned_le16(0, chan + 0);
+		/*
+		 * band 标志必须跟着频段走：厂商抓包里 81/81 条 SET_CHANNEL 都满足
+		 * band = (freq > 2500) ? 1 : 0（2484→0、5180→1，见 re/REPORT_5GHZ.md §1.1）。
+		 * 这里原先写死 0，等于给 5GHz 信道发"2.4GHz band + 5GHz 频率"这种自相矛盾的
+		 * 请求：固件照样回 CFM，却不会真的切过去，于是 5GHz 扫描永远 beacon=0、
+		 * 5GHz 关联无从发生（实测 2026-09-27；同一张卡在厂商 Windows 驱动下
+		 * 5GHz 可跑 13~18 Mbit/s）。zt_set_channel() 一直是对的，只有扫描循环漏了。
+		 */
+		put_unaligned_le16(f > 2500 ? 1 : 0, chan + 0);
 		put_unaligned_le16(f, chan + 2);
 		put_unaligned_le16(f, chan + 4);
 		put_unaligned_le16(20, chan + 10);
