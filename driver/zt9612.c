@@ -199,9 +199,11 @@ MODULE_PARM_DESC(tx_status_probe, "when reporting, mark 1 frame in N as acknowle
  *   2) 读日志用 journalctl -k：本机 `kernel.dmesg_restrict=1` 且 printk 级别低，
  *      `dmesg` 直接读是空的。
  *
- * 2026-09-26 用它得到的结论：ping payload 900 时能看到 usb_len=1038 的回复帧，
- * 而 payload 1400（100% 丢包）时整段窗口里 usb_len 最大只有 570（全是背景流量）
- * ⇒ 设备对超过约 1030 字节的帧**直接丢弃、不报错**（不是截断）。
+ * 2026-09-26 用它得到的**现象**：ping payload 900 时能看到 usb_len=1038 的回复帧，
+ * 而 payload 1400（100% 丢包）时整段窗口里 usb_len 最大只有 570（全是背景流量）。
+ * 当时据此解读为"设备对超过约 1030 字节的帧直接丢弃" —— **该解读已于 2026-09-27 证伪**
+ * （见文件头 ZT_TX_BUF_SIZE 注释）：payload 1400 的**请求帧本身**就被驱动 TX 侧 988 字节
+ * 上限丢掉了，自然没有回复帧可看；设备接收侧完全正常（采样 14095 帧，98.9% >1030 字节）。
  *
  * 默认 0（关闭）。
  */
@@ -222,16 +224,21 @@ MODULE_PARM_DESC(rx_debug, "log the length of the next N received USB transfers 
  *     ⇒ 约 1.14x，**与同臂内的漂移（~15%）同量级，收益不成立**；
  *   - 机制：即使协商上 HT，`station dump` 的速率也停在 **MCS 0**（6.5 MBit/s）——
  *     驱动不上报 TX status（tx_status 默认关），mac80211 的速率控制拿不到反馈、爬不上去；
- *   - **副作用**：声明后 mac80211 会尝试发起 TX Block-Ack 会话，而本驱动没有
- *     `ampdu_action`，触发 `WARNING: net/mac80211/agg-tx.c:623`（docs/09 阶段 D 预警过的风险）。
+ *   - **副作用**：声明后 mac80211 会尝试发起 TX Block-Ack 会话。当时本驱动没有
+ *     `ampdu_action`，于是触发 `WARNING: net/mac80211/agg-tx.c:623`（docs/09 阶段 D 预警过）。
+ *     **已于 v0.4 处理**：实现了 `.ampdu_action`（见 ampdu_en），`ampdu_en=0` 时不声明
+ *     `AMPDU_AGGREGATION`、mac80211 不会发起会话 ⇒ 本 WARNING 不再出现；
+ *     `ampdu_en=1` 时会话能建立，但**压流量会掉线**，因此两个开关默认都关。
  *
- * ⇒ 默认保持关闭；要继续走这条路，得先补 `ampdu_action` + 真实 TX 反馈，
- *   而不是只声明能力位。声明范围刻意保守：只 5GHz、只 HT20（不含 40MHz）、
- *   不声明聚合相关 hw 标志。
+ * ⇒ 默认保持关闭。**HT 的真正意义是"A-MPDU 聚合的前置条件"**（mac80211 的
+ *   `ieee80211_aggr_check()` 在未声明 HT 时直接返回，实测见 docs/04 D16），
+ *   而不是它自己能提速；要继续走聚合这条路，剩下的是**固件对 A-MPDU 的推送/封装语义**
+ *   （驱动现在仍是一帧一次 bulk + 28 字节描述符，吃不下 mac80211 交下来的聚合 skb）。
+ *   声明范围刻意保守：只 5GHz、只 HT20（不含 40MHz）、不声明聚合相关 hw 标志。
  */
 static int ht_cap_enable;
 module_param(ht_cap_enable, int, 0644);
-MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (default 0; measured no throughput gain and triggers an agg-tx WARNING - see re/EXPERIMENT_HT_VHT.md)");
+MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (default 0; measured no throughput gain, but it is the prerequisite for A-MPDU aggregation - see docs/04 D16 and re/EXPERIMENT_HT_VHT.md)");
 
 /*
  * 实验开关（默认关闭）：打印接下来 N 条 EP2-IN 通知的内容。
@@ -244,6 +251,10 @@ MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (de
  *
  * 无论本开关是否为 0，这条通道都会被**持续读取**（计数见 debugfs `zt9612/ntf_count`）；
  * 本开关只决定是否把内容打进 dmesg。
+ *
+ * **实测结论（2026-09-27）：假设已被证伪** —— 本设备 interface 0 **只有 5 个端点**
+ * （EP4-IN + EP5/6/7/8-OUT），**根本没有 EP2-IN**，所以那条 6 字节通知不属于本设备
+ * （或不在本接口）。代码保留接管逻辑，v0.4 起找不到端点就自动跳过。
  */
 static int ntf_log;
 module_param(ntf_log, int, 0644);
@@ -279,14 +290,20 @@ MODULE_PARM_DESC(tx_desc_mask, "experimental: bitmask of vendor DATA-frame descr
  * MM_STA_ADD_REQ(0x0A, 48 字节) 让固件分配 sta_idx，之后数据帧描述符 +0x09 带上它，
  * 同一链路上传 95.3 Mbit/s；本驱动从不发这条消息（所有帧 staid=0xff）⇒ 上传 3.7 Mbit/s。
  *
- * 现状：**骨架 + 尚未回填的 48 字节模板**（逆向见 re/REPORT_STA_ADD_LAYOUT.md）。
- * 实测两次盲发（全 0 / 合理 RC 值）都让固件断言在 rc.c 并 USB 掉线，
- * 因此模板真值必须来自厂商侧"启动→关联→传输"的 USB 抓包（P0-A）或更深的静态逆向，
- * **不要靠猜**。打开本开关会真的发这条消息 ⇒ 默认关闭；打开前先确认模板已回填。
+ * 现状（2026-09-27 实测，第 4~5 轮）：**已打通**。48 字节模板取自
+ * `re/REPORT_STA_ADD_STRUCT.md`（头部 +0x00~+0x13 是速率配置、尾部 +0x14~+0x2F 是
+ * A-MPDU 上限/flags/站点键），实机 CFM 返回 `status=0`、`sta_idx=0/1/2`，
+ * 链路/DHCP/上网不受影响、0 条 WARNING。
+ *
+ * 但**吞吐没变**：A/B（同一 AP）上传 0.38 vs 0.33 Mbit/s、下载 3.99 vs 3.71，都在噪声内
+ * ⇒ 只让描述符带上 `sta_idx` **不足以**打开厂商的 95 Mbit/s 快路径（见 CHANGELOG [Unreleased]）。
+ * 因此默认仍为 0；下一步是聚合（`ampdu_en`），不要再在这里盲试载荷常量：
+ * 改 `+0x00 format` 之类会直接被固件在 `rc.c:676` 断言（实测），BA/STA 的新消息一律
+ * "先打日志、再发一条、一次一个变量"。
  */
 static int sta_add_en;
 module_param(sta_add_en, int, 0644);
-MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and put the sta_idx into data descriptors (0=off; see re/REPORT_STA_ADD_LAYOUT.md)");
+MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and put the sta_idx into data descriptors (0=off; firmware accepts the payload but throughput is unchanged - see re/REPORT_STA_ADD_STRUCT.md and CHANGELOG [Unreleased])");
 
 /*
  * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：**A-MPDU 聚合**。
@@ -304,11 +321,21 @@ MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after associatio
  *      成功再回调 `ieee80211_start_tx_ba_cb_irqsafe()`；停止时发 `MM_BA_DEL_REQ`(0x2A)。
  *
  * 用户态已经把两条消息都验证过了（`MM_BA_ADD_CFM` 返回 status=0；`MM_BA_DEL_CFM` 返回 5
- * 但不断言）。**默认关闭**：聚合会改变 TX 缓冲与 mac80211 的行为，先按 A/B 验证再考虑默认开。
+ * 但不断言）。**实测结果（2026-09-27 第 6~8 轮，实机）**：链路能真的建立起来 ——
+ *   `ampdu_action TX_START: tid=0 ssn=0 buf_size=0` → `BA_ADD: type=0 sta=0 tid=0 A=64 B=0`
+ *   → `BA_ADD_CFM: status=0` → `AMPDU operational (tid=0 bufsz=8)`；
+ * 前提是**必须同时 `ht_cap_enable=1`**（否则 `ieee80211_aggr_check()` 直接返回，`docs/04` D16），
+ * 且 `A`(bufsz) 不能为 0（mac80211 在 TX_START 传 0，照发会让固件断言并 USB 掉线，`docs/04` D15）。
+ *
+ * **但仍不可用**：一压流量就崩 —— 网关 ping 丢包 70%、`tools/tx_blast.py` 中位数 3.77 Mbit/s
+ * （无聚合时约 12）、期间 2 次 USB 掉线重连。推断原因：mac80211 交下来的是**聚合后的大 skb**，
+ * 而本驱动仍按"一帧一次同步 bulk + 28 字节描述符"发，固件吃不下。
+ * ⇒ **默认关闭**；真正的下一步是搞清**固件对 A-MPDU 的封装/推送语义**（先抓一次聚合帧的
+ * 长度与描述符，或拿到官方实现），而不是继续调参数。
  */
 static int ampdu_en;
 module_param(ampdu_en, int, 0644);
-MODULE_PARM_DESC(ampdu_en, "experimental: enable A-MPDU aggregation (AMPDU_AGGREGATION + ampdu_action + MM_BA_ADD_REQ, 16KB TX buffer); 0=off");
+MODULE_PARM_DESC(ampdu_en, "experimental: enable A-MPDU aggregation (AMPDU_AGGREGATION + ampdu_action + MM_BA_ADD_REQ, 16KB TX buffer); needs ht_cap_enable=1; the BA session does establish but TX breaks under load, 0=off");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -835,8 +862,10 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	params[3] = 0;
 	/*
 	 * mac80211 在 TX_START 时给的 buf_size 可能是 0（那是"对端窗口"语义），
-	 * 而用户态实测被固件接受的是 A=64 ⇒ 这里做下限保护；两个值都打进 dmesg，
-	 * 便于和"设备是否立刻掉线"对拍（2026-09-27：带 HT 关联后 84 ms 掉线，待定位）。
+	 * 而用户态实测被固件接受的是 A=64 ⇒ 这里做下限保护。
+	 * 2026-09-27 定案：A=0 就是"开聚合后关联约 84 ms 设备 USB 掉线"的真因
+	 * （固件断言，docs/04 D15），不是聚合实现或 TX 路径的问题；两个值都打进 dmesg，
+	 * 便于和"设备是否立刻掉线"对拍。
 	 */
 	if (bufsz < 64)
 		bufsz = 64;
@@ -2620,7 +2649,9 @@ static void zt_mac_register(struct zt_dev *z)
 	 *   2) 上限压到 900 还有一个严重后果：**IPv6 不可用**——IPv6 要求 MTU ≥1280，
 	 *      这也是 mac80211 的硬下限，接口拿不到 IPv6 地址。
 	 * 结论：不要给这块设备设非标准的 MTU 上限，保持 1500。
-	 * ping 在 payload >905 字节时失败是另一个现象（待查），不影响 TCP 数据面。
+	 * ping 在 payload >905 字节时失败是**另一个现象，已于 0.3.2 定案**：那是驱动
+	 * TX 侧的 988 字节帧长上限（请求帧被驱动丢掉），见文件头 ZT_TX_BUF_SIZE 注释；
+	 * 与 MTU 设置无关，也不影响 TCP 数据面。
 	 */
 	hw->max_mtu = ZT_MAX_MTU;
 	SET_IEEE80211_PERM_ADDR(hw, z->mac);
