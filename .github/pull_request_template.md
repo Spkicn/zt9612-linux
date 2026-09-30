@@ -29,3 +29,4 @@
 - [ ] 没有提交固件、抓包、密钥、凭据、内部文档（见 CONTRIBUTING.md §6）
 - [ ] 驱动行为变更附了 dmesg 证据
 - [ ] 文档/CHANGELOG 已同步（如果影响用户可见行为）
+- [ ] 改了 `dkms.conf` / `MODULE_VERSION` / README 版本号时，已跑 `python ci/version_check.py`

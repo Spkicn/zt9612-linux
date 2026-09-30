@@ -1,0 +1,77 @@
+name: docs
+
+# 文档 / 版本漂移检查。
+#
+# 公开树上有什么、没有什么（决定了这个 job 怎么判）：
+#   * `ci/version_check.py` —— **公开文件**，随仓库发布（`ci/` 不在 .gitignore 里）
+#     ⇒ 版本一致性检查**无条件执行**：dkms.conf 的 PACKAGE_VERSION /
+#     driver/zt9612.c 的 MODULE_VERSION() / CHANGELOG.md 最新已发布小节 /
+#     README.md 的「当前版本·最新发布」，任何一处漂移都让 job 失败。
+#   * `tools/doc_lint.py` 与 `docs/` —— 本地保留目录（见 .gitignore 的「内部资料」一节），
+#     公开 CI 上**不存在** ⇒ 文档一致性检查只能**跳过**。跳过不是失败：公开仓库每次
+#     push 都变红没有意义。将来把 tools/ 与 docs/ 公开后，同一段判断会自动开始跑它们。
+#   * 结论：公开 CI 查得到 = 版本漂移（本 job）+ 编译（build.yml）；
+#     查不到 = 内部文档一致性（参数表 / 默认值 / CRLF / [Unreleased] / 行数引用），
+#     那要在本地完整工作区跑 `python tools/doc_lint.py`。
+#
+# 两个脚本都只用 Python 标准库（无第三方依赖），ubuntu-latest 自带的 python3 够用。
+# 本地在仓库根跑同样的命令即可复现：
+#   python ci/version_check.py -v
+#   python tools/doc_lint.py -v
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: docs (version + doc lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 探测本地保留文件（tools/、docs/）
+        id: gate
+        run: |
+          if [ -f tools/doc_lint.py ]; then
+            echo "tools=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "tools=no" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -d docs ]; then
+            echo "docs=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs=no" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f tools/doc_lint.py ] && [ -d docs ]; then
+            echo "::notice::tools/ 与 docs/ 都在树上：文档一致性检查将一并执行"
+          else
+            echo "::notice::本地保留文件（tools/、docs/）不在公开仓库：跳过文档一致性检查，版本一致性检查照常执行"
+          fi
+
+      - name: 版本一致性（ci/version_check.py，公开文件，无条件执行）
+        run: python3 ci/version_check.py -v
+
+      - name: 文档一致性（tools/doc_lint.py，仅本地完整树）
+        if: steps.gate.outputs.tools == 'yes' && steps.gate.outputs.docs == 'yes'
+        run: python3 tools/doc_lint.py -v
+
+      - name: 说明本轮查了什么 / 跳过了什么
+        if: always()
+        run: |
+          {
+            echo "## docs 检查"
+            echo
+            echo "- 版本一致性（\`ci/version_check.py\`）：**已执行** —— dkms.conf / MODULE_VERSION / CHANGELOG 最新已发布 / README 最新发布 四处必须一致。"
+            if [ "${{ steps.gate.outputs.tools }}" = "yes" ] && [ "${{ steps.gate.outputs.docs }}" = "yes" ]; then
+              echo "- 文档一致性（\`tools/doc_lint.py\`）：**已执行**（CRLF / 表格 / 参数表 / 默认值 / [Unreleased] / 行数引用）。"
+            else
+              echo "- 文档一致性（\`tools/doc_lint.py\`）：**已跳过** —— \`tools/\` 与 \`docs/\` 是本地保留目录（见 .gitignore），公开 CI 树上不存在。"
+              echo "  - 公开 CI 查得到：版本漂移（本 job）、编译（build.yml）。"
+              echo "  - 公开 CI 查不到：内部文档的参数表 / 默认值 / CRLF / [Unreleased] / 行数引用 —— 本地完整工作区跑 \`python tools/doc_lint.py\`。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

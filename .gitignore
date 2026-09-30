@@ -120,3 +120,7 @@ hosts.yml
 *~
 .DS_Store
 Thumbs.db
+
+# ---- Python 缓存（ci/ 与 scripts/ 下都有 Python 脚本）------------------------
+__pycache__/
+*.pyc
