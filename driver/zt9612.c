@@ -1564,7 +1564,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 {
 	struct sk_buff *done[ZT_AGG_SUBFRAMES];
 	size_t off[ZT_AGG_SUBFRAMES];
-	int i, k = 0, sub = 0, ret, sent = 0, total = 0;
+	int i, k = 0, sub = 0, ret, sent = 0, total = 0, stop = n;
 	u8 *buf = z->tx;			/* 聚合缓冲：与 z->txd 分开，互不干扰 */
 	bool dropping = false;
 
@@ -1600,8 +1600,14 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		}
 
 		if (!eligible) {
-			/* 不该进聚合路径：单发；先把已攒的冲出去 */
+			/*
+			 * 不该进聚合路径：先把已攒的冲出去；stop 记住断点，
+			 * 本帧及之后由函数尾部的单帧循环处理。
+			 * （此前这里直接 break 返回：断点后的帧既没发出也没释放，
+			 * 静默丢失 + skb 泄漏 —— ARP 广播在流量中间消失就是这条路径。）
+			 */
 			if (total > 0) {
+				stop = i;
 				*again = true;
 				break;
 			}
@@ -1618,7 +1624,8 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		unit = zt_tx_build(z, buf, z->tx_buf_size, total, f, flen, 0, true);
 		if (unit < 0) {
 			if (total > 0) {
-				*again = true;	/* 缓冲满：先发这一批，当前帧留到下一轮 */
+				stop = i;	/* 缓冲满：先发这一批，当前帧随尾部单帧循环发出 */
+				*again = true;
 				break;
 			}
 			z->tx_dropped++;
@@ -1701,33 +1708,21 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		}
 	}
 
-	if (total > 0) {
-		if (sub < 2) {
-			/*
-			 * 只攒到 1 个单元：**退回单帧路径**（一次 bulk 一个单元）。
-			 * 依据：`agg_block=1`（BA 会话在、但不打包）实测**完全稳定**；
-			 * 而"2 单元一次传输"必崩（1792 字节那条）。单帧没有打包收益，
-			 * 却避免把未验证的多单元形态发出去 —— 等打包形态定案后再放开。
-			 */
-			int r2 = zt_tx_frame(z, done[k - 1]->data, done[k - 1]->len);
+	if (total > 0 && sub < 2) {
+		/*
+		 * 只攒到 1 个单元：不发聚合缓冲（单单元传输与"BA 在但不打包"
+		 * 没有区别，多单元形态未定案前不冒险），全部改走尾部单帧循环。
+		 */
+		total = 0;
+		sub = 0;
+		stop = 0;
+		k = 0;
+	}
 
-			if (r2) {
-				z->tx_dropped++;
-				ieee80211_free_txskb(z->hw, done[k - 1]);
-			} else {
-				z->tx_path_frames++;
-				zt_tx_report_status(z, z->hw, done[k - 1], false);
-			}
-			k--;
-			for (i = 0; i < k; i++) {
-				z->tx_path_frames++;
-				zt_tx_report_status(z, z->hw, done[i], false);
-			}
-			return 0;
-		}
+	if (total > 0) {
 		if (agg_dump > 0) {
 			char line[3 * 64 + 4];
-			int p = 0, b;
+			int p = 0, b, u;
 			u16 fc0 = buf[8 + TX_DESC_LEN] | (buf[9 + TX_DESC_LEN] << 8);
 			u16 sc = buf[30 + TX_DESC_LEN] | (buf[31 + TX_DESC_LEN] << 8);
 
@@ -1739,8 +1734,8 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 				 sub, total, fc0, (fc0 >> 2) & 3, (fc0 >> 4) & 1,
 				 (fc0 >> 8) & 1, (fc0 >> 14) & 1, (fc0 >> 15) & 1, sc, line);
 			/* 逐单元打印**描述符 28 字节**与帧自身的 sequence control（对齐用） */
-			for (k = 0; k < sub && k < 4; k++) {
-				size_t o = off[k];
+			for (u = 0; u < sub && u < 4; u++) {
+				size_t o = off[u];
 				u16 fsc = (u16)(buf[o + 8 + TX_DESC_LEN + 22] |
 						(buf[o + 8 + TX_DESC_LEN + 23] << 8));
 
@@ -1750,7 +1745,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 						       buf[o + 8 + b]);
 				dev_info(&z->intf->dev,
 					 "aggdump: unit%d off=%zu desc=%s fseq=0x%04x\n",
-					 k, o, line, fsc);
+					 u, o, line, fsc);
 			}
 		}
 		mutex_lock(&z->lock);
@@ -1771,6 +1766,20 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		dev_info(&z->intf->dev,
 			 "tx(agg): %d 单元 / 一次传输 %d 字节（累计 %u 次 / %u MPDU）\n",
 			 sub, total, (u32)z->tx_agg_xfers, (u32)z->tx_agg_mpdus);
+	}
+
+	/*
+	 * 批次之外的帧（stop..n-1，或 sub<2 退化时的 0..n-1）：逐帧走单帧路径。
+	 * 此前这些帧在两个提前 break 分支里被静默丢弃（没发出也没释放）。
+	 */
+	for (i = stop; i < n; i++) {
+		if (zt_tx_frame(z, skb[i]->data, skb[i]->len)) {
+			z->tx_dropped++;
+			ieee80211_free_txskb(z->hw, skb[i]);
+			continue;
+		}
+		z->tx_path_frames++;
+		done[k++] = skb[i];
 	}
 
 	for (i = 0; i < k; i++) {
