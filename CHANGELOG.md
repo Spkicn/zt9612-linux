@@ -19,8 +19,19 @@
   `ieee80211_start_tx_ba_cb_irqsafe()`，停止时发 `MM_BA_DEL_REQ`(0x2A)。
   - 用户态已把两条消息验证过：**`MM_BA_ADD_CFM` 返回 status=0**（type=0、sta_idx=会话值、
     tid=0、A=64、B=0，不断言）；`MM_BA_DEL_CFM` 返回 5（语义未定，但同样不断言）。
-  - **端到端尚未验证**：上机时设备进入 D6 挂死态（`hello ack timeout` ⇒ `firmware boot
-    failed: -110`，USB 接口都没枚举出来），需**物理拔插**后才能测；开关默认关闭。
+  - **两个前提已查明**（2026-09-27，BTF + kprobe 定位）：
+    ① **必须先声明 HT**（`ht_cap_enable=1`）：mac80211 的 `ieee80211_aggr_check()` 会检查
+    对端链路能力字节，未声明 HT 时它直接返回，`start_tx_ba_session()` 永不触发；
+    ② **`MM_BA_ADD_REQ` 的 `A`（bufsz）不能为 0**：mac80211 在 `TX_START` 传的
+    `buf_size` 是 0，照发会让固件断言并 USB 掉线（"关联后约 84 ms 掉线"的真因），
+    代码里已做 `A ≥ 64` 下限保护。
+    满足这两条后链路可以真的建立起来：
+    `ampdu_action TX_START → BA_ADD_CFM status=0 → AMPDU operational (tid=0 bufsz=8)`。
+  - **仍存在的问题**：聚合生效后**一压流量就崩** —— 网关 `ping` 丢包 70%、
+    本地 `tx_blast` 中位数 3.77 Mbit/s（无聚合时约 12）、期间 2 次 USB 掉线并反复重连。
+    推断是"mac80211 交下来的是聚合后的大 skb（最多 8 子帧 ≈12 KB），而驱动仍按
+    一帧一次 bulk + 28 字节描述符发送"，固件吃不下。**默认仍为 0**，待查清 A-MPDU 的
+    封装要求后再评估。
 - **实验开关 `sta_add_en`（默认 0 = 行为与 0.3.2 完全一致）—— 固件站点会话已打通**：
   关联完成后发 `MM_STA_ADD_REQ`(0x0A)、记下 CFM 返回的 `sta_idx`，并让**加密单播数据帧**的
   描述符 `+0x09` 带上它（管理帧/广播/EAPOL 仍保持 `staid=0xff`）；断开时清理本地会话。
