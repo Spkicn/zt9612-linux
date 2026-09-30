@@ -8,8 +8,9 @@ Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB �
 
 ## 项目状态
 
-当前版本 **0.3.2**。得到的是一个 managed 模式的无线接口：双频扫描、WPA2-PSK 关联与加密、
-DHCP 与外网访问都已实机验证。
+最新发布 **0.3.2**；`[Unreleased]` 里是下一里程碑 **v0.4**（固件站点会话 + A-MPDU 聚合，
+两个实验开关默认关闭，因此默认行为与 0.3.2 完全一致）。得到的是一个 managed 模式的无线接口：
+双频扫描、WPA2-PSK 关联与加密、DHCP 与外网访问都已实机验证。
 
 | 里程碑 | 状态 |
 |---|---|
@@ -333,7 +334,14 @@ cat /sys/module/zt9612/parameters/*      # 模块参数当前值
 | `tx_desc_mask` | 0 | 实验开关：加密单播数据帧按位采用**厂商数据帧的描述符字段值**（bit1 = `+0x08`，就是那个会大幅改变微基准读数的字段）。**实测会断 DHCP，默认必须为 0**；微基准读数不等于空口吞吐，别被它骗 |
 | `ntf_log` | 0 | 实验开关：打印 EP2-IN 通知内容。实测本设备没有 EP2-IN（只有 EP4-IN + EP5-8-OUT），该通道恒为空 |
 | `sta_add_en` | 0 | 实验开关：关联后给固件发 `MM_STA_ADD_REQ`，并把固件分配的 `sta_idx` 写进**加密单播数据帧**的描述符 `+0x09`（其余帧保持"无站点"）。载荷已实测被固件接受（`STA_ADD_CFM status=0 sta_idx=N`）；**但只带 `sta_idx` 未见吞吐提升**（上传 0.38 vs 0.33 Mbit/s，噪声内），默认仍为 0 |
-| `ampdu_en` | 0 | 实验开关：A-MPDU 聚合。声明 `IEEE80211_HW_AMPDU_AGGREGATION`（**mac80211 组帧**）、TX 缓冲提到 16 KB、实现 `.ampdu_action`（`MM_BA_ADD_REQ`/`MM_BA_DEL_REQ`）。**会话能建立**：`ampdu_action TX_START → BA_ADD_CFM status=0 → AMPDU operational`，前提是同时开 `ht_cap_enable=1`、且 `bufsz` 不能为 0（为 0 时固件会断言掉线，代码已做 `A≥64` 下限保护）。**但压流量时会掉线**（网关 ping 丢包 70%、本地吞吐反降），推送路径还吃不下聚合帧 ⇒ 默认 0 |
+| `ampdu_en` | 0 | 实验开关：A-MPDU 聚合。声明 `IEEE80211_HW_AMPDU_AGGREGATION`、TX 缓冲提到 16 KB、实现 `.ampdu_action`（`MM_BA_ADD_REQ`/`MM_BA_DEL_REQ`）。**组帧在驱动里做**：mac80211 一次只给一个 MPDU，把多个 MPDU 拼进**同一次** bulk 传输是驱动的事（厂商抓包实测 EP5 传输长度 1578/3200/4808 = 1/2/3 个单元，非末尾单元固定 1608 字节槽位）。**会话能建立**（`BA_ADD_CFM status=0 → AMPDU operational`，前提是同时开 `ht_cap_enable=1`、且 `bufsz` 不能为 0），但**首次聚合传输后设备 USB 掉线** ⇒ 默认 0 |
+| `agg_stride` | 1608 | 实验开关：聚合时**非末尾单元**的固定槽位（厂商实测下一个单元恒在 +1608；0 = 紧凑拼接） |
+| `agg_dump` | 0 | 实验开关：hexdump 前 N 次聚合传输，用于与厂商抓包逐字节对比 |
+| `vendor_tmpl` | 0 | 实验开关：加密单播数据帧改用**厂商数据帧描述符模板**（`+0x02..+0x1b` 全部常量），并把 `+0x0E` 写成帧自己的 802.11 序列号。默认关闭 |
+| `agg_block` | 0 | 实验开关：保留 BA 会话但**禁止多 MPDU 打包**（实测该组合完全稳定，用于隔离"会话"与"聚合传输"） |
+| `agg_max_xfers` | 1 | 安全阀：最多尝试打包 N 次，之后退回"一次 bulk 一个 MPDU"（`0` = 不限；默认 1，避免打包缺陷把设备打成 crash-loop） |
+| `tx_dump` | 0 | 诊断：打印前 N 个交给设备的 TX 帧（长度/帧控制位/是否可聚合/序列号） |
+| `agg_dup_seq` | 0 | 实验开关：一次聚合传输内所有单元共用同一 802.11 序列号、只用 fragment 区分（标准 A-MPDU 形态） |
 
 `/dev/zt9612` 的接口约定（调试通道，非数据面）：
 

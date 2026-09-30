@@ -57,11 +57,21 @@
 #define ZT_TX_BUF_SIZE	2048		/* TX 缓冲（z->tx / z->txd） */
 #define ZT_TX_MAX_FRAME	(ZT_TX_BUF_SIZE - TX_DESC_LEN - 8)
 /*
- * 聚合实验（ampdu_en）用的更大缓冲：mac80211 自己组 A-MPDU 后，一次
- * `ieee80211_tx_dequeue()` 可能给出多个 MPDU（最大由 max_tx_aggregation_subframes 决定）。
+ * 聚合实验（ampdu_en）用的更大缓冲：**A-MPDU 由本驱动自己组帧** —— mac80211 一次
+ * `ieee80211_tx_dequeue()` 只给一个 MPDU，把多个 MPDU 拼进**同一次** bulk 传输是驱动的事
+ * （2026-09-30 从厂商上传抓包定案：EP5 的传输长度是 1608 / 3200 / 4808，
+ *  即 1/2/3 个 `WLAN`+描述符+MPDU 单元首尾相接，每个单元 8 字节对齐）。
  */
 #define ZT_AGG_BUF_SIZE		16384
 #define ZT_AGG_SUBFRAMES	8
+/* 一个 txq 每次唤醒最多做几轮"攒批 + 发送"（防止在 work 里长时间独占） */
+#define ZT_AGG_MAX_BLOCKS	16
+/*
+ * 聚合时**非末尾单元**的固定槽位（厂商实测：下一个 `WLAN` 恒在 +1608）。
+ * 1608 = 8(WLAN 头) + 28(描述符) + 1572(MPDU 上限) 且是 8 的倍数。
+ * 末尾单元只补到 8 字节对齐 ⇒ 传输长度 = (n-1)×1608 + align8(8+hlen_last)。
+ */
+#define ZT_AGG_STRIDE		1608
 /*
  * RX 缓冲必须容得下一个满尺寸的 802.11 数据帧，不能按"扫描帧都不大"来定。
  * 实测（2026-09-26）：MAX_FRAME=1024 时，ping payload ≥ 900 字节（MPDU≈968）
@@ -328,15 +338,44 @@ MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after associatio
  * 前提是**必须同时 `ht_cap_enable=1`**（否则 `ieee80211_aggr_check()` 直接返回，`docs/04` D16），
  * 且 `A`(bufsz) 不能为 0（mac80211 在 TX_START 传 0，照发会让固件断言并 USB 掉线，`docs/04` D15）。
  *
- * **但仍不可用**：一压流量就崩 —— 网关 ping 丢包 70%、`tools/tx_blast.py` 中位数 3.77 Mbit/s
- * （无聚合时约 12）、期间 2 次 USB 掉线重连。推断原因：mac80211 交下来的是**聚合后的大 skb**，
- * 而本驱动仍按"一帧一次同步 bulk + 28 字节描述符"发，固件吃不下。
- * ⇒ **默认关闭**；真正的下一步是搞清**固件对 A-MPDU 的封装/推送语义**（先抓一次聚合帧的
- * 长度与描述符，或拿到官方实现），而不是继续调参数。
+ * **但仍不可用（2026-09-30 前）**：一压流量就崩 —— 网关 ping 丢包 70%、`tools/tx_blast.py`
+ * 中位数 3.77 Mbit/s（无聚合时约 12）、期间 2 次 USB 掉线重连。
+ *
+ * **2026-09-30 定案并修复**：真因不是"mac80211 给了聚合 skb"（它一次只给一个 MPDU），
+ * 而是**驱动从不把多个 MPDU 拼进同一次 bulk 传输**。厂商上传抓包显示 EP5 的传输长度是
+ * 1608 / 3200 / 4808（= 1/2/3 个自描述单元，非末尾单元固定 1608 字节槽位）⇒
+ * A-MPDU 由主机在传输层组，固件只按单元逐个解析。实现见 `zt_tx_agg_send()`。
  */
 static int ampdu_en;
 module_param(ampdu_en, int, 0644);
-MODULE_PARM_DESC(ampdu_en, "experimental: enable A-MPDU aggregation (AMPDU_AGGREGATION + ampdu_action + MM_BA_ADD_REQ, 16KB TX buffer); needs ht_cap_enable=1; the BA session does establish but TX breaks under load, 0=off");
+MODULE_PARM_DESC(ampdu_en, "experimental: enable A-MPDU aggregation (AMPDU_AGGREGATION + ampdu_action + MM_BA_ADD_REQ, 16KB TX buffer, driver-side multi-MPDU packing per USB transfer); needs ht_cap_enable=1; 0=off (default)");
+static uint agg_stride = ZT_AGG_STRIDE;
+module_param(agg_stride, uint, 0644);
+MODULE_PARM_DESC(agg_stride, "experimental: fixed per-unit slot for non-final units when packing several MPDUs into one bulk transfer (vendor-observed 1608; 0=compact packing)");
+static int agg_dump;
+module_param(agg_dump, int, 0644);
+MODULE_PARM_DESC(agg_dump, "experimental: hexdump the first N aggregated transfers (0=off) to compare byte-for-byte with the vendor capture");
+static int vendor_tmpl;
+module_param(vendor_tmpl, int, 0644);
+MODULE_PARM_DESC(vendor_tmpl, "experimental: use the vendor's exact DATA-frame descriptor template (a +0x02..+0x1b, fa-then-fe seq) and its i16/flen field, instead of the management-frame template; 0=off");
+static int agg_block;
+module_param(agg_block, int, 0644);
+MODULE_PARM_DESC(agg_block, "experimental: keep the BA session (ampdu_en=1) but BLOCK multi-MPDU packing, so data frames still go one-per-bulk (isolates 'BA session' from 'aggregated transfer' as the crash cause); 0=off");
+/*
+ * 默认只允许 **1 次** 聚合传输：即 `ampdu_en=1` 时把第一个数据帧按聚合格式发出、
+ * 之后立即退回单帧路径。原因：多单元打包目前**必崩**（2026-09-30，见
+ * `re/AMPDU_PUSH_STATUS.md`），默认放开会让 `ampdu_en=1` 直接把设备打成挂死态。
+ * 要继续做实验就显式调大（`agg_max_xfers=20`）—— 崩了也只会崩一次，不会 crash-loop。
+ */
+static int agg_max_xfers = 1;
+module_param(agg_max_xfers, int, 0644);
+MODULE_PARM_DESC(agg_max_xfers, "experimental: stop packing after N aggregated transfers and fall back to one-MPDU-per-bulk (0=unlimited, default 1 = never actually multi-pack); safety valve so a broken packing cannot crash-loop the device");
+static int tx_dump;
+module_param(tx_dump, int, 0644);
+MODULE_PARM_DESC(tx_dump, "experimental: log the first N TX frames handed to the device (len/fc/prot/mcast/eligibility), to see what mac80211 is actually giving us");
+static int agg_dup_seq;
+module_param(agg_dup_seq, int, 0644);
+MODULE_PARM_DESC(agg_dup_seq, "experimental: give every unit in one aggregated transfer the SAME 802.11 sequence number (differing only in the fragment field), which is the normal A-MPDU shape; 0=off (each unit keeps its own sequence)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -407,6 +446,12 @@ struct zt_dev {
 	unsigned long		ba_add_fail;
 	unsigned long		ba_rx_start;
 	unsigned long		ba_rx_stop;
+	unsigned long		tx_agg_xfers;	/* 聚合：一次传输里装多个 MPDU 的次数 */
+	unsigned long		tx_agg_mpdus;	/* 聚合：被聚合发送的 MPDU 总数 */
+	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
+	unsigned long		tx_agg_multi;	/* 聚合：真正装了 >1 个单元的传输次数 */
+	u16			agg_seq;	/* agg_dup_seq：本次传输共用的序列号 */
+	u8			agg_frag;	/* agg_dup_seq：分片号（逐单元 +1） */
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -1264,30 +1309,43 @@ static void zt_dbg_init(struct zt_dev *z)
 }
 
 /*
- * 把一条 802.11 帧交给设备发送：EP5-OUT。
- * 线上格式与其它帧一致：WLAN 头 + 28 字节描述符 + 802.11 帧，
+ * 前置声明：zt_tx_report_status() 在上传脚本区、zt_mac_wake_tx_queue() 在文件下半部分，
+ * 而 TX 路径（本段）要用到它们。
+ */
+static void zt_tx_report_status(struct zt_dev *z, struct ieee80211_hw *hw,
+				struct sk_buff *skb, bool legacy);
+static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
+
+/*
+ * 把一条 802.11 帧拼进 TX 传输缓冲：`WLAN` 头 + 28 字节描述符 + 802.11 帧。
  * 其中 WLAN 头的 hlen = 28 + 帧长（抓包实测：111 字节的 probe request → hlen=139）。
  * 第 9 轮教训：漏掉 WLAN 头直接发描述符会让固件断言、设备复位回 ROM 模式。
+ *
+ * `at` 是**本次传输内的写入偏移**：0 = 第一个单元，>0 = 追加（聚合）。
+ * `stride` 是**非末尾单元之间的固定推进量**（厂商实测 1608 字节槽位；0 = 紧凑拼接），
+ * `last` 为真表示这是本次传输的最后一个单元（只补到 8 字节对齐）。
+ * 本函数**不做 USB 传输**，由调用者（zt_tx_frame / zt_tx_agg_send）决定何时发。
+ *
+ * 返回写入后的总长度（含补齐），失败返回负值。
  */
-static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
+static int zt_tx_build(struct zt_dev *z, u8 *buf, size_t buf_size, size_t at,
+		       const u8 *frame, u16 flen, size_t stride, bool last)
 {
-	u8 *buf = z->txd;
+	size_t total = at;
 	u8 *d;
-	u16 total;
-	int ret, sent = 0;
 
-	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
-		return -ENODEV;
-	if (flen < 10 || flen > (int)(z->tx_buf_size - TX_DESC_LEN - 8))
+	if (!buf || flen < 10)
 		return -EINVAL;
 
 	if (tx_variant == 2) {
 		/* 变体 2：不带描述符，只发 WLAN 头 + 帧 */
-		memcpy(buf, "WLAN", 4);
-		put_unaligned_le16(flen, buf + 4);
-		put_unaligned_le16(TX_TYPE_DATA, buf + 6);
-		memcpy(buf + 8, frame, flen);
-		total = 8 + flen;
+		if (total + 8 + flen > buf_size)
+			return -ENOSPC;
+		memcpy(buf + total, "WLAN", 4);
+		put_unaligned_le16(flen, buf + total + 4);
+		put_unaligned_le16(TX_TYPE_DATA, buf + total + 6);
+		memcpy(buf + total + 8, frame, flen);
+		total += 8 + flen;
 	} else {
 		/*
 		 * 描述符按 802.11 帧类型选模板（2026-09-27 定案，见 re/EXPERIMENT_TX_RATE.md）：
@@ -1318,9 +1376,22 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		 */
 		bool mcast = (flen >= 5) && (frame[4] & 0x01);
 
-		d = buf + 8;
+		if (total + 8 + TX_DESC_LEN + flen > buf_size)
+			return -ENOSPC;
+		d = buf + total + 8;
 		memset(d, 0, TX_DESC_LEN);
+		/*
+		 * +0x00 = 0xffffffff（与厂商逐字节一致），+0x04 = 本帧长度。
+		 */
 		put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
+		/*
+		 * +0x04 = 本帧长度。**必须写**（2026-09-30 更正）：
+		 *   - 厂商 probe request（re/ 里的 vendor_probe_139）在此处是 0x006f = 111 = 帧长；
+		 *   - 厂商**数据帧**（vendor_upload.pcap，4808 字节三单元那条）此处是 0x0000，
+		 *     但那是因为它用了另一套数据模板，该 2 字节在其模板里另有含义；
+		 *   - 实测（2026-09-30）：去掉这次写入后**管理帧认证直接超时**（关联不上）⇒ 写回。
+		 * 单帧/多帧都一样写，聚合时每个单元各自携带自己的长度。
+		 */
 		put_unaligned_le16(flen, d + 4);
 		/* 先按厂商管理帧模板（我们一直以来的行为） */
 		put_unaligned_le16(0x0700, d + 6);
@@ -1334,9 +1405,68 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 			put_unaligned_le16((u16)z->sta_idx, d + 8);
 		else
 			put_unaligned_le16(0xff00, d + 8);
-		put_unaligned_le16(0x0005, d + 10);
-		put_unaligned_le16(z->tx_seq++, d + 14);
-		put_unaligned_le16(0x003f, d + 26);
+		/*
+		 * +0x0E = 802.11 序列号（= MAC 头 sequence control >> 4）。
+		 *
+		 * 依据（厂商 4808 字节三单元那条）：单元 0/1/2 的 +0x0E 是 0x0296/0x0297/0x0298，
+		 * 逐单元 +1，且与各自 MAC 头的 sequence control 一致 ⇒ 这是**帧自己的序号**，
+		 * 不是驱动自增计数器。我们此前写 `z->tx_seq++`（与帧头无关），
+		 * 聚合时多个单元的序号既不连续也不匹配帧头，固件很可能据此断言。
+		 * 这里改成：以帧自身的 sequence control 为准（若更小则与 z->tx_seq 取较大者，
+		 * 避免重放旧序号），并把它同步写回 MAC 头，保证"描述符序号 == 帧序号"。
+		 */
+		{
+			u16 fseq = (flen >= 24) ?
+				(u16)(((frame[22] | (frame[23] << 8)) >> 4) & 0xfff) : 0;
+			u16 seq = (fseq >= (u16)(z->tx_seq & 0xfff)) ? fseq
+								     : (u16)(z->tx_seq & 0xfff);
+			u16 sc;
+
+			/*
+			 * agg_dup_seq=1：一次聚合传输里的所有单元共用**同一个序列号**，
+			 * 只用 fragment 字段区分（0,1,2…）—— 这才是 A-MPDU 的标准形态
+			 * （同一 PSDU 的多个 MPDU 属于同一个序列号的不同分片）。
+			 * 实测：我们原来给两个单元 0 和 1（相邻序号）后固件必崩。
+			 */
+			if (agg_dup_seq && z->agg_seq != 0) {
+				seq = z->agg_seq & 0xfff;
+				sc = (u16)((seq << 4) | (z->agg_frag++ & 0x0f));
+			} else {
+				sc = (u16)(seq << 4);
+				z->tx_seq = seq + 1;
+			}
+			put_unaligned_le16(sc, d + 14);
+			if (flen >= 24) {
+				u8 *fh = d + TX_DESC_LEN;	/* MAC 头起点 */
+
+				fh[22] = (u8)(sc | (fh[22] & 0x0f));
+				fh[23] = (u8)(sc >> 8);
+			}
+		}
+		put_unaligned_le16(vendor_tmpl ? 0x0000 : 0x003f, d + 26);
+		if (vendor_tmpl && is_data && protected && !mcast) {
+			/*
+			 * 厂商**数据帧**模板（2026-09-30 逐字节提取：样本 1888/3200/4152/4808
+			 * 四种传输、共 10 个单元，除 +0x04 与本序号外**全部恒定**）：
+			 *   +0x02 ffff | +0x04 flen | +0x06 0000 | +0x08 0000 | +0x0a 1312
+			 *   +0x0c 0040 | +0x0e seq  | +0x10 0000 | +0x12 0000 | +0x14 0200
+			 *   +0x16 0000 | +0x18 0000 | +0x1a 7540
+			 * 其中 +0x04 = **MPDU 长**（1550 = hlen - 28，我们写的 flen 正是这个值）。
+			 * 只用于**已加密单播数据帧**：管理帧/EAPOL/广播继续走管理模板
+			 * （厂商抓包里没有这些帧的数据模板样本，实测数据模板会让 DHCP 拿不到地址）。
+			 */
+			put_unaligned_le16(0xffff, d + 2);
+			put_unaligned_le16(0x0000, d + 6);
+			put_unaligned_le16(0x0000, d + 8);
+			put_unaligned_le16(0x1312, d + 10);
+			put_unaligned_le16(0x0040, d + 12);
+			put_unaligned_le16(0x0000, d + 16);
+			put_unaligned_le16(0x0000, d + 18);
+			put_unaligned_le16(0x0200, d + 20);
+			put_unaligned_le16(0x0000, d + 22);
+			put_unaligned_le16(0x0000, d + 24);
+			put_unaligned_le16(0x7540, d + 26);
+		}
 		/*
 		 * 实验：加密单播数据帧按位采用厂商**数据帧**的字段值（见 tx_desc_mask 注释）。
 		 * 广播/组播仍用管理模板：厂商抓包里 96107 条数据帧全是单播，且实测加密广播
@@ -1358,22 +1488,56 @@ static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
 		}
 		memcpy(d + TX_DESC_LEN, frame, flen);
 
-		memcpy(buf, "WLAN", 4);
-		put_unaligned_le16(TX_DESC_LEN + flen, buf + 4);
-		put_unaligned_le16(TX_TYPE_DATA, buf + 6);
-		total = 8 + TX_DESC_LEN + flen;
+		memcpy(buf + total, "WLAN", 4);
+		put_unaligned_le16(TX_DESC_LEN + flen, buf + total + 4);
+		put_unaligned_le16(TX_TYPE_DATA, buf + total + 6);
+		total += 8 + TX_DESC_LEN + flen;
 	}
 	/*
-	 * 抓包实测：EP5 的传输长度是 8 的倍数（147→152、138→144），不足处补零。
-	 * 变体 3 则补齐到 512（批量端点包长的整数倍）。
+	 * 单元之间的推进量（stride）—— **与厂商逐字节一致**（2026-09-30 定案）：
+	 *   厂商不是紧凑拼接，而是给**每个非末尾单元固定 1608 字节槽位**
+	 *   （下一个 `WLAN` 恒在 +1608），只有末尾单元才用 align8(8+hlen)。
+	 *   传输长度公式：`(n-1) × 1608 + align8(8 + hlen_last)`。
+	 *   证据：vendor_upload.pcap 里 1578/3200/4808 三种长度 × 全部单元 10/10 一致
+	 *   （4808 = 2×1608 + 1592），见 re/REPORT_AMPDU_PUSH.md §5。
+	 *   1608 = 8(WLAN头) + 28(描述符) + **1572** + 补齐 ⇒ 非末尾单元的 MPDU 上限 1572。
+	 * `last` 为真（单帧或聚合的最后一帧）时只补到 8 的倍数。
 	 */
-	if (tx_variant == 3) {
-		while (total & 0x1ff)
+	{
+		size_t gran = (tx_variant == 3) ? 512 : 8;
+
+		if (!last && stride) {
+			if ((size_t)at + stride > buf_size)
+				return -ENOSPC;
+			while (total < (size_t)at + stride) {
+				if (total >= buf_size)
+					return -ENOSPC;
+				buf[total++] = 0;
+			}
+		}
+		while (total & (gran - 1)) {
+			if (total >= buf_size)
+				return -ENOSPC;
 			buf[total++] = 0;
-	} else {
-		while (total & 7)
-			buf[total++] = 0;
+		}
 	}
+	return (int)total;
+}
+
+/*
+ * 单帧发送路径（管理帧、EAPOL、广播，以及 ampdu_en=0 时的全部帧）：一次 bulk 一个单元。
+ */
+static int zt_tx_frame(struct zt_dev *z, const u8 *frame, u16 flen)
+{
+	u8 *buf = z->txd;
+	int total, ret, sent = 0;
+
+	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
+		return -ENODEV;
+
+	total = zt_tx_build(z, buf, z->tx_buf_size, 0, frame, flen, 0, true);
+	if (total < 0)
+		return total;
 
 	ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
 			   buf, total, &sent, 1000);
@@ -1399,6 +1563,249 @@ static int zt_tx_raw(struct zt_dev *z, const u8 *wlan_frame, u16 total)
 		return ret;
 	}
 	z->tx_frames++;
+	return 0;
+}
+
+/*
+ * 聚合发送（ampdu_en=1）：把 n 个已加密单播数据 MPDU 拼进**同一次** bulk 传输。
+ *
+ * 依据（2026-09-30，厂商上传抓包 re/captures/vendor_upload.pcap，EP5 共 96107 条传输）：
+ *   传输长度只有 1608 / 3200 / 4808 三种众数，且 4808 = 3 × 1608；
+ *   每个单元是 `"WLAN" + u16 hlen + u16 type + 28B 描述符 + MPDU`，hlen = 28 + MPDU 长，
+ *   单元之间**没有** 802.11 MPDU delimiter、也没有额外的长度表。
+ *   ⇒ 固件期望"一次传输 = 一串自描述单元"，**A-MPDU 由主机自己组**。
+ * 我们此前每个 MPDU 单独一次 bulk（1578 → 1578 → …），固件永远收不到聚合，
+ * 压流量时链路崩掉（丢包 70%、USB 掉线）。
+ *
+ * 只聚合**已加密的单播数据帧**：EAPOL（未加密数据帧）、管理帧、广播一律走单帧路径，
+ * 与 zt_tx_build 的"帧身份"判断保持同一套，避免把四次握手/会话维护帧带进聚合。
+ *
+ * 返回 0 表示 skb 的所有权已转移（已上报 TX status 或已释放）。
+ */
+static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *again)
+{
+	struct sk_buff *done[ZT_AGG_SUBFRAMES];
+	size_t off[ZT_AGG_SUBFRAMES];
+	int i, k = 0, sub = 0, ret, sent = 0, total = 0;
+	u8 *buf = z->tx;			/* 聚合缓冲：与 z->txd 分开，互不干扰 */
+	bool dropping = false;
+
+	*again = false;
+	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
+		dropping = true;
+
+	/* 第一遍：紧凑排列各单元，记下每个单元的起始偏移 */
+	for (i = 0; i < n && !dropping; i++) {
+		u8 *f = skb[i]->data;
+		u16 flen = skb[i]->len;
+		bool is_data = (flen >= 2) && ((f[0] & 0x0c) == 0x08);
+		bool prot = (flen >= 2) && (f[1] & 0x40);
+		bool mcast = (flen >= 5) && (f[4] & 0x01);
+		/*
+		 * 聚合资格（2026-09-30 收紧）：
+		 *   ① 加密单播数据帧（Protected 位 且 非组播）；
+		 *   ② 长度 ≤ 1572（= 1608 槽位 - 8 WLAN 头 - 28 描述符）；
+		 * 只有同时满足的帧才参与聚合，其余走单帧路径（已验证稳定）。
+		 * 实证动机：首次聚合传输（1792 字节）里混进了一个"标记为加密、
+		 * 但长度只有 138/394 字节"的数据帧，混合传输后固件立刻断言掉线；
+		 * 厂商抓包里 96107 条数据帧**全是单播**，没有这种混合样本。
+		 */
+		bool eligible = is_data && prot && !mcast && (flen <= 1572);
+		int unit;
+
+		if (tx_dump > 0) {
+			tx_dump--;
+			dev_info(&z->intf->dev,
+				 "txdump: len=%u fc=0x%04x data=%u prot=%u mcast=%u eligible=%u fseq=0x%04x\n",
+				 flen, (u16)(f[0] | (f[1] << 8)), is_data, prot, mcast, eligible,
+				 (u16)((f[22] | (f[23] << 8)) & 0xffff));
+		}
+
+		if (!eligible) {
+			/* 不该进聚合路径：单发；先把已攒的冲出去 */
+			if (total > 0) {
+				*again = true;
+				break;
+			}
+			if (zt_tx_frame(z, f, flen)) {
+				z->tx_dropped++;
+				ieee80211_free_txskb(z->hw, skb[i]);
+				continue;
+			}
+			z->tx_path_frames++;
+			done[k++] = skb[i];
+			continue;
+		}
+
+		/*
+		 * agg_dup_seq：本次传输共用的序列号 = 第一个单元的序列号；
+		 * 之后每个单元的 fragment 依次 +1（标准 A-MPDU 形态）。
+		 */
+		if (agg_dup_seq && sub == 0)
+			z->agg_seq = (u16)(((f[22] | (f[23] << 8)) & 0xfff0) | 0x0001);
+
+		unit = zt_tx_build(z, buf, z->tx_buf_size, total, f, flen, 0, true);
+		if (unit < 0) {
+			if (total > 0) {
+				*again = true;	/* 缓冲满：先发这一批，当前帧留到下一轮 */
+				break;
+			}
+			z->tx_dropped++;
+			ieee80211_free_txskb(z->hw, skb[i]);
+			continue;
+		}
+		off[sub] = total;
+		total = unit;
+		done[k++] = skb[i];
+		sub++;
+	}
+
+	if (dropping) {
+		for (i = 0; i < n; i++) {
+			z->tx_dropped++;
+			ieee80211_free_txskb(z->hw, skb[i]);
+		}
+		return -ENODEV;
+	}
+
+	/*
+	 * 计数在**尝试之前**自增：`agg_max_xfers` 限的是"尝试打包多少次"，
+	 * 而不是"成功多少次" —— 崩掉的那次传输永远不会走到成功路径的计数
+	 * （实测踩坑：用成功计数当上限时，`agg_max_xfers=1` 完全拦不住它）。
+	 */
+	if (z->tx_agg_attempts < 0xffff)
+		z->tx_agg_attempts++;
+	if (sub > 1)
+		z->tx_agg_multi++;
+
+	/*
+	 * 第二遍：把**非末尾单元**补齐到固定槽位 ZT_AGG_STRIDE
+	 * （厂商实测：下一个 `WLAN` 恒在 +1608；末尾单元只补到 8 字节对齐）。
+	 * 用 memmove 逐个后移，避免第一遍就要预留槽位。
+	 */
+	for (i = 0; i + 1 < sub; i++) {
+		size_t want = off[i] + agg_stride;
+		size_t have = off[i + 1];
+		size_t tail = (size_t)total - have;
+
+		if (want < have)
+			continue;			/* 单元比槽位还大：保持紧凑 */
+		if (want + tail > z->tx_buf_size) {
+			dev_warn_ratelimited(&z->intf->dev,
+					     "tx(agg): 槽位补齐超出缓冲，按紧凑格式发送\n");
+			break;
+		}
+		if (want > have) {
+			memmove(buf + want, buf + have, tail);
+			memset(buf + have, 0, want - have);
+			total = (int)(want + tail);
+			for (k = i + 1; k < sub; k++)
+				off[k] += want - have;
+		}
+	}
+
+	/*
+	 * **关键修正（2026-09-30）**：传输长度不能是端点包长(512)的整数倍。
+	 * 批量端点上"刚好整数个最大包"时，设备无法判定传输结束、会一直等后续数据
+	 * ⇒ 固件卡住、USB 掉线（本设备 bulk-IN 是 512，EP5-OUT 同）。
+	 * 实证：我们的首次聚合传输 = **1792 = 3.5 × 512** 后立刻掉线；
+	 * 而厂商全部传输长度（1578/1888/3200/4152/4808）**没有一个是 512 的倍数**。
+	 * 处理：补到下一个 8 字节边界后，若仍是 512 的倍数，再多补 8 字节。
+	 */
+	if (total > 0 && (total & 511) == 0) {
+		if ((size_t)total + 8 > z->tx_buf_size) {
+			/*
+			 * 缓冲塞不下这 8 字节：**不能直接返回**（那样这一批 skb 既没发出也没释放，
+			 * 会泄漏），退化为"按原长发出"并告警。
+			 */
+			dev_warn_ratelimited(&z->intf->dev,
+					     "tx(agg): 传输长度 %d 是 512 的倍数但缓冲已满，按原长发送\n",
+					     total);
+		} else {
+			dev_info(&z->intf->dev,
+				 "tx(agg): 传输长度 %d 是 512 的倍数，补 8 字节避免设备等待后续数据\n",
+				 total);
+			memset(buf + total, 0, 8);
+			total += 8;
+		}
+	}
+
+	if (total > 0) {
+		if (sub < 2) {
+			/*
+			 * 只攒到 1 个单元：**退回单帧路径**（一次 bulk 一个单元）。
+			 * 依据：`agg_block=1`（BA 会话在、但不打包）实测**完全稳定**；
+			 * 而"2 单元一次传输"必崩（1792 字节那条）。单帧没有打包收益，
+			 * 却避免把未验证的多单元形态发出去 —— 等打包形态定案后再放开。
+			 */
+			int r2 = zt_tx_frame(z, done[k - 1]->data, done[k - 1]->len);
+
+			if (r2) {
+				z->tx_dropped++;
+				ieee80211_free_txskb(z->hw, done[k - 1]);
+			} else {
+				z->tx_path_frames++;
+				zt_tx_report_status(z, z->hw, done[k - 1], false);
+			}
+			k--;
+			for (i = 0; i < k; i++) {
+				z->tx_path_frames++;
+				zt_tx_report_status(z, z->hw, done[i], false);
+			}
+			return 0;
+		}
+		if (agg_dump > 0) {
+			char line[3 * 64 + 4];
+			int p = 0, b;
+			u16 fc0 = buf[8 + TX_DESC_LEN] | (buf[9 + TX_DESC_LEN] << 8);
+			u16 sc = buf[30 + TX_DESC_LEN] | (buf[31 + TX_DESC_LEN] << 8);
+
+			agg_dump--;
+			for (b = 0; b < 56 && b < total; b++)
+				p += scnprintf(line + p, sizeof(line) - p, "%02x ", buf[b]);
+			dev_info(&z->intf->dev,
+				 "aggdump: units=%d total=%d fc=0x%04x (type=%u sub=%u tods=%u prot=%u qos=%u) sc=0x%04x | %s\n",
+				 sub, total, fc0, (fc0 >> 2) & 3, (fc0 >> 4) & 1,
+				 (fc0 >> 8) & 1, (fc0 >> 14) & 1, (fc0 >> 15) & 1, sc, line);
+			/* 逐单元打印**描述符 28 字节**与帧自身的 sequence control（对齐用） */
+			for (k = 0; k < sub && k < 4; k++) {
+				size_t o = off[k];
+				u16 fsc = (u16)(buf[o + 8 + TX_DESC_LEN + 22] |
+						(buf[o + 8 + TX_DESC_LEN + 23] << 8));
+
+				p = 0;
+				for (b = 0; b < TX_DESC_LEN; b++)
+					p += scnprintf(line + p, sizeof(line) - p, "%02x",
+						       buf[o + 8 + b]);
+				dev_info(&z->intf->dev,
+					 "aggdump: unit%d off=%zu desc=%s fseq=0x%04x\n",
+					 k, o, line, fsc);
+			}
+		}
+		mutex_lock(&z->lock);
+		ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
+				   buf, total, &sent, 1000);
+		mutex_unlock(&z->lock);
+		if (ret) {
+			dev_warn(&z->intf->dev, "tx(agg): bulk OUT 失败 (%d)\n", ret);
+			for (i = 0; i < n; i++) {
+				z->tx_dropped++;
+				ieee80211_free_txskb(z->hw, skb[i]);
+			}
+			return ret;
+		}
+		z->tx_frames += sub;
+		z->tx_agg_xfers++;
+		z->tx_agg_mpdus += sub;
+		dev_info(&z->intf->dev,
+			 "tx(agg): %d 单元 / 一次传输 %d 字节（累计 %u 次 / %u MPDU）\n",
+			 sub, total, (u32)z->tx_agg_xfers, (u32)z->tx_agg_mpdus);
+	}
+
+	for (i = 0; i < k; i++) {
+		z->tx_path_frames++;
+		zt_tx_report_status(z, z->hw, done[i], false);
+	}
 	return 0;
 }
 
@@ -2232,7 +2639,35 @@ static void zt_tx_work(struct work_struct *w)
 			 * ieee80211_tx_dequeue() 带 in_softirq 断言
 			 * （踩坑记录见 docs/04 的 D14）。
 			 * RCU 只护"出队"这一步 —— 之后 USB 传输会睡眠。
+			 *
+			 * ampdu_en=1 时改用"攒一批再一次 bulk"：mac80211 一次只给一个
+			 * MPDU，把多个 MPDU 拼进同一次传输是驱动的事（zt_tx_agg_send）。
 			 */
+			if (ampdu_en && !agg_block &&
+			    (agg_max_xfers <= 0 || (int)z->tx_agg_attempts < agg_max_xfers)) {
+				struct sk_buff *batch[ZT_AGG_SUBFRAMES];
+				int cnt = 0, blk = 0;
+				bool again = false;
+
+				while (blk++ < ZT_AGG_MAX_BLOCKS) {
+					while (cnt < ZT_AGG_SUBFRAMES) {
+						rcu_read_lock();
+						skb = ieee80211_tx_dequeue_ni(z->hw, pend[i]);
+						rcu_read_unlock();
+						if (!skb)
+							break;
+						batch[cnt++] = skb;
+					}
+					if (!cnt)
+						break;
+					zt_tx_agg_send(z, batch, cnt, &again);
+					cnt = 0;
+					if (!again)
+						break;	/* 该队列已空 */
+				}
+				if (again)
+					zt_mac_wake_tx_queue(z->hw, pend[i]);	/* 还有余量：重新排队 */
+			} else
 			while (1) {
 				rcu_read_lock();
 				skb = ieee80211_tx_dequeue_ni(z->hw, pend[i]);
@@ -2626,15 +3061,16 @@ static void zt_mac_register(struct zt_dev *z)
 	}
 	if (ampdu_en) {
 		/*
-		 * 打开后 **mac80211 自己组 A-MPDU**（见 mac80211.h 对
-		 * max_tx_aggregation_subframes 的说明），驱动拿到的是聚合 skb ⇒
-		 * TX 缓冲已在 probe 里同步放大。真正开始聚合还需要与 AP 协商出
-		 * BA 会话：`ht_cap_enable=1`（要有 HT 能力）+ 我们实现 ampdu_action。
+		 * A-MPDU 聚合：**组帧在驱动里做**，不是 mac80211 做。
+		 * mac80211 只负责按对端能力/BA 会话决定"这一帧允许聚合"，
+		 * 一次 `ieee80211_tx_dequeue()` 仍只给一个 MPDU；把它们拼进同一次
+		 * bulk 传输（zt_tx_agg）才是驱动的活。厂商抓包实测：EP5 上
+		 * 1608 / 3200 / 4808 字节的传输 = 1/2/3 个单元首尾相接。
 		 */
 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
 		hw->max_tx_aggregation_subframes = ZT_AGG_SUBFRAMES;
 		dev_info(&z->intf->dev,
-			 "experimental: A-MPDU 聚合已启用（mac80211 组帧，TX 缓冲 %u 字节，最多 %u 子帧）\n",
+			 "experimental: A-MPDU 聚合已启用（驱动组帧，TX 缓冲 %u 字节，最多 %u 子帧/传输）\n",
 			 z->tx_buf_size, ZT_AGG_SUBFRAMES);
 	}
 	hw->wiphy->max_scan_ssids = 1;
