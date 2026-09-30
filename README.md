@@ -147,15 +147,22 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 ```
 
 默认行为是安装模块到 `/lib/modules/$(uname -r)/extra/`，并写入
-`/etc/modprobe.d/zt9612-blacklist.conf`。**该文件同时挡住自动加载和 `modprobe zt9612`**
-（里面有一条 `install zt9612 /bin/true`），所以要手动加载请用：
+`/etc/modprobe.d/zt9612-blacklist.conf`，内容是**一行 `blacklist zt9612`** ——
+它**只挡住插卡/开机的自动加载，不挡手动 `modprobe`**（`--enable-autoload` 会删掉这个文件）：
 
 ```bash
-sudo modprobe --ignore-install zt9612
+sudo modprobe zt9612
 ```
 
-> 实测（2026-09-27，内核 7.0.0-34）：直接 `sudo modprobe zt9612` 会静默返回 0 且什么都不做 ——
-> 这是 `install` 守卫在起作用，不是加载失败。
+> 本项目开发文档（`docs/06` 等）里另有一个**手工**写的守卫文件，其中除了 `blacklist` 还有
+> `install zt9612 /bin/true`。那种环境下 `sudo modprobe zt9612` 会**静默返回 0 且什么都不做**
+> （实测 2026-09-27，内核 7.0.0-34），必须用：
+>
+> ```bash
+> sudo modprobe --ignore-install zt9612
+> ```
+>
+> ⚠️ 手工加过守卫的机器上，`--enable-autoload` 会**整个删除**该 blacklist 文件（连同守卫）。
 
 也可以直接用 DKMS：
 

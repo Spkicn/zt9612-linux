@@ -36,7 +36,7 @@ for arg in "$@"; do
 		--enable-autoload) ENABLE_AUTOLOAD=1 ;;
 		--dkms)            USE_DKMS=1 ;;
 		-h|--help)
-			sed -n '3,20p' "$0"; exit 0 ;;
+			sed -n '3,22p' "$0"; exit 0 ;;
 		*)
 			echo "未知参数: $arg（用 --help 看用法）"; exit 1 ;;
 	esac

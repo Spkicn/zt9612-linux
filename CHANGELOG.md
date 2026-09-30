@@ -101,10 +101,12 @@
 - **上传吞吐（旧结论已作废）**：此前测得的"TX 字节率上限 6.2–7.2 Mbit/s"是**管理帧模板**下的
   结果，不代表设备能力 —— 厂商同链路 95.3 Mbit/s。"URB 流水线无用"的结论仍然成立
   （4 进程并发反而更低）。详见 `re/EXPERIMENT_TX_RATE.md`。
-- **让速率控制真的能爬升（优先级高）**：5GHz 实测显示 `station dump` 的速率长期停在
-  MCS 0 —— 不是能力位不够，而是驱动不给反馈。需要 ①补 `ampdu_action` 与真实 TX 反馈
-  （现有 `tx_status` 只能乐观探测 ACK），②有 `ht_cap_enable` 的开关可复用。
-  注意 `docs/09` 阶段 D 的红线：动 HT/聚合前先单独验证 `sta_add/ampdu_action`。
+- **让速率控制真的能爬升（已收窄，勿再重复劳动）**：5GHz 实测显示 `station dump` 的速率长期停在
+  MCS 0。结论：**这不是驱动侧能解的问题**（见 `[0.3.0]`：主机侧无法影响发射速率）；
+  v0.4 已把当时设想的两件事都实装并实机跑过 —— `.ampdu_action`（`ampdu_en`）与
+  `ht_cap_enable`，见上面的 Added。**唯一剩下的卡点是 A-MPDU 的推送/封装语义**
+  （mac80211 交下聚合 skb，驱动仍一帧一次 bulk + 28 字节描述符 ⇒ 压流量掉线），
+  需要抓一次聚合帧的长度/描述符或拿到官方实现，不是继续调参数。
 - **厂商渠道（最高优先级）**：索取官方 Linux 驱动包，或**含 RAM 段代码的完整固件** ——
   现有 219 KB 镜像里没有速率控制代码（指针表指向段外），这是唯一还能打开
   "主机影响发射速率"通道的路径
@@ -192,6 +194,8 @@
     吞吐 2.4 GHz 4.16 → 5 GHz **9.00 Mbit/s**，强信号 5 GHz BSS（−26 dBm）**12.10 Mbit/s**。
   - **对照**：同一张卡在厂商 Windows 驱动下 5 GHz 为 13.37–18.21 Mbit/s（本版仍略低，
     候选原因是本驱动未声明 HT/VHT；**尚未验证**）。
+    > **后续**：该候选已被证伪 —— 声明 HT 只有约 1.14×、与漂移同量级，见本节下面的更正段
+    > 与 `[Unreleased]` 的 `ht_cap_enable` 条目（`re/EXPERIMENT_HT_VHT.md`）。
 - **同时更正两条旧结论**（README 已同步）：
   - M3.5「5 GHz 已完成并实机验证」当时的证据（"59 个 BSS 中 7 个在 5GHz"）是频点错误标注的产物，
     5 GHz 关联在此之前从未发生过；
@@ -379,7 +383,7 @@ ARRM 更大选速空间，是唯一剩下的驱动侧手段"，随后论证为**
 ### Added
 - **WPA2 关联、加密与端到端联网打通（M3 验收全部达成）**：连接 WPA2-PSK 热点实测
   关联 226 ms、四次握手 344 ms、`WPA: Key negotiation completed [PTK=CCMP GTK=CCMP]`，
-  `wpa_cli status` 报 `wpa_state=COMPLETED`；随后 DHCP 拿到 `192.168.43.8/24`（租约 6 h），
+  `wpa_cli status` 报 `wpa_state=COMPLETED`；随后 DHCP 拿到 `192.168.x.y/24`（租约 6 h），
   `ping` 网关 3/4、`ping 223.5.5.5` 3/3（48–69 ms）、`ping 8.8.8.8` 3/3（54–82 ms），
   全程 0 条 Oops/WARNING。**本项驱动零改动**：mac80211 自带默认加密套件表
   （`iw phy info` 列出 WEP/TKIP/CCMP/GCMP 共 7 个），且 `set_key` 为空时自动回退软件加密

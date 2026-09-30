@@ -297,7 +297,8 @@ MODULE_PARM_DESC(tx_desc_mask, "experimental: bitmask of vendor DATA-frame descr
  *
  * 但**吞吐没变**：A/B（同一 AP）上传 0.38 vs 0.33 Mbit/s、下载 3.99 vs 3.71，都在噪声内
  * ⇒ 只让描述符带上 `sta_idx` **不足以**打开厂商的 95 Mbit/s 快路径（见 CHANGELOG [Unreleased]）。
- * 因此默认仍为 0；下一步是聚合（`ampdu_en`），不要再在这里盲试载荷常量：
+ * 因此默认仍为 0；聚合已经实装（`ampdu_en`，见下面的注释与 CHANGELOG `[Unreleased]`），
+ * 剩下的卡点是 **A-MPDU 的推送/封装语义**。不要再在这里盲试载荷常量：
  * 改 `+0x00 format` 之类会直接被固件在 `rc.c:676` 断言（实测），BA/STA 的新消息一律
  * "先打日志、再发一条、一次一个变量"。
  */
