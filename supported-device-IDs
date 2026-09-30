@@ -30,7 +30,7 @@ FCC ID: 2BOBE-ZT9612UV10
    350b:9612   bcdDevice 0x0200，iProduct "802.11ax 2x2 WLAN Adapter"
    接口: 1 个，class FF/FF/FF（厂商自定义），5 个 512 字节批量端点
          EP4-IN(0x84) 设备->主机，EP8-OUT(0x08) 主机->设备
-   序列号: B40418000012（示例，随卡不同）
+   序列号: 每张卡不同（形如 XXXXXXXXXXXX，本仓库不记录真实值）
 
    注意：切换后 ROM 只留出**秒级**窗口接受固件下载，所以要"插上就切、切完就加载"。
 

@@ -1,6 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * zt9612_fw.c - M1: firmware loader for ZT9612U (ZTOP / 兆通微 ACEV100) USB WiFi adapter
+ *
+ * 历史文件：M1 阶段的独立固件装载模块，**未编入当前构建**
+ * （`driver/Makefile` 只编 `zt9612.o`，功能已并入 `zt9612.c`），保留供对照与复用。
  *
  * 协议来自 USB 抓包 + 静态逆向，逐字节验证（见 zt9612-linux/re/REPORT*.md）：
  *   握手 0x0201 -> 488B 块 (0x0200) xN -> 末块 0x0204(整段 XOR16) -> 配置块 -> RUN(0x0200 sub 0x05)
