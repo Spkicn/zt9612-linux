@@ -53,7 +53,7 @@
   用的描述符常量与我们不同**（我们的值全部抄自**管理帧**/扫描 probe request）。逐字段二分：
   单改 `+0x08`（0xff00 → 0x0000）就能把 `ZT_IOC_TXRAW` 微基准读数从 6.67 拉到 178.88 Mbit/s。
   - **但那个读数不是吞吐，已用功能判据证实**：A/B/A 实测 `+0x08` 一改，
-    **关联正常但 DHCP 拿不到地址**（0x02→无 IP / 0x00→172.20.17.191，两次交替复现）。
+    **关联正常但 DHCP 拿不到地址**（0x02→无 IP / 0x00→拿到 DHCP 地址 `172.20.x.y`，两次交替复现）。
     新增 ARP 判据（`tools/arp_oracle.py`：清 ARP 表 → 发指定描述符的 ARP 请求 → 看网关回不回）
     给出直接证据：**管理模板能收到网关 ARP 回复；`mask=0x02` 与厂商完整模板 `mask=0x3F`
     都收不到任何回复** ⇒ 那些配置下帧**根本没上过空口**，设备只是"接收/丢弃得更快"。
@@ -85,7 +85,8 @@
   （到 2012），这些调试通道漏了，导致**帧长相关的实验会直接 `EINVAL` 且看不出原因**
   （本次做 TX 微基准时就撞上：1436 字节传输被拒）。现统一为 `ZT_TX_BUF_SIZE`（2048）。
 - **公开文档与 0.3.1/0.3.2 的事实对齐**：`zt9612.conf` 补上随后新增的 3 个参数
-  （`ht_cap_enable`、`tx_desc_mask`、`ntf_log`，现共 12 个）；`README`、`FAQ`、`CONTRIBUTING`
+  （`ht_cap_enable`、`tx_desc_mask`、`ntf_log`，当时共 12 个；**后续**：`[Unreleased]` 又加入
+  `sta_add_en`/`ampdu_en`，现共 **14** 个）；`README`、`FAQ`、`CONTRIBUTING`
   移除已被 [0.3.2] 更正的"**设备收帧上限约 1030 字节**"表述（实为驱动 TX 侧上限，接收侧正常），
   并把 README 路线图里同样作废的"TX 字节率上限 6.2–7.2 Mbit/s"（那是**管理帧模板**下的读数）
   改为当前的**固件站点会话**线索；给"驱动侧无可改之处"补上**只在 2.4 GHz 口径成立**的限定；
@@ -157,6 +158,9 @@
     速率控制拿不到反馈、爬不上去）；
   - 副作用：声明后 mac80211 会尝试发起 TX Block-Ack 会话，而本驱动没有 `ampdu_action`，
     触发 `WARNING: net/mac80211/agg-tx.c:623`（`docs/09` 阶段 D 预警过的风险）。
+    > **后续（[Unreleased]）**：`.ampdu_action` 已实装（`ampdu_en`，默认 0），该 WARNING
+    > 不再出现；但聚合**压流量会掉线**，所以 `ht_cap_enable`/`ampdu_en` 两个开关**仍然默认关闭**
+    > （见本文件 [Unreleased] 的 `ampdu_en` 条目与 `docs/04` D15/D16）。
   - 详细设计、判据与数据见 `re/EXPERIMENT_HT_VHT.md`。
 - **顺带更正**："5GHz 残余差距由未声明 HT/VHT 造成"这一设想**被证伪**：修好 5GHz 后本驱动
   最好成绩 15.71 Mbit/s 已落进厂商 Windows 驱动的 13.37–18.21 区间内，两边的差别
@@ -221,7 +225,8 @@
   `install-driver.sh` 的能力说明改为 v0.2.0 的真实状态（不再 grep `wlan0`，
   改为按实际接口名查找，因为接口名由 MAC 生成）、README 验收输出改用当前的 MAC 读取路径
   （**注**：此处"9 个"是当时的数量；0.3.2 与未发布改动又加入 `ht_cap_enable`/`tx_desc_mask`/
-  `ntf_log`，现共 **12** 个，`zt9612.conf` 已在 [Unreleased] 同步）
+  `ntf_log`，当时为 **12** 个，`zt9612.conf` 已在 [Unreleased] 同步；**截至 2026-09-27 为 14 个**，
+  [Unreleased] 又加入 `sta_add_en`/`ampdu_en`）
 - 公开文件（README、CHANGELOG）不再出现本机真实 MAC、AP BSSID 与 SSID，改用占位符；
   设备唯一信息只留在本地未入库的交接文档与进度日志里
 
