@@ -833,8 +833,17 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	params[1] = z->sta_idx;
 	params[2] = tid;
 	params[3] = 0;
+	/*
+	 * mac80211 在 TX_START 时给的 buf_size 可能是 0（那是"对端窗口"语义），
+	 * 而用户态实测被固件接受的是 A=64 ⇒ 这里做下限保护；两个值都打进 dmesg，
+	 * 便于和"设备是否立刻掉线"对拍（2026-09-27：带 HT 关联后 84 ms 掉线，待定位）。
+	 */
+	if (bufsz < 64)
+		bufsz = 64;
 	put_unaligned_le16(bufsz, params + 4);	/* A：候选 bufsz */
 	put_unaligned_le16(ssn, params + 6);	/* B：候选 ssn */
+	dev_info(&z->intf->dev, "BA_ADD: type=0 sta=%u tid=%u A=%u B=%u\n",
+		 z->sta_idx, tid, bufsz, ssn);
 
 	if (zt_cmd_fifo_resp(z, 0x0028, params, sizeof(params), 0x0029, 1000, resp, &rlen)) {
 		z->ba_add_fail++;
@@ -2505,6 +2514,10 @@ static int zt_mac_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 
 	switch (params->action) {
 	case IEEE80211_AMPDU_TX_START:
+		/* 记录 mac80211 给的参数：这是"设备为何立刻掉线"的第一手线索 */
+		dev_info(&z->intf->dev,
+			 "ampdu_action TX_START: tid=%u ssn=%u buf_size=%u amsdu=%d\n",
+			 params->tid, params->ssn, params->buf_size, params->amsdu);
 		if (zt_ba_add(z, (u8)params->tid, params->buf_size, params->ssn))
 			return -EIO;
 		ieee80211_start_tx_ba_cb_irqsafe(vif, sta->addr, params->tid);
