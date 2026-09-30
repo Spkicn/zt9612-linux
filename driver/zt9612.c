@@ -373,9 +373,6 @@ MODULE_PARM_DESC(agg_max_xfers, "experimental: stop packing after N aggregated t
 static int tx_dump;
 module_param(tx_dump, int, 0644);
 MODULE_PARM_DESC(tx_dump, "experimental: log the first N TX frames handed to the device (len/fc/prot/mcast/eligibility), to see what mac80211 is actually giving us");
-static int agg_dup_seq;
-module_param(agg_dup_seq, int, 0644);
-MODULE_PARM_DESC(agg_dup_seq, "experimental: give every unit in one aggregated transfer the SAME 802.11 sequence number (differing only in the fragment field), which is the normal A-MPDU shape; 0=off (each unit keeps its own sequence)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -450,8 +447,6 @@ struct zt_dev {
 	unsigned long		tx_agg_mpdus;	/* 聚合：被聚合发送的 MPDU 总数 */
 	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
 	unsigned long		tx_agg_multi;	/* 聚合：真正装了 >1 个单元的传输次数 */
-	u16			agg_seq;	/* agg_dup_seq：本次传输共用的序列号 */
-	u8			agg_frag;	/* agg_dup_seq：分片号（逐单元 +1） */
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -1406,42 +1401,25 @@ static int zt_tx_build(struct zt_dev *z, u8 *buf, size_t buf_size, size_t at,
 		else
 			put_unaligned_le16(0xff00, d + 8);
 		/*
-		 * +0x0E = 802.11 序列号（= MAC 头 sequence control >> 4）。
+		 * +0x0E = 帧自身的 802.11 序列号（12 位裸序号，不含分片位）。
 		 *
-		 * 依据（厂商 4808 字节三单元那条）：单元 0/1/2 的 +0x0E 是 0x0296/0x0297/0x0298，
-		 * 逐单元 +1，且与各自 MAC 头的 sequence control 一致 ⇒ 这是**帧自己的序号**，
-		 * 不是驱动自增计数器。我们此前写 `z->tx_seq++`（与帧头无关），
-		 * 聚合时多个单元的序号既不连续也不匹配帧头，固件很可能据此断言。
-		 * 这里改成：以帧自身的 sequence control 为准（若更小则与 z->tx_seq 取较大者，
-		 * 避免重放旧序号），并把它同步写回 MAC 头，保证"描述符序号 == 帧序号"。
+		 * 两个雷都已排掉（2026-09-30）：
+		 * ① 不能写 seq<<4：厂商证据（vendor_upload.pcap）里描述符 +0x0E
+		 *   = 0x0296，而同一帧 MAC 头 sequence control = 0x2960 —— 描述符
+		 *   装的是**裸序号**（seq_ctrl >> 4），不是 seq_ctrl 本身；
+		 *   管理帧抓包（78 个 probe）同样 = 0..77 裸计数。
+		 * ② 不能改写 MAC 头的序号：mac80211 交来的帧已被软件 CCMP 加密，
+		 *   AAD 包含序号位 —— 此前 max(fseq, z->tx_seq) 一旦让驱动计数器
+		 *   跑在帧序号前面（它连管理帧也数）就会改写帧头，
+		 *   AP 侧 MIC 校验失败、静默丢帧。
+		 * 驱动自行构造的帧（probe 重放）走 zt_tx_raw，不经过这里，
+		 * 无需驱动侧兜底序号。
 		 */
 		{
 			u16 fseq = (flen >= 24) ?
 				(u16)(((frame[22] | (frame[23] << 8)) >> 4) & 0xfff) : 0;
-			u16 seq = (fseq >= (u16)(z->tx_seq & 0xfff)) ? fseq
-								     : (u16)(z->tx_seq & 0xfff);
-			u16 sc;
 
-			/*
-			 * agg_dup_seq=1：一次聚合传输里的所有单元共用**同一个序列号**，
-			 * 只用 fragment 字段区分（0,1,2…）—— 这才是 A-MPDU 的标准形态
-			 * （同一 PSDU 的多个 MPDU 属于同一个序列号的不同分片）。
-			 * 实测：我们原来给两个单元 0 和 1（相邻序号）后固件必崩。
-			 */
-			if (agg_dup_seq && z->agg_seq != 0) {
-				seq = z->agg_seq & 0xfff;
-				sc = (u16)((seq << 4) | (z->agg_frag++ & 0x0f));
-			} else {
-				sc = (u16)(seq << 4);
-				z->tx_seq = seq + 1;
-			}
-			put_unaligned_le16(sc, d + 14);
-			if (flen >= 24) {
-				u8 *fh = d + TX_DESC_LEN;	/* MAC 头起点 */
-
-				fh[22] = (u8)(sc | (fh[22] & 0x0f));
-				fh[23] = (u8)(sc >> 8);
-			}
+			put_unaligned_le16(fseq, d + 14);
 		}
 		put_unaligned_le16(vendor_tmpl ? 0x0000 : 0x003f, d + 26);
 		if (vendor_tmpl && is_data && protected && !mcast) {
@@ -1636,13 +1614,6 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			done[k++] = skb[i];
 			continue;
 		}
-
-		/*
-		 * agg_dup_seq：本次传输共用的序列号 = 第一个单元的序列号；
-		 * 之后每个单元的 fragment 依次 +1（标准 A-MPDU 形态）。
-		 */
-		if (agg_dup_seq && sub == 0)
-			z->agg_seq = (u16)(((f[22] | (f[23] << 8)) & 0xfff0) | 0x0001);
 
 		unit = zt_tx_build(z, buf, z->tx_buf_size, total, f, flen, 0, true);
 		if (unit < 0) {
