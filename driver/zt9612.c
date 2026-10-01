@@ -532,6 +532,7 @@ struct zt_dev {
 	/* 实验：固件密钥（见 key_en / key_rx_en，re/DRIVER_PROGRESS.md 第 19 轮） */
 	bool			key_installed;	/* 任一 KEY_ADD 成功后置位，断开清除 */
 	u8			key_cipher_fw;	/* 最后装入的固件 cipher（RX 剥离臂用） */
+	u8			key_hw_idx;	/* KEY_ADD_CFM 回的固件 key 槽位（DEL 用） */
 	unsigned long		key_add_ok;
 	unsigned long		key_add_fail;
 	unsigned long		key_del_skip;	/* DISABLE_KEY 未下发固件的次数 */
@@ -1107,9 +1108,10 @@ static u8 zt_cipher_fw(u32 cipher)
  * 时序：mac80211 在 4-way EAPOL 之后调 set_key（进程上下文，可睡眠）；
  * pairwise 必须在 STA_ADD 建立会话之后（z->sta_valid）。
  *
- * DISABLE_KEY：MM_KEY_DEL_REQ(0x26) 载荷未逆向，暂不下发（key_del_skip 计数）
- * —— 固件 key 表残留风险由断开时的 STA_DEL 级联回收兜底；重连后 hw_key_idx
- * 若持续增长（18→19→…）就是残留实证，届时再逆向 0x26。
+ * DISABLE_KEY → MM_KEY_DEL_REQ(0x26)，载荷 = **1 字节 hw_key_idx**（厂商
+ * rwnx_send_key_del 逐字确认：`key_del_req->hw_key_idx = hw_key_idx;` 且 CFM
+ * 0x27 不取出参）—— 与 zt_sta_del 的 1 字节形态同型。hw_key_idx 来自本会话
+ * KEY_ADD_CFM；无会话记录时静默跳过。
  */
 static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 			  struct ieee80211_vif *vif, struct ieee80211_sta *sta,
@@ -1135,7 +1137,24 @@ static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	}
 
 	if (cmd == DISABLE_KEY) {
-		z->key_del_skip++;
+		u8 resp2[4];
+		u16 rlen2 = 0;
+
+		if (!z->key_installed) {
+			z->key_del_skip++;
+			return 0;
+		}
+		ret = zt_cmd_fifo_resp(z, 0x0026, &z->key_hw_idx, 1,
+				       0x0027, 300, resp2, &rlen2);
+		if (ret) {
+			dev_warn(&z->intf->dev,
+				 "KEY_DEL: no CFM for hw_key_idx=%u\n",
+				 z->key_hw_idx);
+			return 0;	/* 删除失败不上抛（mac80211 仍会拆 key） */
+		}
+		dev_info(&z->intf->dev, "KEY_DEL_CFM: hw_key_idx=%u status=%u\n",
+			 z->key_hw_idx, rlen2 >= 1 ? resp2[0] : 0xff);
+		z->key_installed = false;
 		return 0;
 	}
 
@@ -1182,6 +1201,7 @@ static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	z->key_add_ok++;
 	z->key_installed = true;
 	z->key_cipher_fw = cipher;
+	z->key_hw_idx = resp[1];
 	key->hw_key_idx = resp[1];
 	dev_info(&z->intf->dev,
 		 "KEY_ADD_CFM: status=0 hw_key_idx=%u (sta_idx=%u pair=%u cipher=%u klen=%u idx=%u)\n",
