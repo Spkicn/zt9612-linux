@@ -350,7 +350,30 @@ MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after associatio
  */
 static int sta_add_fmt;
 module_param(sta_add_fmt, int, 0644);
-MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (0=legacy template baseline; 2=HT with 5G band-consistent rate set 0x0ff0/r_idx=4 - see re/REPORT_STA_ADD_STRUCT.md; 2.4G unsupported)");
+MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only)");
+/*
+ * 实验开关（默认 0）：**固件密钥（WPA 聋态修复主线）**。
+ *
+ * 背景（2026-10-01，re/DRIVER_PROGRESS.md 第 19 轮）：驱动无 .set_key ⇒ 从不发
+ * MM_KEY_ADD_REQ(0x24) ⇒ WPA 网络下固件没有 PTK/GTK，加密帧全聋（arp_oracle
+ * 只在开放网络有效）。用户态已实测定稿 44B 载荷布局（tools/key_add_probe.py，
+ * 同日两次实测：组密钥 0xFF 与 pairwise sta_idx=2 均 CFM status=0，
+ * hw_key_idx 组=0 / pairwise=18）。
+ *
+ * 布局（aic8800d80 lmac_msg.h 的 struct mm_key_add_req，44B，见 zt_mac_set_key）：
+ *   +0 key_idx  +1 sta_idx  +4 key.length  +8..39 key.material[32]
+ *   +40 cipher_suite(WEP40=0 TKIP=1 CCMP=2 WEP104=3 BIP=5)  +41 inst_nbr  +42 spp  +43 pairwise
+ *
+ * key_rx_en（RX 解密声明臂）：固件装 key 后解密行为的帧形态未知 —— aic8800 同族
+ * 固件解密后 IV(8B)/MIC(8B) 仍留在 MPDU 里（aicwf 变体按 decr_status 手工剥），
+ * 标准版语义是 DECRYPTED|IV_STRIPPED|MMIC_STRIPPED。臂义见 zt_rx_inject 注释。
+ */
+static int key_en;
+module_param(key_en, int, 0644);
+MODULE_PARM_DESC(key_en, "experimental: implement .set_key -> MM_KEY_ADD_REQ(0x24)/KEY_DEL skip; WPA deafness fix line (0=off; layout verified in userspace via tools/key_add_probe.py)");
+static int key_rx_en;
+module_param(key_rx_en, int, 0644);
+MODULE_PARM_DESC(key_rx_en, "experimental: RX decryption-claim arm once a key is installed (0=hand frames up untouched, dump via /dev/zt9612; 1=strip 16B CCMP/TKIP IV+MIC + DECRYPTED|IV_STRIPPED|MMIC_STRIPPED; 2=strip nothing + all three flags; 3=strip nothing + DECRYPTED only)");
 
 /*
  * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：**A-MPDU 聚合**。
@@ -506,6 +529,15 @@ struct zt_dev {
 	u8			sta_bssid[6];
 	unsigned long		sta_add_ok;
 	unsigned long		sta_add_fail;
+	/* 实验：固件密钥（见 key_en / key_rx_en，re/DRIVER_PROGRESS.md 第 19 轮） */
+	bool			key_installed;	/* 任一 KEY_ADD 成功后置位，断开清除 */
+	u8			key_cipher_fw;	/* 最后装入的固件 cipher（RX 剥离臂用） */
+	unsigned long		key_add_ok;
+	unsigned long		key_add_fail;
+	unsigned long		key_del_skip;	/* DISABLE_KEY 未下发固件的次数 */
+	u32			rx_key_seen;	/* 装 key 后收到的 protected 数据帧 */
+	u32			rx_key_arm[4];	/* key_rx_en 各臂实际处理帧数 */
+	u32			rx_key_short;	/* 臂1：帧太短没剥的帧数 */
 	/* 实验：A-MPDU 聚合（见 ampdu_en） */
 	u16			tx_buf_size;	/* 运行期 TX 缓冲长度（聚合时更大） */
 	u8			ba_tid;
@@ -919,7 +951,16 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 	memcpy(z->sta_bssid, bssid, sizeof(z->sta_bssid));
 
 	memcpy(pl, zt_sta_add_tmpl, sizeof(pl));
-	if (sta_add_fmt == 2) {
+	if (sta_add_fmt == 1) {
+		/*
+		 * 第 19 轮单变量臂：只把 format 字节改成 2，其余 47 字节与
+		 * legacy 模板逐位相同。判别第 17 轮的死亡到底来自
+		 * "format 字节本身"还是"RC 块内容（r_idx/rate_map）"。
+		 * 第 17 轮两臂同时改了 7~8 字节（format+r_idx+rate_map+flags），
+		 * 单变量归因从未做过。
+		 */
+		pl[0] = 0x02;
+	} else if (sta_add_fmt == 2) {
 		/*
 		 * HT 登记版（re/REPORT_STA_ADD_STRUCT.md §3.2/§6.2）：
 		 *   +0x00 format=2 (HT)；+0x02/03 r_idx=4/4（位图最低置位位，
@@ -942,6 +983,28 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		pl[8] = 0xf0;	/* rate_map_l = 0x0ff0 */
 		pl[9] = 0x0f;
 		pl[0x14] = 0x04;	/* flags bit2 = HT（§2.3 证据级公式） */
+	} else if (sta_add_fmt == 3) {
+		/*
+		 * 第 19 轮臂：format 字节保持 0（legacy 路径），只把速率位图
+		 * 换成 5G OFDM 一致形态：rate_map(+0x04..05/+0x08..09)=0x0ff0，
+		 * r_idx_min/max=4/11（=0x0ff0 的最低/最高置位位；第 17 轮写
+		 * 4/4 与位图自相矛盾）。E1 已证 format=2 单字节致死 ⇒ 厂商
+		 * 真实关联不可能发 format=2，修复杠杆在 format=0 的速率位图。
+		 * 判据：若被接受且 MCS 单播 RX 复活 ⇒ 根因=固件把 STA_ADD
+		 * RC 位图当 RX 速率接受过滤器（#MCS-RX-DEAF 闭合）。
+		 */
+		pl[2] = 0x04;
+		pl[3] = 0x0b;
+		pl[4] = 0xf0;
+		pl[5] = 0x0f;
+		pl[8] = 0xf0;
+		pl[9] = 0x0f;
+	} else if (sta_add_fmt == 4) {
+		/* fmt=0 + 仅 rate_map=0x0ff0，r_idx 保持模板 0..7（更保守）。 */
+		pl[4] = 0xf0;
+		pl[5] = 0x0f;
+		pl[8] = 0xf0;
+		pl[9] = 0x0f;
 	}
 
 	if (zt_cmd_fifo_resp(z, 0x000a, pl, ZT_STA_ADD_LEN,
@@ -999,6 +1062,7 @@ static void zt_sta_del(struct zt_dev *z)
 	/* 会话没了 ⇒ BA 也没了（防 TX_STOP 没来得及走时的悬挂 ba_valid） */
 	z->sta_valid = false;
 	z->ba_valid = false;
+	z->key_installed = false;	/* 固件 key 与会话绑定，一并失效 */
 	z->sta_idx = 0;
 
 	if (zt_cmd_fifo_resp(z, 0x000c, &idx, 1, 0x000d, 500, resp, &rlen)) {
@@ -1009,6 +1073,121 @@ static void zt_sta_del(struct zt_dev *z)
 	}
 	dev_info(&z->intf->dev, "STA_DEL_CFM: sta_idx=%u status=%u (len=%u)\n",
 		 idx, rlen >= 1 ? resp[0] : 0xff, rlen);
+}
+
+/*
+ * NL80211 cipher（WLAN_CIPHER_SUITE_*，linux/ieee80211.h）→ 固件
+ * mac_cipher_suite（aic8800d80 lmac_mac.h 原文：WEP40=0 TKIP=1 CCMP=2
+ * WEP104=3 WPI=4 BIP_CMAC_128=5）。0xff = 不支持，让 mac80211 走软件加密。
+ */
+static u8 zt_cipher_fw(u32 cipher)
+{
+	switch (cipher) {
+	case WLAN_CIPHER_SUITE_WEP40:		return 0;
+	case WLAN_CIPHER_SUITE_TKIP:		return 1;
+	case WLAN_CIPHER_SUITE_CCMP:		return 2;
+	case WLAN_CIPHER_SUITE_WEP104:		return 3;
+	case WLAN_CIPHER_SUITE_AES_CMAC:	return 5;
+	default:				return 0xff;
+	}
+}
+
+/*
+ * .set_key → MM_KEY_ADD_REQ(0x24)，等 CFM 0x25 {u8 status; u8 hw_key_idx}。
+ *
+ * 44B 载荷 = struct mm_key_add_req（aic8800d80 lmac_msg.h，用户态实测定稿
+ * 2026-10-01：组密钥与 pairwise 两次 CFM status=0，tools/key_add_probe.py）：
+ *   +0 key_idx   mac80211 的 key->keyidx（组/默认密钥才有效）
+ *   +1 sta_idx   pairwise=z->sta_idx（STA_ADD CFM 分配）；组密钥 0xFF
+ *   +4 key.length  ≤32（MAC_SEC_KEY_LEN；TKIP 32B 按 mac80211 原布局直转，
+ *                  与厂商 rwnx_send_key_add 的 memcpy 语义一致）
+ *   +8..39 key.material
+ *   +40 cipher_suite   +41 inst_nbr(vif_idx，单 vif=0)   +42 spp=0   +43 pairwise
+ *
+ * 时序：mac80211 在 4-way EAPOL 之后调 set_key（进程上下文，可睡眠）；
+ * pairwise 必须在 STA_ADD 建立会话之后（z->sta_valid）。
+ *
+ * DISABLE_KEY：MM_KEY_DEL_REQ(0x26) 载荷未逆向，暂不下发（key_del_skip 计数）
+ * —— 固件 key 表残留风险由断开时的 STA_DEL 级联回收兜底；重连后 hw_key_idx
+ * 若持续增长（18→19→…）就是残留实证，届时再逆向 0x26。
+ */
+static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+			  struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+			  struct ieee80211_key_conf *key)
+{
+	struct zt_dev *z = *(struct zt_dev **)hw->priv;
+#define ZT_KEY_ADD_LEN	44
+	u8 pl[ZT_KEY_ADD_LEN];
+	u8 resp[8];
+	u16 rlen = 0;
+	u8 sta_idx, cipher, pairwise, klen;
+	int ret;
+
+	if (!key_en)
+		return -EOPNOTSUPP;
+
+	cipher = zt_cipher_fw(key->cipher);
+	if (cipher == 0xff) {
+		dev_info_ratelimited(&z->intf->dev,
+				     "KEY: cipher %#010x unsupported -> software\n",
+				     key->cipher);
+		return -EOPNOTSUPP;
+	}
+
+	if (cmd == DISABLE_KEY) {
+		z->key_del_skip++;
+		return 0;
+	}
+
+	if (sta) {
+		if (!z->sta_valid) {
+			dev_warn(&z->intf->dev,
+				 "KEY_ADD: pairwise but no sta session (sta_idx=0) -> software\n");
+			return -EOPNOTSUPP;
+		}
+		sta_idx = z->sta_idx;
+		pairwise = 1;
+	} else {
+		sta_idx = 0xFF;		/* 组/默认密钥约定（rwnx_send_key_add） */
+		pairwise = 0;
+	}
+
+	klen = min_t(u8, key->keylen, 32);
+	memset(pl, 0, sizeof(pl));
+	pl[0] = key->keyidx;
+	pl[1] = sta_idx;
+	pl[4] = klen;
+	memcpy(&pl[8], key->key, klen);
+	pl[40] = cipher;
+	pl[41] = 0;		/* inst_nbr = vif_idx（本驱动单 vif） */
+	pl[42] = 0;		/* spp */
+	pl[43] = pairwise;
+
+	ret = zt_cmd_fifo_resp(z, 0x0024, pl, sizeof(pl), 0x0025, 300, resp, &rlen);
+	if (ret) {
+		z->key_add_fail++;
+		dev_warn(&z->intf->dev,
+			 "KEY_ADD: no CFM (sta=%u pair=%u cipher=%u klen=%u idx=%u)\n",
+			 sta_idx, pairwise, cipher, klen, key->keyidx);
+		return -EIO;
+	}
+	if (rlen < 2 || resp[0] != 0) {
+		z->key_add_fail++;
+		dev_warn(&z->intf->dev,
+			 "KEY_ADD_CFM: status=%u (len=%u sta=%u pair=%u cipher=%u)\n",
+			 rlen >= 1 ? resp[0] : 0xff, rlen, sta_idx, pairwise, cipher);
+		return -EIO;
+	}
+
+	z->key_add_ok++;
+	z->key_installed = true;
+	z->key_cipher_fw = cipher;
+	key->hw_key_idx = resp[1];
+	dev_info(&z->intf->dev,
+		 "KEY_ADD_CFM: status=0 hw_key_idx=%u (sta_idx=%u pair=%u cipher=%u klen=%u idx=%u)\n",
+		 resp[1], sta_idx, pairwise, cipher, klen, key->keyidx);
+	return 0;
+#undef ZT_KEY_ADD_LEN
 }
 
 /*
@@ -2194,6 +2373,58 @@ static void zt_rx_inject(struct zt_dev *z, const u8 *buf, int len)
 	memset(st, 0, sizeof(*st));
 
 	/*
+	 * 加密帧臂（key_rx_en，实验）：装 key 后固件的解密帧形态未知 ——
+	 * aic8800 同族固件解密后 IV(8B)/MIC(8B) 仍留在 MPDU 里（aicwf 变体驱动
+	 * 按 decr_status 手工剥离），标准版语义则是 DECRYPTED|IV_STRIPPED|
+	 * MMIC_STRIPPED（固件剥净）。判别路径：
+	 *   0 = 原样上交（配 /dev/zt9612 dump：对比装 key 前后同一 MSDU 的
+	 *       MPDU 长度差 16B ⇒ IV/MIC 还在；差 0 ⇒ 固件剥净）；
+	 *   1 = 驱动剥 IV+MIC（WEP 4+4 / CCMP·TKIP 8+8，按 z->key_cipher_fw）
+	 *       + 三标志（aicwf 形态假设）；
+	 *   2 = 不剥 + 三标志（剥净假设）；  3 = 不剥 + 仅 DECRYPTED。
+	 * 只处理 protected 数据帧（fc bit14 且 type=data）；统计 rx_key_*。
+	 */
+	if (key_rx_en && READ_ONCE(z->key_installed)) {
+		u16 fc = get_unaligned_le16(payload);
+
+		if ((fc & 0x4000) && (fc & 0x000c) == 0x0008) {
+			z->rx_key_seen++;
+			if (key_rx_en == 2) {
+				st->flag |= RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED |
+					    RX_FLAG_MMIC_STRIPPED;
+				z->rx_key_arm[2]++;
+			} else if (key_rx_en == 3) {
+				st->flag |= RX_FLAG_DECRYPTED;
+				z->rx_key_arm[3]++;
+			} else if (key_rx_en == 1) {
+				u8 hdr = 24;
+				u8 strip;
+
+				if ((fc & 0x808c) == 0x8088)	/* QoS data */
+					hdr += 2;
+				if (z->key_cipher_fw == 0 || z->key_cipher_fw == 3)
+					strip = 8;	/* WEP 4(IV)+4(ICV) */
+				else
+					strip = 16;	/* CCMP/TKIP 8(IV)+8(MIC) */
+				if (flen >= hdr + strip + 1) {
+					memmove(skb->data + hdr,
+						skb->data + hdr + strip / 2,
+						flen - hdr - strip);
+					skb_trim(skb, flen - strip);
+					st->flag |= RX_FLAG_DECRYPTED |
+						    RX_FLAG_IV_STRIPPED |
+						    RX_FLAG_MMIC_STRIPPED;
+					z->rx_key_arm[1]++;
+				} else {
+					z->rx_key_short++;
+				}
+			} else {
+				z->rx_key_arm[0]++;
+			}
+		}
+	}
+
+	/*
 	 * d 指向归一化（48B 坐标系）描述符，字段语义见 re/REPORT_RX_DESC.md：
 	 *   +0x0E  int8 RSSI（dBm，抓包实测 -87~-42，同组内极差 <=2 dB）
 	 *   +0x28  band（0 = 2.4 GHz，1 = 5 GHz）
@@ -3299,6 +3530,8 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.hw_scan = zt_mac_hw_scan,
 	/* 实验：A-MPDU 聚合（ampdu_en=1 时才会被 mac80211 调用） */
 	.ampdu_action = zt_mac_ampdu_action,
+	/* 实验：固件密钥（key_en=1 时生效；WPA 聋态修复主线，44B 布局已用户态实测） */
+	.set_key = zt_mac_set_key,
 	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
