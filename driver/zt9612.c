@@ -374,6 +374,15 @@ static int tx_dump;
 module_param(tx_dump, int, 0644);
 MODULE_PARM_DESC(tx_dump, "experimental: log the first N TX frames handed to the device (len/fc/prot/mcast/eligibility), to see what mac80211 is actually giving us");
 /*
+ * 诊断：打印两条 TX 路径的帧数与聚合计数（`txpath=` 行）。
+ * 为什么需要：2026-10-01 实测 13k 帧的真实流量下 `tx(agg)` 一次都没出现 ——
+ * 说明数据帧主要走**传统 .tx 路径**（zt_mac_tx → z->txq），而聚合分支在 TXQ 路径里。
+ * 光看 tx_packets 分不出这件事，必须有这条计数。
+ */
+static int tx_diag;
+module_param(tx_diag, int, 0644);
+MODULE_PARM_DESC(tx_diag, "experimental: expose how many frames took the legacy .tx path vs the TXQ path (write 1 to start logging on every wake-up)");
+/*
  * 只把 >= agg_min_len 的帧纳入聚合（默认 1500 = 满尺寸数据帧）。
  * 依据：厂商抓包里**每一个**聚合单元都是 1578 字节（MPDU 1550），最小的聚合传输是
  * 1888 = 1608 + 280；而我们第一枪聚合的是 394 + 138 字节两个小帧 —— 小帧进聚合是
@@ -454,6 +463,8 @@ struct zt_dev {
 	unsigned long		ba_rx_stop;
 	unsigned long		tx_agg_xfers;	/* 聚合：一次传输里装多个 MPDU 的次数 */
 	unsigned long		tx_agg_mpdus;	/* 聚合：被聚合发送的 MPDU 总数 */
+	unsigned long		tx_legacy_frames;	/* 走传统 .tx 路径的帧数（实测主路径） */
+	unsigned long		tx_txq_frames;	/* 走 TXQ（wake_tx_queue）路径的帧数 */
 	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
 	unsigned long		tx_agg_multi;	/* 聚合：真正装了 >1 个单元的传输次数 */
 	unsigned long		tx_probes;
@@ -2611,9 +2622,21 @@ static void zt_tx_work(struct work_struct *w)
 	int n, i;
 
 	for (;;) {
-		/* 1) 传统 .tx 路径登记进来的 skb */
-		while ((skb = skb_dequeue(&z->txq)))
+		/*
+		 * 1) 传统 .tx 路径登记进来的 skb
+		 *
+		 * ⚠️ 2026-10-01 实测：**本内核把数据帧走这条路**（不是注释原先写的
+		 * "TXQ 才是主路径"）—— 13k 帧的真实流量下 TXQ 分支一次都没被走到。
+		 *
+		 * 也试过在这里攒批（复用 zt_tx_agg_send）：结果**明显回归** ——
+		 * `tx_blast` 1.26 Mbit/s、网关 ping 丢包 **90%**（改前同链路 10.3 Mbit/s / 0%），
+		 * 于是整体回退，只保留计数。原因推测：这批帧走的是"传统路径"，
+		 * 与 BA 会话/聚合所需的 txq 语义不同（当时也没有 BA 会话）。
+		 */
+		while ((skb = skb_dequeue(&z->txq))) {
+			z->tx_legacy_frames++;
 			zt_tx_one(z, z->hw, skb, true);
+		}
 
 		/* 2) TXQ 路径：取出本轮被唤醒的队列，逐个 dequeue 到空 */
 		spin_lock_irqsave(&z->txq_lock, flags);
@@ -2621,6 +2644,11 @@ static void zt_tx_work(struct work_struct *w)
 		memcpy(pend, z->txq_pend, n * sizeof(pend[0]));
 		z->txq_n = 0;
 		spin_unlock_irqrestore(&z->txq_lock, flags);
+		if (tx_diag)
+			dev_info(&z->intf->dev,
+				 "txpath: legacy=%lu txq=%lu agg_xfers=%lu agg_multi=%lu txq_pend=%d\n",
+				 z->tx_legacy_frames, z->tx_txq_frames,
+				 z->tx_agg_xfers, z->tx_agg_multi, n);
 		if (!n)
 			return;
 		for (i = 0; i < n; i++) {
@@ -2664,6 +2692,7 @@ static void zt_tx_work(struct work_struct *w)
 				rcu_read_unlock();
 				if (!skb)
 					break;
+				z->tx_txq_frames++;
 				zt_tx_one(z, z->hw, skb, false);
 			}
 		}
