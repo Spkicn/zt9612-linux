@@ -2664,6 +2664,7 @@ static void zt_tx_work(struct work_struct *w)
 			 * 之前调用；next_txq 返回的队列用完要用 return_txq 还回去。
 			 */
 			u8 ac = pend[i]->ac;
+			int rounds = 0;
 
 			ieee80211_txq_schedule_start(z->hw, ac);
 			for (;;) {
@@ -2671,6 +2672,9 @@ static void zt_tx_work(struct work_struct *w)
 				bool sent_any = false;
 
 				if (!txq)
+					break;
+				/* 防止在 work 里无界循环（每轮至少发一帧才会继续） */
+				if (++rounds > ZT_AGG_MAX_BLOCKS * ZT_AGG_SUBFRAMES)
 					break;
 
 				/*
