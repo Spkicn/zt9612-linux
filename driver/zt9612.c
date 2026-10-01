@@ -3141,7 +3141,7 @@ static int zt_mac_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
  * mac80211 的 ampdu_action。契约（mac80211.h @ampdu_action）：
  * TX_START 时必须先准备好会话，再调 `ieee80211_start_tx_ba_cb_irqsafe()`；
  * TX_STOP_CONT 之后调 `ieee80211_stop_tx_ba_cb_irqsafe()`；FLUSH 不需要回调。
- * RX 方向由固件自己管，这里只回成功（回错误会让 mac80211 认为设备不支持聚合）。
+ * RX 方向：返回 -EOPNOTSUPP 拒绝下行 BA（见 RX_START 分支内的判别实验注释）。
  */
 static int zt_mac_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			       struct ieee80211_ampdu_params *params)
@@ -3173,7 +3173,15 @@ static int zt_mac_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vi
 		return 0;
 	case IEEE80211_AMPDU_RX_START:
 		z->ba_rx_start++;
-		return 0;
+		/*
+		 * 拒绝下行聚合（2026-10-01 判别实验，re/DRIVER_PROGRESS.md 第 15 轮）：
+		 * 接受 RX BA（原实现只回成功、不配置固件）后，ch161 实测 RX 引擎
+		 * 数秒内退化 → BEACON-LOSS → 断开循环；legacy（ht_cap_enable=0）同信道 96s
+		 * ping 11/11 稳定。固件 RX 路径对 A-MPDU 接收未做任何适配，
+		 * 让 mac80211 DECLINE AP 的 ADDBA、AP 回退单帧下行；
+		 * 上行聚合（TX BA，主线目标）由 TX_START 分支处理，不受影响。
+		 */
+		return -EOPNOTSUPP;
 	case IEEE80211_AMPDU_RX_STOP:
 		z->ba_rx_stop++;
 		return 0;
