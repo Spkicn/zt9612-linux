@@ -1710,7 +1710,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		off[sub] = total;
 		total = unit;
 		/*
-		 * ⚠️ 2026-09-27 修复：这些帧此刻**还没上线**（聚合缓冲可能最终
+		 * ⚠️ 2026-10-01 修复：这些帧此刻**还没上线**（聚合缓冲可能最终
 		 * 被退化丢弃，或 break 后重排），不能先记进 done[]。
 		 * 旧代码在此处 done[k++]，配合下方两处缺陷（补齐循环覆盖 k、
 		 * 退化分支重发）导致 skb 泄漏 / 重复 report。
@@ -1761,7 +1761,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			memmove(buf + want, buf + have, tail);
 			memset(buf + have, 0, want - have);
 			total = (int)(want + tail);
-			/* ⚠️ 2026-09-27 修复：此处严禁用 k —— k 是 done[] 的写入游标，
+			/* ⚠️ 2026-10-01 修复：此处严禁用 k —— k 是 done[] 的写入游标，
 			 * 旧代码在这覆盖 k 导致混合批次（前置单帧 + 聚合）漏报 skb。 */
 			for (j = i + 1; j < sub; j++)
 				off[j] += want - have;
@@ -1800,7 +1800,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		 * 没有区别，多单元形态未定案前不冒险），从第一个聚合帧起
 		 * 全部改走尾部单帧循环。
 		 *
-		 * ⚠️ 2026-09-27 修复：旧代码 stop=0 / k=0 会把第一遍里**已经
+		 * ⚠️ 2026-10-01 修复：旧代码 stop=0 / k=0 会把第一遍里**已经
 		 * 单帧发出**的帧（批次开头的 ARP 广播 / EAPOL 等不合格帧）在
 		 * 尾部循环里**再发一遍** —— 线上出现重复帧（EAPOL/ARP 重复对
 		 * AP 侧状态机是真实输入差异）。first_agg 之前的帧已上线且在
