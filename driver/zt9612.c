@@ -2179,19 +2179,56 @@ static void zt_rx_complete(struct urb *urb)
 	int len = urb->actual_length;
 
 	/*
-	 * 临时诊断（默认关闭，诊断大包为何不上栈）：
-	 * 记录 USB 层实际收到的长度与帧头里的 hlen。计数由模块参数 rx_debug 控制，
-	 * 可随时 `sudo sh -c 'echo N > .../parameters/rx_debug'` 重新开始。
+	 * 临时诊断（默认关闭）：USB 层每收到一笔 WLAN 传输打一行。
+	 * 数据帧（0x0000/0x0004）额外打印 fc/addr1/protected 位 + RX 描述符
+	 * 未定字段（re/REPORT_RX_DESC.md §6：+0x0D/0F/10/12/24/25，速率/PHY
+	 * 弱候选）——#MCS-RX-DEAF 判别用：ping 风暴期间若 a1=本机、prot=1 的
+	 * 数据帧出现在 USB 层而 ping 不通 ⇒ 丢在注入/mac80211 层；若完全不
+	 * 出现 ⇒ 固件没交上来。beacon/probe-resp 只留 5 条作速率字段基线，
+	 * 重连后的 4-way EAPOL（prot=0 单播数据）与 ping 回包（prot=1）在同一
+	 * 窗口内直接对照。预算 = 模块参数 rx_debug：`echo N > .../rx_debug`。
 	 */
 	if (rx_debug_left > 0 && urb->status == 0 && len >= 8 &&
 	    !memcmp(z->rx_buf, "WLAN", 4)) {
 		u16 dh = get_unaligned_le16(z->rx_buf + 4);
 		u16 dt = get_unaligned_le16(z->rx_buf + 6);
+		static unsigned int rx_dbg_bcn;
+		static unsigned int rx_dbg_ipc;
 
-		rx_debug_left--;
-		dev_info(&z->intf->dev,
-			 "rxdbg: usb_len=%d hlen=%u type=%#06x left=%d\n",
-			 len, dh, dt, rx_debug_left);
+		if ((dt == T_RX_DATA0 || dt == T_RX_DATA4) &&
+		    dh >= (dt == T_RX_DATA4 ? 52 : 48) + 24 && 8 + dh <= len) {
+			u16 dlen = (dt == T_RX_DATA4) ? 52 : 48;
+			const u8 *d = z->rx_buf + 8 + (dt == T_RX_DATA4 ? 4 : 0);
+			const u8 *p = z->rx_buf + 8 + dlen;	/* MPDU */
+			u16 fc = get_unaligned_le16(p);
+			bool bcn = ((fc & 0x00fc) == 0x0080 ||
+				    (fc & 0x00fc) == 0x0050);
+
+			/* beacon/probe-resp 只留 5 条基线，其余不占预算 */
+			if (!bcn || rx_dbg_bcn < 5) {
+				if (bcn)
+					rx_dbg_bcn++;
+				rx_debug_left--;
+				dev_info(&z->intf->dev,
+					 "rxp: usb_len=%d type=%#06x fc=%#06x a1=%pM prot=%d rssi=%d d0d=%02x d0f=%02x d10=%02x d12=%02x d24=%02x d25=%02x cnt=%lu/%lu/%lu/%lu/%lu left=%d\n",
+					 len, dt, fc, p + 4,
+					 !!(fc & 0x4000), (s8)d[0x0E],
+					 d[0x0D], d[0x0F], d[0x10], d[0x12],
+					 d[0x24], d[0x25],
+					 z->rx_type_cnt[0], z->rx_type_cnt[1],
+					 z->rx_type_cnt[2], z->rx_type_cnt[3],
+					 z->rx_type_cnt[4], rx_debug_left);
+			}
+		} else if (dt == 0x0100 && rx_dbg_ipc >= 2) {
+			/* IPC 心跳 ~22 条/s，只留 2 条样本，不吃预算 */
+		} else {
+			if (dt == 0x0100)
+				rx_dbg_ipc++;
+			rx_debug_left--;
+			dev_info(&z->intf->dev,
+				 "rxp: usb_len=%d hlen=%u type=%#06x (IPC/短帧) left=%d\n",
+				 len, dh, dt, rx_debug_left);
+		}
 	}
 
 	/* D9：卸载中（alive=0）不再碰任何缓冲，只回报回收完成 */
