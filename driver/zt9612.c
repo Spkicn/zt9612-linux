@@ -905,16 +905,45 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		 rlen, rlen >= 3 ? resp[2] : 0xff);
 }
 
-/* 断开时只清本地状态：MM_STA_DEL_REQ(0x0C) 的参数布局尚未证实，不猜着发。 */
+/*
+ * 断开时发 MM_STA_DEL_REQ(0x0C)，把固件站点表里的槽位还回去。
+ *
+ * 布局证据（2026-10-01，厂商驱动指令级逆向 re/_sess13c.txt）：
+ *   rwnx_send_sta_del @ 0x140006f20 —— msg_alloc(id=0x0C) 后**只写
+ *   payload[0] = sta_idx**，同步发送等 CFM 0x0D（MM_STA_DEL_CFM），不取出参。
+ *   ⇒ 载荷 = 1 字节 sta_idx。
+ *
+ * 动机（2026-10-01 聚合死亡取证）：固件每次关联分配一个新 sta_idx（实测
+ * 0,2,3,…,9 单调递增），不发 0x0C 表格只增不减 ⇒ 耗尽后 STA_ADD_CFM status=1
+ * ⇒ sta_valid=false ⇒ BA 建不起来 ⇒ 无固件会话却仍打多单元传输 ⇒ macif.c:1019
+ * 断言（re/AMPDU_PUSH_STATUS.md 第 12 轮取证链）。
+ *
+ * 注：厂商 Windows 驱动里 rwnx_send_sta_del **零引用**（死代码），它的清理策略
+ * 未知；我们按协议语义发。若固件不认（CFM 超时/status≠0）也不影响断开流程 ——
+ * 本地状态照清，下次关联重试；CFM 结果打进 dmesg 供验证臂对拍。
+ */
 static void zt_sta_del(struct zt_dev *z)
 {
+	u8 resp[4];
+	u16 rlen = 0;
+	u8 idx;
+
 	if (!z->sta_valid)
 		return;
-	dev_info(&z->intf->dev,
-		 "STA_DEL: clear local sta_idx=%u (no IPC sent; layout unconfirmed)\n",
-		 z->sta_idx);
+	idx = z->sta_idx;
+	/* 会话没了 ⇒ BA 也没了（防 TX_STOP 没来得及走时的悬挂 ba_valid） */
 	z->sta_valid = false;
+	z->ba_valid = false;
 	z->sta_idx = 0;
+
+	if (zt_cmd_fifo_resp(z, 0x000c, &idx, 1, 0x000d, 500, resp, &rlen)) {
+		dev_warn(&z->intf->dev,
+			 "STA_DEL: no CFM for sta_idx=%u (slot may not be freed)\n",
+			 idx);
+		return;
+	}
+	dev_info(&z->intf->dev, "STA_DEL_CFM: sta_idx=%u status=%u (len=%u)\n",
+		 idx, rlen >= 1 ? resp[0] : 0xff, rlen);
 }
 
 /*
@@ -1621,12 +1650,17 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		 * 聚合资格（2026-09-30 收紧）：
 		 *   ① 加密单播数据帧（Protected 位 且 非组播）；
 		 *   ② 长度 ≤ 1572（= 1608 槽位 - 8 WLAN 头 - 28 描述符）；
+		 *   ③ 会话门（2026-10-01 新增）：固件站点会话 + BA 会话都在。
 		 * 只有同时满足的帧才参与聚合，其余走单帧路径（已验证稳定）。
-		 * 实证动机：首次聚合传输（1792 字节）里混进了一个"标记为加密、
-		 * 但长度只有 138/394 字节"的数据帧，混合传输后固件立刻断言掉线；
-		 * 厂商抓包里 96107 条数据帧**全是单播**，没有这种混合样本。
+		 *
+		 * ③ 的取证链（re/AMPDU_PUSH_STATUS.md 第 12 轮）：STA_ADD_CFM
+		 * status=1 ⇒ sta_valid=false ⇒ 9 次 TX_START 全在 zt_ba_add 入口被挡
+		 * ⇒ 无固件会话却仍打 2 单元传输 ⇒ 固件 macif.c:1019 断言 ⇒ EP5 -71
+		 * ⇒ CDROM 重枚举。会话不在时打包"格式再正确"也是死路 ——
+		 * aggdump 里单元描述符与厂商模板逐字节一致，死的照样死。
 		 */
-		bool eligible = is_data && prot && !mcast && (flen <= 1572) &&
+		bool eligible = z->sta_valid && z->ba_valid &&
+				is_data && prot && !mcast && (flen <= 1572) &&
 				(agg_min_len <= 0 || (int)flen >= agg_min_len);
 		int unit;
 
