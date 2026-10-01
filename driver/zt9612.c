@@ -1631,9 +1631,11 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 {
 	struct sk_buff *done[ZT_AGG_SUBFRAMES];
 	size_t off[ZT_AGG_SUBFRAMES];
-	int i, k = 0, sub = 0, ret, sent = 0, total = 0, stop = n;
+	int i, j, k = 0, sub = 0, ret, sent = 0, total = 0, stop = n;
 	u8 *buf = z->tx;			/* 聚合缓冲：与 z->txd 分开，互不干扰 */
 	bool dropping = false;
+	int agg_idx[ZT_AGG_SUBFRAMES];	/* 参与聚合的帧在 skb[] 里的下标 */
+	int first_agg = -1;		/* 第一个参与聚合的帧下标（退化重发起点） */
 
 	*again = false;
 	if (!READ_ONCE(z->alive) || !z->ep_tx || !buf)
@@ -1707,7 +1709,16 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		}
 		off[sub] = total;
 		total = unit;
-		done[k++] = skb[i];
+		/*
+		 * ⚠️ 2026-09-27 修复：这些帧此刻**还没上线**（聚合缓冲可能最终
+		 * 被退化丢弃，或 break 后重排），不能先记进 done[]。
+		 * 旧代码在此处 done[k++]，配合下方两处缺陷（补齐循环覆盖 k、
+		 * 退化分支重发）导致 skb 泄漏 / 重复 report。
+		 * 统一改为：bulk 成功后按 agg_idx 登记。
+		 */
+		agg_idx[sub] = i;
+		if (first_agg < 0)
+			first_agg = i;
 		sub++;
 	}
 
@@ -1750,8 +1761,10 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			memmove(buf + want, buf + have, tail);
 			memset(buf + have, 0, want - have);
 			total = (int)(want + tail);
-			for (k = i + 1; k < sub; k++)
-				off[k] += want - have;
+			/* ⚠️ 2026-09-27 修复：此处严禁用 k —— k 是 done[] 的写入游标，
+			 * 旧代码在这覆盖 k 导致混合批次（前置单帧 + 聚合）漏报 skb。 */
+			for (j = i + 1; j < sub; j++)
+				off[j] += want - have;
 		}
 	}
 
@@ -1784,12 +1797,18 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 	if (total > 0 && sub < 2) {
 		/*
 		 * 只攒到 1 个单元：不发聚合缓冲（单单元传输与"BA 在但不打包"
-		 * 没有区别，多单元形态未定案前不冒险），全部改走尾部单帧循环。
+		 * 没有区别，多单元形态未定案前不冒险），从第一个聚合帧起
+		 * 全部改走尾部单帧循环。
+		 *
+		 * ⚠️ 2026-09-27 修复：旧代码 stop=0 / k=0 会把第一遍里**已经
+		 * 单帧发出**的帧（批次开头的 ARP 广播 / EAPOL 等不合格帧）在
+		 * 尾部循环里**再发一遍** —— 线上出现重复帧（EAPOL/ARP 重复对
+		 * AP 侧状态机是真实输入差异）。first_agg 之前的帧已上线且在
+		 * done[] 里，不能重发；first_agg 起的帧只构建过、必须重发。
 		 */
 		total = 0;
 		sub = 0;
-		stop = 0;
-		k = 0;
+		stop = (first_agg >= 0) ? first_agg : 0;
 	}
 
 	if (total > 0) {
@@ -1853,6 +1872,9 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		z->tx_frames += sub;
 		z->tx_agg_xfers++;
 		z->tx_agg_mpdus += sub;
+		/* 聚合帧此刻才真正上线，现在才允许进 done[] 报状态 */
+		for (j = 0; j < sub; j++)
+			done[k++] = skb[agg_idx[j]];
 		dev_info(&z->intf->dev,
 			 "tx(agg): %d 单元 / 一次传输 %d 字节（累计 %u 次 / %u MPDU）\n",
 			 sub, total, (u32)z->tx_agg_xfers, (u32)z->tx_agg_mpdus);
