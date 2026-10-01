@@ -73,6 +73,14 @@
  */
 #define ZT_AGG_STRIDE		1608
 /*
+ * 单次聚合传输的总长上限（2026-10-01 逆向定案）：厂商 hif.c 的 host TX soft agg
+ * 把它硬编码为 `tx_agg_max_len = 0x2000 = 8192`（`tx_agg_int` @ 0x1400314cc：
+ * tx_buf_size 超过它直接软断言 hif.c:0x343）。我们 8 单元 × 1608 = 12864 字节
+ * 是厂商机制下**不可能产生**的传输尺寸；对齐这个上限，把"尺寸维度"从死亡
+ * 排除矩阵里消掉（re/AMPDU_PUSH_STATUS.md 第 14 轮）。
+ */
+#define ZT_AGG_XFER_CAP		8192
+/*
  * RX 缓冲必须容得下一个满尺寸的 802.11 数据帧，不能按"扫描帧都不大"来定。
  * 实测（2026-09-26）：MAX_FRAME=1024 时，ping payload ≥ 900 字节（MPDU≈968）
  * 的回复一个字节都上不了栈 —— 空口收到了，URB 缓冲装不下就直接丢，
@@ -1694,6 +1702,18 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			z->tx_path_frames++;
 			done[k++] = skb[i];
 			continue;
+		}
+
+		/*
+		 * 传输总长上限（ZT_AGG_XFER_CAP = 8192 = 厂商 tx_agg_max_len，
+		 * 逆向依据见宏定义处注释）：再攒一个单元就会超限 ⇒ 先断批。
+		 * 当前帧随尾部单帧循环发出，again=true 让调用方继续 dequeue 攒下一批。
+		 */
+		if (total > 0 &&
+		    total + 8 + TX_DESC_LEN + (size_t)flen > ZT_AGG_XFER_CAP) {
+			stop = i;
+			*again = true;
+			break;
 		}
 
 		unit = zt_tx_build(z, buf, z->tx_buf_size, total, f, flen, 0, true);
