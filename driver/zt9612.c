@@ -373,6 +373,15 @@ MODULE_PARM_DESC(agg_max_xfers, "experimental: stop packing after N aggregated t
 static int tx_dump;
 module_param(tx_dump, int, 0644);
 MODULE_PARM_DESC(tx_dump, "experimental: log the first N TX frames handed to the device (len/fc/prot/mcast/eligibility), to see what mac80211 is actually giving us");
+/*
+ * 只把 >= agg_min_len 的帧纳入聚合（默认 1500 = 满尺寸数据帧）。
+ * 依据：厂商抓包里**每一个**聚合单元都是 1578 字节（MPDU 1550），最小的聚合传输是
+ * 1888 = 1608 + 280；而我们第一枪聚合的是 394 + 138 字节两个小帧 —— 小帧进聚合是
+ * 厂商样本里从未出现过的形态，先用"只聚合大帧"把它排除掉。
+ */
+static int agg_min_len = 1500;
+module_param(agg_min_len, int, 0644);
+MODULE_PARM_DESC(agg_min_len, "experimental: minimum MPDU length for aggregation (default 1500); smaller frames keep the single-frame path");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -1588,7 +1597,8 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		 * 但长度只有 138/394 字节"的数据帧，混合传输后固件立刻断言掉线；
 		 * 厂商抓包里 96107 条数据帧**全是单播**，没有这种混合样本。
 		 */
-		bool eligible = is_data && prot && !mcast && (flen <= 1572);
+		bool eligible = is_data && prot && !mcast && (flen <= 1572) &&
+				(agg_min_len <= 0 || (int)flen >= agg_min_len);
 		int unit;
 
 		if (tx_dump > 0) {
