@@ -121,6 +121,9 @@ hosts.yml
 .DS_Store
 Thumbs.db
 
+# ---- WorkBuddy 会话数据（本地笔记，不入库） ----------------------------------
+.workbuddy/
+
 # ---- Python 缓存（ci/ 与 scripts/ 下都有 Python 脚本）------------------------
 __pycache__/
 *.pyc
