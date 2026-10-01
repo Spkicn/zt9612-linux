@@ -325,6 +325,34 @@ module_param(sta_add_en, int, 0644);
 MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and put the sta_idx into data descriptors (0=off; firmware accepts the payload but throughput is unchanged - see re/REPORT_STA_ADD_STRUCT.md and CHANGELOG [Unreleased])");
 
 /*
+ * #MCS-RX-DEAF 实验开关（2026-10-01，第 17 轮）。
+ *
+ * 现象：HT 关联（ht_cap_enable=1）下，AP 发的 MCS **单播**一个都到不了 USB
+ * （EAPOL/广播/管理帧正常，ping 100% loss）；ht_cap_enable=0 反而全通。
+ *
+ * H1'（根因假设，证据链闭合于 re/REPORT_STA_ADD_STRUCT.md §3.2/§6.2）：
+ * 我们的 STA_ADD 48B 载荷头部是**速率控制块**，模板 `zt_sta_add_tmpl` 的
+ * +0x00 format=0 ⇒ 固件把对端登记为 legacy-only 站点 ⇒ AP 的 MCS 单播在
+ * 固件 RX 策略层被丢弃（到不了主机）。厂商驱动的 format 由对端能力分支
+ * （{0=legacy, 2=HT, 4=VHT, 5=HE}），我们恒发 0。
+ *
+ * 取值：
+ *   0 = 现行 legacy 模板（基线，行为与 0.4 之前一致）
+ *   2 = HT 登记：format=2 + 速率集改为 5G OFDM 位（rate_map/rate_map_l=0x0ff0，
+ *       r_idx=4/4=位图最低置位位）。**注意是 5G 专用**：band==1 时厂商驱动把
+ *       位图 <<4（CCK 位 0..3 在 5G 不存在）；2.4G 上要用未移位的位图，另行加值。
+ *
+ * 第 17 轮实测（两臂，均使固件当场挂：-71 boot failed、USB 重枚举、STA_ADD
+ * no CFM）：① flags=0；② flags=0x04（§2.3 证据级公式，HT 站点必带 bit2）。
+   band 一致性与 flags 两个候选修正都无效 ⇒ format=2 的载荷还有别的不自洽
+ * （K1：固件拿 beacon 缓存的 AP HT 能力做交叉校验；K2：缺 vendor 关联序列
+ * 前置消息），修复路径待固件侧静态定位，先勿再盲试载荷。
+ */
+static int sta_add_fmt;
+module_param(sta_add_fmt, int, 0644);
+MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (0=legacy template baseline; 2=HT with 5G band-consistent rate set 0x0ff0/r_idx=4 - see re/REPORT_STA_ADD_STRUCT.md; 2.4G unsupported)");
+
+/*
  * 实验开关（默认 0 = 与 0.3.x 行为完全一致）：**A-MPDU 聚合**。
  *
  * 背景：`re/REPORT_TX_SESSION.md` 指出厂商快路径 = ①固件站点会话 ②描述符带 sta_idx
@@ -882,17 +910,46 @@ static const u8 zt_sta_add_tmpl[ZT_STA_ADD_LEN] = {
  */
 static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 {
+	/* 载荷从模板拷贝再改写：sta_add_fmt=2 时只动 RC 块 8 个字节（一次一个变量）。 */
+	u8 pl[ZT_STA_ADD_LEN];
 	u8 resp[8];
 	u16 rlen = 0;
 
 	z->sta_aid = aid;
 	memcpy(z->sta_bssid, bssid, sizeof(z->sta_bssid));
 
-	if (zt_cmd_fifo_resp(z, 0x000a, zt_sta_add_tmpl, ZT_STA_ADD_LEN,
+	memcpy(pl, zt_sta_add_tmpl, sizeof(pl));
+	if (sta_add_fmt == 2) {
+		/*
+		 * HT 登记版（re/REPORT_STA_ADD_STRUCT.md §3.2/§6.2）：
+		 *   +0x00 format=2 (HT)；+0x02/03 r_idx=4/4（位图最低置位位，
+		 *   打包器恒等写入）；+0x04..07 rate_map[0..1]=0x0ff0；
+		 *   +0x08/09 rate_map_l=0x0ff0（band==1 ⇒ 位图<<4，5G OFDM 位 4..11）。
+		 *   +0x14 flags=0x04 —— §2.3 证据级公式：flags = (params+0x22?2:0) |
+		 *   (params+0x38?4:0) | (params+0x48?0x20:0)，params+0x38 是 format=2
+		 *   的同一判据 ⇒ HT 站点必带 bit2。
+		 * 其余字节（mcs_max=7、bw_max=0、no_ss=1、A-MPDU 上限…）与实测可用
+		 * 的 legacy 模板逐位相同。no_ss 语义=速率图最高非 0 字节下标，
+		 * 0x0ff0 ⇒ 1，与模板值恰好自洽；ldpc(+0x13) 保守填 0。
+		 * 第 17 轮两臂（flags=0 / flags=0x04）实测固件均当场挂（-71 boot
+		 * failed、STA_ADD no CFM），载荷细节仍不自洽，详见注释开头。
+		 */
+		pl[0] = 0x02;	/* format=2 (HT) */
+		pl[2] = 0x04;	/* r_idx_min = 4 */
+		pl[3] = 0x04;	/* r_idx_max = 4 */
+		pl[4] = 0xf0;	/* rate_map[0..1] = 0x0ff0 */
+		pl[5] = 0x0f;
+		pl[8] = 0xf0;	/* rate_map_l = 0x0ff0 */
+		pl[9] = 0x0f;
+		pl[0x14] = 0x04;	/* flags bit2 = HT（§2.3 证据级公式） */
+	}
+
+	if (zt_cmd_fifo_resp(z, 0x000a, pl, ZT_STA_ADD_LEN,
 			     0x000b, 1000, resp, &rlen)) {
 		z->sta_add_fail++;
 		dev_warn(&z->intf->dev,
-			 "STA_ADD: no CFM (see re/REPORT_STA_ADD_LAYOUT.md)\n");
+			 "STA_ADD: no CFM (fmt=%d, see re/REPORT_STA_ADD_LAYOUT.md)\n",
+			 sta_add_fmt);
 		return;
 	}
 	/*
@@ -904,8 +961,8 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		z->sta_valid = true;
 		z->sta_add_ok++;
 		dev_info(&z->intf->dev,
-			 "STA_ADD_CFM: status=0 sta_idx=%u pm_state=%u (aid=%u)\n",
-			 z->sta_idx, resp[1], aid);
+			 "STA_ADD_CFM: status=0 sta_idx=%u pm_state=%u (aid=%u fmt=%d)\n",
+			 z->sta_idx, resp[1], aid, sta_add_fmt);
 		return;
 	}
 	z->sta_add_fail++;
