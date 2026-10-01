@@ -391,6 +391,23 @@ MODULE_PARM_DESC(tx_diag, "experimental: expose how many frames took the legacy 
 static int agg_min_len = 1500;
 module_param(agg_min_len, int, 0644);
 MODULE_PARM_DESC(agg_min_len, "experimental: minimum MPDU length for aggregation (default 1500); smaller frames keep the single-frame path");
+/*
+ * 一次传输最多装几个单元。**实测（2026-10-01）**：装 8 个（12832 字节）能跑出
+ * 76 Mbit/s，但连续 21 次传输后固件崩（`bulk OUT 失败 (-71)` → USB 掉线）；
+ * 而厂商抓包里单次传输**最多 3 个单元 / 4808 字节**。默认取厂商上限 3。
+ */
+static int agg_max_units = 3;
+module_param(agg_max_units, int, 0644);
+MODULE_PARM_DESC(agg_max_units, "experimental: max units packed into one bulk transfer (default 3 = the vendor capture's maximum; 8 was measured to work but crashed after ~21 transfers)");
+/*
+ * 两次聚合传输之间的最小间隔（微秒）。**实测动机（2026-10-01）**：
+ * 崩溃前那几次聚合传输挤在 6 ms 内（我们用同步 usb_bulk_msg 死循环猛灌），
+ * 而厂商驱动用的是 URB 队列 + 完成回调，节奏天然受硬件约束。
+ * 先加一个"节流"旋钮验证"灌太快把固件/USB 打崩"这个假设。
+ */
+static int agg_gap_us;
+module_param(agg_gap_us, int, 0644);
+MODULE_PARM_DESC(agg_gap_us, "experimental: minimum microseconds between aggregated bulk transfers (0 = unrestricted; use to test whether pacing prevents the firmware crash)");
 
 struct zt_dev {
 	struct usb_device	*udev;
@@ -467,6 +484,7 @@ struct zt_dev {
 	unsigned long		tx_txq_frames;	/* 走 TXQ（wake_tx_queue）路径的帧数 */
 	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
 	unsigned long		tx_agg_multi;	/* 聚合：真正装了 >1 个单元的传输次数 */
+	unsigned long		tx_agg_last;	/* 聚合：上次传输的 jiffies（agg_gap_us 节流用） */
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -1769,6 +1787,23 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 					 u, o, line, fsc);
 			}
 		}
+		/*
+		 * 可选节流：两次聚合传输之间至少间隔 agg_gap_us 微秒。
+		 * 用于验证"用同步 usb_bulk_msg 猛灌会把固件打崩"这个假设
+		 *（实测崩溃前 5 次传输挤在 6 ms 内；厂商驱动是 URB 队列 + 完成回调）。
+		 */
+		if (agg_gap_us > 0) {
+			unsigned long gap = usecs_to_jiffies(agg_gap_us);
+
+			if (gap == 0)
+				gap = 1;
+			/* 只在本批确实发过聚合传输后计时 */
+			if (z->tx_agg_xfers) {
+				while (time_before(jiffies, z->tx_agg_last + gap))
+					usleep_range(agg_gap_us / 2, agg_gap_us);
+			}
+			z->tx_agg_last = jiffies;
+		}
 		mutex_lock(&z->lock);
 		ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
 				   buf, total, &sent, 1000);
@@ -2690,11 +2725,14 @@ static void zt_tx_work(struct work_struct *w)
 				    (agg_max_xfers <= 0 ||
 				     (int)z->tx_agg_attempts < agg_max_xfers)) {
 					struct sk_buff *batch[ZT_AGG_SUBFRAMES];
+					int cap = agg_max_units > 0 &&
+						  agg_max_units < ZT_AGG_SUBFRAMES ?
+						  agg_max_units : ZT_AGG_SUBFRAMES;
 					int cnt = 0, blk = 0;
 					bool again = false;
 
 					while (blk++ < ZT_AGG_MAX_BLOCKS) {
-						while (cnt < ZT_AGG_SUBFRAMES) {
+						while (cnt < cap) {
 							rcu_read_lock();
 							skb = ieee80211_tx_dequeue_ni(z->hw, txq);
 							rcu_read_unlock();
@@ -3126,8 +3164,7 @@ static void zt_mac_register(struct zt_dev *z)
 		 * 1608 / 3200 / 4808 字节的传输 = 1/2/3 个单元首尾相接。
 		 */
 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
-		hw->max_tx_aggregation_subframes = ZT_AGG_SUBFRAMES;
-		dev_info(&z->intf->dev,
+		hw->max_tx_aggregation_subframes = ZT_AGG_SUBFRAMES;		dev_info(&z->intf->dev,
 			 "experimental: A-MPDU 聚合已启用（驱动组帧，TX 缓冲 %u 字节，最多 %u 子帧/传输）\n",
 			 z->tx_buf_size, ZT_AGG_SUBFRAMES);
 	}
