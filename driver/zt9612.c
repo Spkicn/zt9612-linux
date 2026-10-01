@@ -2653,48 +2653,83 @@ static void zt_tx_work(struct work_struct *w)
 			return;
 		for (i = 0; i < n; i++) {
 			/*
-			 * 进程上下文必须用 _ni 版本：7.0 的
-			 * ieee80211_tx_dequeue() 带 in_softirq 断言
-			 * （踩坑记录见 docs/04 的 D14）。
-			 * RCU 只护"出队"这一步 —— 之后 USB 传输会睡眠。
-			 *
-			 * ampdu_en=1 时改用"攒一批再一次 bulk"：mac80211 一次只给一个
-			 * MPDU，把多个 MPDU 拼进同一次传输是驱动的事（zt_tx_agg_send）。
+			 * ⚠️ 2026-10-01 定案：出队必须走 mac80211 规定的**调度循环**：
+			 *     schedule_start(ac) → next_txq(ac) → tx_dequeue()* → return_txq() → …
+			 * 只调 `ieee80211_tx_dequeue_ni()` 是不够的 —— 实测现象：
+			 * `txpath: legacy=… txq=0 … txq_pend=1` 反复出现（mac80211 不停
+			 * 唤醒队列，我们一帧都取不到），数据帧卡在 TXQ 里出不去
+			 * ⇒ ARP 不解析、**每个 AP 的 DHCP 都拿不到租约**、网关 ping 100% 丢包，
+			 * 而扫描/关联/四次握手（走 .tx 路径）全部正常。
+			 * 内核头文件（mac80211.h）明确：schedule_start 必须在 next_txq/return_txq
+			 * 之前调用；next_txq 返回的队列用完要用 return_txq 还回去。
 			 */
-			if (ampdu_en && !agg_block &&
-			    (agg_max_xfers <= 0 || (int)z->tx_agg_attempts < agg_max_xfers)) {
-				struct sk_buff *batch[ZT_AGG_SUBFRAMES];
-				int cnt = 0, blk = 0;
-				bool again = false;
+			u8 ac = pend[i]->ac;
 
-				while (blk++ < ZT_AGG_MAX_BLOCKS) {
-					while (cnt < ZT_AGG_SUBFRAMES) {
+			ieee80211_txq_schedule_start(z->hw, ac);
+			for (;;) {
+				struct ieee80211_txq *txq = ieee80211_next_txq(z->hw, ac);
+				bool sent_any = false;
+
+				if (!txq)
+					break;
+
+				/*
+				 * 进程上下文必须用 _ni 版本：7.0 的
+				 * ieee80211_tx_dequeue() 带 in_softirq 断言
+				 * （踩坑记录见 docs/04 的 D14）。
+				 * RCU 只护"出队"这一步 —— 之后 USB 传输会睡眠。
+				 *
+				 * ampdu_en=1 时攒一批再一次 bulk：mac80211 一次只给一个
+				 * MPDU，把多个 MPDU 拼进同一次传输是驱动的事（zt_tx_agg_send）。
+				 */
+				if (ampdu_en && !agg_block &&
+				    (agg_max_xfers <= 0 ||
+				     (int)z->tx_agg_attempts < agg_max_xfers)) {
+					struct sk_buff *batch[ZT_AGG_SUBFRAMES];
+					int cnt = 0, blk = 0;
+					bool again = false;
+
+					while (blk++ < ZT_AGG_MAX_BLOCKS) {
+						while (cnt < ZT_AGG_SUBFRAMES) {
+							rcu_read_lock();
+							skb = ieee80211_tx_dequeue_ni(z->hw, txq);
+							rcu_read_unlock();
+							if (!skb)
+								break;
+							batch[cnt++] = skb;
+						}
+						if (!cnt)
+							break;
+						sent_any = true;
+						z->tx_txq_frames += cnt;
+						zt_tx_agg_send(z, batch, cnt, &again);
+						cnt = 0;
+						if (!again)
+							break;	/* 该队列已空 */
+					}
+				} else {
+					for (;;) {
 						rcu_read_lock();
-						skb = ieee80211_tx_dequeue_ni(z->hw, pend[i]);
+						skb = ieee80211_tx_dequeue_ni(z->hw, txq);
 						rcu_read_unlock();
 						if (!skb)
 							break;
-						batch[cnt++] = skb;
+						sent_any = true;
+						z->tx_txq_frames++;
+						zt_tx_one(z, z->hw, skb, false);
 					}
-					if (!cnt)
-						break;
-					zt_tx_agg_send(z, batch, cnt, &again);
-					cnt = 0;
-					if (!again)
-						break;	/* 该队列已空 */
 				}
-				if (again)
-					zt_mac_wake_tx_queue(z->hw, pend[i]);	/* 还有余量：重新排队 */
-			} else
-			while (1) {
-				rcu_read_lock();
-				skb = ieee80211_tx_dequeue_ni(z->hw, pend[i]);
-				rcu_read_unlock();
-				if (!skb)
+
+				ieee80211_return_txq(z->hw, txq, false);
+				/*
+				 * 本轮该队列没发出任何帧 ⇒ mac80211 的调度器会认为
+				 * 它"还需要时间"，继续 next_txq() 只会拿到同一个队列，
+				 * 死循环。必须跳出。
+				 */
+				if (!sent_any)
 					break;
-				z->tx_txq_frames++;
-				zt_tx_one(z, z->hw, skb, false);
 			}
+			ieee80211_txq_schedule_end(z->hw, ac);
 		}
 	}
 }
