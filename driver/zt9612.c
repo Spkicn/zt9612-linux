@@ -368,9 +368,9 @@ MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_ST
  * 固件解密后 IV(8B)/MIC(8B) 仍留在 MPDU 里（aicwf 变体按 decr_status 手工剥），
  * 标准版语义是 DECRYPTED|IV_STRIPPED|MMIC_STRIPPED。臂义见 zt_rx_inject 注释。
  */
-static int key_en;
+static int key_en = 2;	/* r20 实测定案：固件不做 TX 加密，默认走 mac80211 软加解密 */
 module_param(key_en, int, 0644);
-MODULE_PARM_DESC(key_en, "experimental: implement .set_key -> MM_KEY_ADD_REQ(0x24)/KEY_DEL skip; WPA deafness fix line (0=off; layout verified in userspace via tools/key_add_probe.py)");
+MODULE_PARM_DESC(key_en, "0=off; 1=hw key path (MM_KEY_ADD 0x24, kept for firmware TX-crypto RE — firmware accepts keys but does NOT encrypt TX, r20 proven); 2=software crypto (default, r20: WPA2 ping 0% loss ht=0/ht=1)");
 static int key_rx_en;
 module_param(key_rx_en, int, 0644);
 MODULE_PARM_DESC(key_rx_en, "experimental: RX decryption-claim arm once a key is installed (0=hand frames up untouched, dump via /dev/zt9612; 1=strip 16B CCMP/TKIP IV+MIC + DECRYPTED|IV_STRIPPED|MMIC_STRIPPED; 2=strip nothing + all three flags; 3=strip nothing + DECRYPTED only)");
@@ -536,6 +536,7 @@ struct zt_dev {
 	unsigned long		key_add_ok;
 	unsigned long		key_add_fail;
 	unsigned long		key_del_skip;	/* DISABLE_KEY 未下发固件的次数 */
+	unsigned long		key_sw_skip;	/* key_en=2 臂：拒绝装固件 key 的次数 */
 	u32			rx_key_seen;	/* 装 key 后收到的 protected 数据帧 */
 	u32			rx_key_arm[4];	/* key_rx_en 各臂实际处理帧数 */
 	u32			rx_key_short;	/* 臂1：帧太短没剥的帧数 */
@@ -1127,6 +1128,15 @@ static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 
 	if (!key_en)
 		return -EOPNOTSUPP;
+
+	/* key_en=2：软件加密隔离臂。整套 key 交给 mac80211 软加/解密
+	 * （TX 出驱前已加密、RX 密文上交由 mac80211 解）——用于判定
+	 * "固件 TX 不加密" 是否为 WPA 聋态根因（re/DRIVER_PROGRESS.md r20）。
+	 * 注意 key_rx_en 必须为 0（密文原样上交，不加 DECRYPTED 标志）。 */
+	if (key_en == 2) {
+		z->key_sw_skip++;
+		return -EOPNOTSUPP;
+	}
 
 	cipher = zt_cipher_fw(key->cipher);
 	if (cipher == 0xff) {
