@@ -325,6 +325,17 @@ module_param(sta_add_en, int, 0644);
 MODULE_PARM_DESC(sta_add_en, "experimental: send MM_STA_ADD_REQ after association and put the sta_idx into data descriptors (0=off; firmware accepts the payload but throughput is unchanged - see re/REPORT_STA_ADD_STRUCT.md and CHANGELOG [Unreleased])");
 
 /*
+ * r20 重连聋隔离臂（_r20_slotverify/_r20_stafix）：
+ * 固件断开后会话回收失效（或 STA_DEL 无效），重连分配新 sta_idx 后加密
+ * 单播 TX 全丢；首连（slot 0）与明文帧（staid=0xff）均正常。
+ *   tx_staidx=0：加密单播数据帧也走"无站点"描述符（0xff00），
+ *               验证 staid 路由是否为丢帧开关（SW 加密固件不需要 staid）。
+ */
+static int tx_staidx = 1;
+module_param(tx_staidx, int, 0644);
+MODULE_PARM_DESC(tx_staidx, "1=write sta_idx into TX descriptor staid byte for protected unicast data (default); 0=always no-station 0xff path (r20 reconnect-deafness isolation arm)");
+
+/*
  * #MCS-RX-DEAF 实验开关（2026-10-01，第 17 轮）。
  *
  * 现象：HT 关联（ht_cap_enable=1）下，AP 发的 MCS **单播**一个都到不了 USB
@@ -1737,8 +1748,16 @@ static int zt_tx_build(struct zt_dev *z, u8 *buf, size_t buf_size, size_t at,
 		 * 只有**有会话的加密单播数据帧**填 sta_idx，其余保持"无站点"，
 		 * 避免把第四条实验通道（广播/DHCP、EAPOL）带进未验证的路径。
 		 */
-		if (z->sta_valid && is_data && protected && !mcast)
-			put_unaligned_le16((u16)z->sta_idx, d + 8);
+		/*
+		 * +0x08 = vif_idx、+0x09 = staid（re/REPORT_TX_SESSION.md §4 厂商
+		 * pcap 字节序铁证：数据帧 `00 00`、管理帧 `00 ff` = (vif, staid)。
+		 * 【r20 修复】此前写 le16(sta_idx) 把 staid 落在了 +0x08 低字节——
+		 * slot 0 时 (0,0) 恰好等价而从未暴露；重连后固件分配 sta_idx>=1，
+		 * 描述符变成 (vif=N, staid=0)，与厂商布局不符。正确写法：
+		 * 低字节 vif=0、高字节 staid，即 le16(sta_idx << 8)。
+		 */
+		if (tx_staidx && z->sta_valid && is_data && protected && !mcast)
+			put_unaligned_le16((u16)(z->sta_idx << 8), d + 8);
 		else
 			put_unaligned_le16(0xff00, d + 8);
 		/*
