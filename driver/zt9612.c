@@ -336,6 +336,20 @@ module_param(tx_staidx, int, 0644);
 MODULE_PARM_DESC(tx_staidx, "1=write sta_idx into TX descriptor staid byte for protected unicast data (default); 0=always no-station 0xff path (r20 reconnect-deafness isolation arm)");
 
 /*
+ * r22 实验臂（默认 0）：把加密单播数据帧描述符的前 4 字节从厂商稳态形态
+ * 0xffffffff 换成关联期 46B 形态的头部 `00 staid 05 00`。
+ *
+ * 证据（2026-10-02，re/_r21_decode.txt L6/L1008/L1040/L1064）：厂商 EP5 上行
+ * 描述符 +0x01 = sta_idx（02→03 随 STA_ADD_CFM 同步演化，铁证）、+0x02 = 0x05
+ * 恒定（与 STA_ADD format=5 呼应）、+0x00/+0x03 = 0。我们的稳态模板这里恒
+ * 0xffffffff —— 两套形态唯一可低成本缝合的硬差异。
+ * 若启用后固件 TX 死锁消失（ping 持续通）⇒ 死锁根因 = 描述符头形态不符。
+ */
+static int tx_staid4b;
+module_param(tx_staid4b, int, 0644);
+MODULE_PARM_DESC(tx_staid4b, "1=TX desc bytes[0..3] = 00 staid 05 00 (vendor assoc-phase header, r22); 0=vendor steady-state 0xffffffff (default)");
+
+/*
  * 重连聋修复（_r20_twoarms 臂 B，r20 默认启用）：
  * 固件对断开后的会话清理不可逆——重连后无论新槽位（sta_idx>=1）还是
  * 无站点描述符，加密单播 TX 一律被丢（首连 slot 0 与明文帧正常）。
@@ -1855,7 +1869,12 @@ static int zt_tx_build(struct zt_dev *z, u8 *buf, size_t buf_size, size_t at,
 		/*
 		 * +0x00 = 0xffffffff（与厂商逐字节一致），+0x04 = 本帧长度。
 		 */
-		put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
+		if (tx_staid4b && z->sta_valid && is_data && protected && !mcast)
+			/* r22：字节 [00 staid 05 00]（LE u32 = 0x0005_0000 | staid<<8），
+			 * 复刻厂商关联期形态头部（_r21_decode.txt L1008）。 */
+			put_unaligned_le32((u32)0x00050000 | ((u32)z->sta_idx << 8), d + 0);
+		else
+			put_unaligned_le32(tx_variant == 1 ? 0 : 0xffffffff, d + 0);
 		/*
 		 * +0x04 = 本帧长度。**必须写**（2026-09-30 更正）：
 		 *   - 厂商 probe request（re/ 里的 vendor_probe_139）在此处是 0x006f = 111 = 帧长；
