@@ -336,6 +336,25 @@ module_param(tx_staidx, int, 0644);
 MODULE_PARM_DESC(tx_staidx, "1=write sta_idx into TX descriptor staid byte for protected unicast data (default); 0=always no-station 0xff path (r20 reconnect-deafness isolation arm)");
 
 /*
+ * 重连聋修复（_r20_twoarms 臂 B，r20 默认启用）：
+ * 固件对断开后的会话清理不可逆——重连后无论新槽位（sta_idx>=1）还是
+ * 无站点描述符，加密单播 TX 一律被丢（首连 slot 0 与明文帧正常）。
+ * 唯一实测可用的重连路径 = 保留固件会话：
+ *   sta_del_en=0：断开不下发 MM_STA_DEL（0x0C），固件会话保持；
+ *   sta_reuse=1 ：同 BSSID 再关联时跳过 STA_ADD，沿用旧 sta_idx。
+ * 已知代价：BSSID 变化（漫游）时 sta_reuse 不命中 => 新槽位，旧槽位泄漏
+ * （固件 ~250 槽，耗尽后 STA_ADD_CFM status=1，需重载模块恢复）。
+ * 注意：ampdu_en=1 与会话复用重连的组合未验证（BA 状态跨断开残留）。
+ */
+static int sta_del_en;
+module_param(sta_del_en, int, 0644);
+MODULE_PARM_DESC(sta_del_en, "1=send MM_STA_DEL on disconnect; 0=keep firmware session across reconnects (DEFAULT, r20: firmware drops encrypted TX after disconnect cleanup - session reuse is the only working reconnect path)");
+
+static int sta_reuse = 1;
+module_param(sta_reuse, int, 0644);
+MODULE_PARM_DESC(sta_reuse, "1=skip MM_STA_ADD when a session for the same BSSID exists (DEFAULT, r20: validated 2x reconnect 0% loss, see re/_r20_twoarms)");
+
+/*
  * #MCS-RX-DEAF 实验开关（2026-10-01，第 17 轮）。
  *
  * 现象：HT 关联（ht_cap_enable=1）下，AP 发的 MCS **单播**一个都到不了 USB
@@ -960,6 +979,17 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 	u8 resp[8];
 	u16 rlen = 0;
 
+	/* r20 修复：同 BSSID 复用旧固件会话（见 sta_reuse 说明） */
+	if (sta_reuse && z->sta_valid &&
+	    ether_addr_equal(bssid, z->sta_bssid)) {
+		z->sta_aid = aid;
+		z->sta_add_ok++;
+		dev_info(&z->intf->dev,
+			 "STA_REUSE: sta_idx=%u kept (aid=%u, no MM_STA_ADD sent)\n",
+			 z->sta_idx, aid);
+		return;
+	}
+
 	z->sta_aid = aid;
 	memcpy(z->sta_bssid, bssid, sizeof(z->sta_bssid));
 
@@ -1071,6 +1101,13 @@ static void zt_sta_del(struct zt_dev *z)
 
 	if (!z->sta_valid)
 		return;
+	/* r20 修复：保留固件会话供重连复用（见 sta_del_en 说明） */
+	if (!sta_del_en) {
+		dev_info(&z->intf->dev,
+			 "STA_DEL: skipped (sta_del_en=0, keeping sta_idx=%u)\n",
+			 z->sta_idx);
+		return;
+	}
 	idx = z->sta_idx;
 	/* 会话没了 ⇒ BA 也没了（防 TX_STOP 没来得及走时的悬挂 ba_valid） */
 	z->sta_valid = false;
