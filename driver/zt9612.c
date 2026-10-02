@@ -381,6 +381,17 @@ MODULE_PARM_DESC(sta_reuse, "1=skip MM_STA_ADD when a session for the same BSSID
 static int sta_add_fmt = 5;
 module_param(sta_add_fmt, int, 0644);
 MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (5=vendor-verbatim payload from 2026-10-02 USBPcap capture, DEFAULT, r21; 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only)");
+
+/*
+ * r21 实验：关联后补发厂商配置序列（STA_ADD 之后、密钥之前的 8 条消息）。
+ * 载荷逐字节来自 2026-10-02 USBPcap 厂商实抓（re/_r21_decode.txt L943-974），
+ * 之前从未实现 —— USB 层抓帧（_r21_judge3）显示 AP 发了几百个单播加密帧
+ * 固件只交付 3 个，怀疑本序列里有固件 RX/速率配置的缺环。
+ * 0=off（DEFAULT，行为不变）；1=在 MM_STA_ADD_CFM status=0 后发序列。
+ */
+static int vendor_seq_en;
+module_param(vendor_seq_en, int, 0644);
+MODULE_PARM_DESC(vendor_seq_en, "r21 experiment: replay the vendor post-STA_ADD config sequence (0x001a x4, 0x0054, 0x001e, 0x0020, 0x005a) verbatim (0=off DEFAULT, 1=on)");
 /*
  * 实验开关（默认 0）：**固件密钥（WPA 聋态修复主线）**。
  *
@@ -935,6 +946,8 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
 	return -ETIMEDOUT;
 }
 
+static void zt_vendor_seq(struct zt_dev *z);
+
 /*
  * MM_STA_ADD_REQ(0x0A) 的 48 字节载荷模板。
  *
@@ -1096,11 +1109,59 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		dev_info(&z->intf->dev,
 			 "STA_ADD_CFM: status=0 sta_idx=%u pm_state=%u (aid=%u fmt=%d)\n",
 			 z->sta_idx, resp[1], aid, sta_add_fmt);
+		if (vendor_seq_en)
+			zt_vendor_seq(z);
 		return;
 	}
 	z->sta_add_fail++;
 	dev_warn(&z->intf->dev, "STA_ADD_CFM: unexpected result (len=%u status=%u)\n",
 		 rlen, rlen >= 3 ? resp[2] : 0xff);
+}
+
+/*
+ * r21：关联后的厂商配置序列（MM_STA_ADD_CFM 之后、4-way 密钥之前）。
+ * 厂商时序（re/_r21_decode.txt L943-974，每条都等到空 CFM 才发下一条）：
+ *   0x001a "00 03 00 11 f2 02 00"  → 0x001b
+ *   0x001a "00 02 00 12 e2 05 00"  → 0x001b
+ *   0x001a "00 01 00 12 02 00 00"  → 0x001b
+ *   0x0054 16B 门限四元组           → 0x0055
+ *   0x001a "00 00 00 17 02 00 00"  → 0x001b
+ *   0x001e "00 01 01 00"           → 0x001f
+ *   0x0020 "09"                    → 0x0021
+ *   0x005a "00 3f 01 00 00"        → 0x005b
+ * 语义未逆向（疑似速率表槽 3..0 写入 + RSSI/CCA 门限 + RX 能力开关），
+ * 先逐字节照抄验证"补齐序列是否治 MCS RX"。
+ */
+static void zt_vendor_seq(struct zt_dev *z)
+{
+	static const u8 a1[7] = { 0x00, 0x03, 0x00, 0x11, 0xf2, 0x02, 0x00 };
+	static const u8 a2[7] = { 0x00, 0x02, 0x00, 0x12, 0xe2, 0x05, 0x00 };
+	static const u8 a3[7] = { 0x00, 0x01, 0x00, 0x12, 0x02, 0x00, 0x00 };
+	static const u8 a4[7] = { 0x00, 0x00, 0x00, 0x17, 0x02, 0x00, 0x00 };
+	static const u8 m54[16] = {
+		0x62, 0x32, 0xff, 0x00, 0x42, 0x43, 0xff, 0x00,
+		0x03, 0xa4, 0xff, 0x00, 0x27, 0xa4, 0xff, 0x00,
+	};
+	static const u8 m1e[4] = { 0x00, 0x01, 0x01, 0x00 };
+	static const u8 m20[1] = { 0x09 };
+	static const u8 m5a[5] = { 0x00, 0x3f, 0x01, 0x00, 0x00 };
+	int fail = 0;
+
+	fail += zt_cmd_fifo(z, 0x001a, a1, 7, 0x001b, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x001a, a2, 7, 0x001b, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x001a, a3, 7, 0x001b, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x0054, m54, 16, 0x0055, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x001a, a4, 7, 0x001b, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x001e, m1e, 4, 0x001f, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x0020, m20, 1, 0x0021, 500) ? 1 : 0;
+	fail += zt_cmd_fifo(z, 0x005a, m5a, 5, 0x005b, 500) ? 1 : 0;
+
+	if (fail)
+		dev_warn(&z->intf->dev,
+			 "VENDOR_SEQ: %d/8 steps failed (see kfifo timeout logs)\n", fail);
+	else
+		dev_info(&z->intf->dev,
+			 "VENDOR_SEQ: 8/8 steps ok (post-STA_ADD vendor sequence)\n");
 }
 
 /*
