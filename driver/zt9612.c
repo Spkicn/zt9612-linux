@@ -378,9 +378,9 @@ MODULE_PARM_DESC(sta_reuse, "1=skip MM_STA_ADD when a session for the same BSSID
  * （K1：固件拿 beacon 缓存的 AP HT 能力做交叉校验；K2：缺 vendor 关联序列
  * 前置消息），修复路径待固件侧静态定位，先勿再盲试载荷。
  */
-static int sta_add_fmt;
+static int sta_add_fmt = 5;
 module_param(sta_add_fmt, int, 0644);
-MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only)");
+MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (5=vendor-verbatim payload from 2026-10-02 USBPcap capture, DEFAULT, r21; 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only)");
 /*
  * 实验开关（默认 0）：**固件密钥（WPA 聋态修复主线）**。
  *
@@ -957,6 +957,24 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
  * 改任何一个字节都要按"一次一个变量 + 看 0x0B / 0x0600"重新验证。
  */
 #define ZT_STA_ADD_LEN	48
+/*
+ * fmt=5：**厂商驱动 2026-10-02 实抓的逐字节真载荷**（USBPcap，宿主机 SS 关联
+ * TP-LINK_85E8 全程，re/_r21_decode.txt L939-942）。CFM {sta_idx=3, pm_state=0x13,
+ * status=0}，随后 DHCP/ARP/ping 全通 —— 这是唯一一份"固件必收"的 RC 登记。
+ * 与 legacy 模板的关键差异：format=5（非 0 非 2！r17/r19 盲试必死的真因）、
+ * mcs_max=11（HE）、r_idx 4..11、rate_map=0xfffa/0x0ff0、bw_max=2(80MHz)、
+ * short_gi=1、he_max_ampdu=0x7fffff、vht_max_ampdu=0xfffff、ht_max_ampdu=0xffff、
+ * min_ampdu=0。两个运行时字段：+0x14 u16 AID（实抓 38 = AP 实派）、+0x26 BSSID。
+ */
+static const u8 zt_sta_add_v5[ZT_STA_ADD_LEN] = {
+	0x05, 0x0b, 0x04, 0x0b, 0xfa, 0xff, 0x00, 0x00,
+	0xf0, 0x0f, 0x02, 0x01, 0x01, 0x00, 0x01, 0x00,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0xff, 0xff, 0x7f, 0x00, 0xff, 0xff, 0x0f, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
 static const u8 zt_sta_add_tmpl[ZT_STA_ADD_LEN] = {
 	0x00, 0x07, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00,
 	0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
@@ -1048,6 +1066,15 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		pl[5] = 0x0f;
 		pl[8] = 0xf0;
 		pl[9] = 0x0f;
+	} else if (sta_add_fmt == 5) {
+		/*
+		 * 厂商逐字节真载荷（见 zt_sta_add_v5 注释）：基表 v5 +
+		 * 两个运行时字段 —— AID u16@+0x14（厂商实抓 38，随关联变化）、
+		 * BSSID 6B@+0x26（当前关联的 AP）。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
 	}
 
 	if (zt_cmd_fifo_resp(z, 0x000a, pl, ZT_STA_ADD_LEN,
