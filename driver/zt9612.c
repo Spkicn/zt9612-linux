@@ -650,6 +650,8 @@ struct zt_dev {
 	int			txq_n;
 	spinlock_t		txq_lock;
 	unsigned long		txq_overflow;
+	unsigned long		txq_wakes;	/* r34: wake_tx_queue 调用次数（含重复登记） */
+	unsigned long		txq_works;	/* r34: tx_work 实际运行次数 */
 
 	struct mutex		lock;
 };
@@ -1831,6 +1833,9 @@ static void zt_dbg_init(struct zt_dev *z)
 		return;
 	debugfs_create_file("tx_raw", 0200, zt_dbg_root, z, &zt_dbg_tx_fops);
 	debugfs_create_u32("tx_frames", 0400, zt_dbg_root, (u32 *)&z->tx_frames);
+	/* r34：TXQ 唤醒链路计数（wake 回调次数 / tx_work 运行次数） */
+	debugfs_create_ulong("txq_wakes", 0400, zt_dbg_root, &z->txq_wakes);
+	debugfs_create_ulong("txq_works", 0400, zt_dbg_root, &z->txq_works);
 	/* C1 观测：EP2-IN 通知通道的计数（低 32 位） */
 	debugfs_create_u32("ntf_count", 0400, zt_dbg_root, (u32 *)&z->ntf_count);
 	debugfs_create_u32("ntf_bytes", 0400, zt_dbg_root, (u32 *)&z->ntf_bytes);
@@ -3369,9 +3374,10 @@ static void zt_tx_work(struct work_struct *w)
 		spin_unlock_irqrestore(&z->txq_lock, flags);
 		if (tx_diag)
 			dev_info(&z->intf->dev,
-				 "txpath: legacy=%lu txq=%lu agg_xfers=%lu agg_multi=%lu txq_pend=%d\n",
+				 "txpath: legacy=%lu txq=%lu agg_xfers=%lu agg_multi=%lu txq_pend=%d wakes=%lu works=%lu\n",
 				 z->tx_legacy_frames, z->tx_txq_frames,
-				 z->tx_agg_xfers, z->tx_agg_multi, n);
+				 z->tx_agg_xfers, z->tx_agg_multi, n,
+				 z->txq_wakes, ++z->txq_works);
 		if (!n)
 			return;
 		for (i = 0; i < n; i++) {
@@ -3416,10 +3422,19 @@ static void zt_tx_work(struct work_struct *w)
 					int cap = agg_max_units > 0 &&
 						  agg_max_units < ZT_AGG_SUBFRAMES ?
 						  agg_max_units : ZT_AGG_SUBFRAMES;
-					int cnt = 0, blk = 0;
+					int cnt = 0;
 					bool again = false;
 
-					while (blk++ < ZT_AGG_MAX_BLOCKS) {
+					/*
+					 * r34：排水必须排到**真空**（dequeue 返回 NULL），
+					 * 不能用 again 当"队列已空"信号——again=false 只表示
+					 * "本批干净发完"，批满（cnt==cap）干净发完时同样是
+					 * false ⇒ 旧代码每轮 wake 只排一个 bulk（≤3 帧）就
+					 * return_txq，积压要等下一次 wake（实测 wake 率
+					 * 1.5~30/s）⇒ 正是 R22-R33 的 1 帧/wake 计量现象。
+					 * 修复后与单帧分支同语义：dequeue 返回 NULL 才退出。
+					 */
+					for (;;) {
 						while (cnt < cap) {
 							rcu_read_lock();
 							skb = ieee80211_tx_dequeue_ni(z->hw, txq);
@@ -3434,8 +3449,6 @@ static void zt_tx_work(struct work_struct *w)
 						z->tx_txq_frames += cnt;
 						zt_tx_agg_send(z, batch, cnt, &again);
 						cnt = 0;
-						if (!again)
-							break;	/* 该队列已空 */
 					}
 				} else {
 					for (;;) {
@@ -3470,6 +3483,7 @@ static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *
 	unsigned long flags;
 	int i;
 
+	WRITE_ONCE(z->txq_wakes, z->txq_wakes + 1);	/* r34: 每次回调都计 */
 	spin_lock_irqsave(&z->txq_lock, flags);
 	for (i = 0; i < z->txq_n; i++) {
 		if (z->txq_pend[i] == txq)
