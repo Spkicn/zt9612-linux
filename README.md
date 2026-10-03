@@ -32,7 +32,7 @@ managed 模式的无线接口：双频扫描、WPA2-PSK 关联与加密、DHCP �
 | 吞吐 | 见下表；速率由固件内部决定，主机侧无法影响 |
 | v0.3.1 5 GHz 修复 | 完成，已实机验证（此前 5 GHz 一直不可用，测试证据是频点误标产物） |
 | v0.3.2 上传修复 | 完成，已实机验证（此前 TX 帧长上限 988 字节，上传基本不可用） |
-| 上传吞吐（v0.4 主线） | 会话（`STA_ADD_CFM status=0`）、BA 会话（`BA_ADD_CFM status=0`）、WPA2 加密路径（`key_en=2`，`ping` 0% 丢包）三步都已打通；聚合注入微基准曾测得 **76.32 Mbit/s**。**当前卡点：固件数据路径在 `MM_STA_ADD` 登记后 8~40s 定时死亡**（r25 R 臂归案：R1 基线存活、R2 +STA_ADD 死）。详见「已知问题」与 CHANGELOG `[Unreleased]` |
+| 上传吞吐（v0.4 主线） | 会话（`STA_ADD_CFM status=0`）、BA 会话（`BA_ADD_CFM status=0`）、WPA2 加密路径（`key_en=2`，`ping` 0% 丢包）三步都已打通；**2026-10-04：`sta_add_fmt=7`（宽切除修复载荷）通过浸泡+洪泛三重验证，`MM_STA_ADD` 登记后定时死亡问题拆除**；聚合吞吐受 mac80211 TXQ 计量限制待解。详见「已知问题」与 CHANGELOG `[Unreleased]` |
 
 实测吞吐（同一张卡，HTTPS，10 s × 3 取中位数）：
 
@@ -295,21 +295,22 @@ sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 期望 40 个以上（双频）
   `sta_add_en`（`STA_ADD_CFM status=0`，数据帧描述符带 `sta_idx`）、`ampdu_en`
   （`BA_ADD_CFM status=0`，聚合注入微基准 76.32 Mbit/s vs 单帧 7~14）、`key_en=2`
   （WPA2 软件加解密，`ping` 0% 丢包）。
-  **当前卡点（2026-10-03 r25 重定性）：固件数据路径在 `MM_STA_ADD` 登记后 8~40s
-  定时死亡** —— r25 R 臂归案：R1（legacy + 纯基线参数）**5 分钟零掉关联存活**
-  （ping 100 轮 mean 0.8%，assoc 保持 >350s）；R2（legacy + `sta_add_en=1
-  sta_add_fmt=5`）**round 3 死**（连接后 ~8-10s），tail 三态 `00 7A→10 2C→90 2C`
-  与 Q/P/B 会话同构 ⇒ **引爆点锁定 `MM_STA_ADD_REQ`(0x0A) 登记，vendor_seq/
-  HT/聚合/加密全部无辜**；同日晚 R11 在 ht=1 健康链路上复现（PRE 0% 起跑、
-  round 2 死、tail `10 2C→90 2C`），R12 证明 fmt=0 载荷则**出生即闸死**数据面
-  （`00 04`），R13 确认 ht=1 纯基线长期存活——毒性在**载荷/注册处理**，
-  "消息本身有毒"被否证（详见 r25 报告 §9 与 CHANGELOG `[Unreleased]`）。
+  **当前状态（2026-10-04 凌晨，r26）：炸弹拆除——`sta_add_fmt=7` 修复载荷实证可用**。
+  r25 R 臂归因（引爆点锁定 `MM_STA_ADD_REQ` 登记、vendor_seq/HT/聚合/加密无辜）
+  经健康链路终审确认；r26 夜间二分把毒物定位到厂商 fmt=5 载荷的三个未知掩码块
+  （+0x04..05/0xfffa、+0x18..0x1f、+0x24..25），**宽切除版 `sta_add_fmt=7`
+  通过三重验证**：断开重连恢复（会话复用兼容）、12 分钟浸泡零死亡、
+  21.4 Mbit/s UDP 洪泛 30 秒全存活（旧 fmt=5 时代第 21/44 次传输即挂）。
+  聚合咬合同步达成（`agg_max_xfers` 默认值 1 曾是元凶，需设 0）。
+  **遗留**：聚合吞吐受 mac80211 TXQ 计量限制（~55 帧/s，airtime 94% 空闲；
+  aic8800d80 驱动以自定义 netdev_ops 绕开 mac80211 TXQ 的方案为修复模板），
+  排查记录与两条修复路线见 r25 报告 §9 与 `re/REPORT_AIC_MIGRATION.md`。
+  tail 状态分类学：`00 7A`=数据流动 / `00 3A`=宽切除会话稳定态 / `10 2C→90 2C`=
+  死亡序列 / `00 04`=已关联但数据从未流动。
   另记环境怪癖：TP-LINK AP 断电重启后 5G 只拒 legacy 调制**数据**帧
-  （管理帧/HT 帧正常），`ht_cap_enable=1` 可绕过。心跳 tail 三态是固件侧死亡
-  标记，早于 mac80211 掉关联约 9 秒 ⇒ 原"TX 死锁"取证（TX 三计数器冻结、
-  头 4~10 帧后停摆、"26 倍 TX 差距"）实为掉关联态照片/死前残值。
-  连续聚合另有"有限次数后打挂设备"的稳定性问题（`agg_max_units=8` 第 21 次、`=3`/`=2`
-  第 44 次；1 ms 节流无效）。详见 CHANGELOG `[Unreleased]` r21 定案条目。
+  （管理帧/HT 帧正常），`ht_cap_enable=1` 可绕过。
+  连续聚合"有限次数后打挂设备"的历史问题在 fmt=7 会话上**未复现**
+  （30 秒洪泛 + 12 分钟浸泡全存活），待长 soak 复核。详见 CHANGELOG `[Unreleased]`。
 - **做 TX 实验必须带功能判据**：`usb_bulk_msg` 完成得快**不等于**帧发出去了
   （本项目自己踩过这个坑）。请用 `tools/arp_oracle.py`（发 ARP 请求看网关回不回）作为必跑项。
   ⚠️ **但它只在开放网络上有效**：该工具用 `ZT_IOC_TXRAW` 发**未加密**数据帧，
