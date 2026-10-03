@@ -16,9 +16,50 @@
 > 截至 2026-10-02（r19~r22）：`sta_add_en`/`ampdu_en`/`tx_staid4b` 等**行为开关仍默认 0**，
 > 但三个参数的默认值已按实测改定 —— `sta_add_fmt=5`（厂商实抓真载荷）、`key_en=2`
 > （mac80211 软件加解密）、`sta_reuse=1`（会话跨重连复用）。默认组合已能完成 WPA2 关联 +
-> DHCP + ping，**当前总卡点是固件数据路径在 `MM_STA_ADD` 登记后 8~40s 内定时死亡**
-> （r25 R 臂归案：R1 基线参数 5 分钟零掉关联存活——引爆点锁定 STA_ADD 登记，
-> vendor_seq/HT/聚合/加密全部无辜；见下方 r25 条目）。
+> DHCP + ping。
+> **2026-10-04（r26）：炸弹拆除** —— r25 定位的"登记后 8~40s 定时死亡"已由
+> `sta_add_fmt=7`（宽切除修复载荷）实证拆除（重连恢复 + 12min 浸泡 + 21.4 Mbit/s
+> 洪泛 30s 全存活），详见下方 r26 条目；剩余问题收敛为聚合吞吐的 mac80211 TXQ 计量。
+
+## [Unreleased] r26（2026-10-04 凌晨）：炸弹拆除 + 聚合咬合 + TXQ 计量定位
+
+- **`sta_add_fmt=7`（宽切除修复载荷，新实验开关）**：fmt=5 厂商真载荷保留
+  "速率核"（format/max-mcs/r_idx/0x0ff0 位图/NSS/AID/BSSID），清零三个未知
+  掩码块（+0x04..05=0xfffa、+0x18..0x1f、+0x24..25=0xffff）。**三重验证**：
+  断开重连恢复（r20 会话复用兼容）、12 分钟浸泡零死亡、21.4 Mbit/s UDP 洪泛
+  30 秒全存活（旧 fmt=5 时代第 21/44 次传输即挂）。R13（无 STA_ADD 基线）
+  同链路同速率对照成立。
+- **二分过程（R11-R17，每臂判据预登记）**：R11（fmt=5）PRE 0% → round 2 死
+  （tail `10 2C→90 2C`）＝炸弹复现；R12（fmt=0）出生即闸死（`00 04`、B≡0）；
+  R13（ht=1 纯基线）5min 存活 ⇒ 毒在载荷。R14（固件 KEY_ADD 零材料注入）
+  打断数据面（固件 key 状态调制 TX 管线实证）；R15（MCS 钳位 0b→07）无效
+  ⇒ 速率档排除；R16（宽切除）存活 + R17（前半掩码回填）死亡 ⇒ **毒物锁定在
+  fmt=5 的掩码块**。
+- **健康链路发现（R9-R10）**：TP-LINK AP 断电重启后 5G 只拒 legacy 调制
+  数据帧（assoc/4 次握手/加密 RX 全通、DHCP/ARP 零响应；2.4G 同卡全通；
+  `ht_cap_enable=1` 绕过）——beacon 仍通告 legacy 基础速率，AP 行为与自播
+  beacon 矛盾，机制未解。
+- **聚合咬合达成（R20-R21b）**：旧"第 21/44 次传输打挂"在 fmt=7 会话上
+  **未复现**（30s 洪泛全存活）；咬合元凶 = `agg_max_xfers` 默认值 1（第一次
+  尝试后永久关闭打包），需设 0。
+- **剩余问题定位：mac80211 TXQ 计量**（agg 路径 ~55 帧/s vs 单帧路径
+  1760 帧/s，35 倍差；airtime 94% 空闲；tx failed=0）。已排除：打印洪流、
+  扫描打断、USB 速度（bulk 116us）、状态上报模式（free/全 ACK/同步）、
+  速率回填、无锁旁路。tx_diag 纠正：重负载走 TXQ（44k 帧）、轻负载走
+  legacy（5 帧）。修复两条路线过夜沉淀（见 r25 报告 §9）：
+  ① 读 mac80211 dequeue 的 hold 语义；② 学 aic8800d80 挂自定义 netdev_ops
+  绕开 mac80211 TXQ（aic 源码为 GPL 模板）。
+- **参考源码入库（本地 re/reference/，gitignored）**：aic8800_fdrv（CS 包
+  GPL 源码树，SDK 同源）、aic8800d80 全套、ZTOP ZT9101 原厂源码
+  （Codeberg，Realtek 系架构）、FCC 档案 3 份 PDF（模块 datasheet/内部
+  照片/批准信）、mac80211 master 快照。跨参考报告：
+  `re/REPORT_AIC_CROSSREF.md`、`re/REPORT_AIC_MIGRATION.md`。
+- **新工具**：`re/_r3_rxdump.py`（chardev RX 帧分类 dump：EAPOL/单播定向/
+  beacon——连接期抓握手必备）；`re/_r14_keyadd.py`（固件 KEY_ADD 注入器）。
+- **方法坑入册**：跨 BSSID 切换不重载模块 = 固件会话陈旧（每臂必须全新
+  模块）；写死网关 MAC 的 permanent neigh 遇 AP 重启必翻车；远端重编后
+  必须 `make sign`；sshd 偶发拒绝连接加重试循环即可；聚合期 dev_info
+  每帧打印会拖垮 TXQ 排水（打印门控修复）。
 
 ### Added (v0.4 主线：站点会话 + A-MPDU 聚合)
 - **A-MPDU 推送语义已定案（2026-09-30）：A-MPDU 由驱动在传输层组帧**。
@@ -288,29 +329,23 @@
   memdump/sysstat/trace。
 
 ### Planned (v0.4 主线：上传快路径与厂商渠道)
-- **上传真正修好（r25 口径，方向已锁定为"MM_STA_ADD 登记毒性"）**：会话/BA/密钥
-  三步都已落地（`sta_add_en` + `ampdu_action` + `key_en=2`），数据帧确实进了固件，
-  但**固件数据路径在 STA_ADD 登记后 8~40s 内定时死亡**（r25 R 臂归案：R1 基线
-  5min 存活、R2 +STA_ADD(fmt=5) round 3 死；tail `00 7A→10 2C→90 2C` 是固件侧
-  死亡标记）。剩余判决按预登记判据执行（见 r25 报告 §6）：
-  ① R3：legacy + `sta_add_fmt=0`（legacy 模板载荷）——判"消息本身 vs fmt=5
-  载荷内容"（待 AP 物理清理后执行）；
-  ② 若 fmt=0 也死 ⇒ 换 STA_ADD 策略（重试/降级/不发 STA_ADD 走基线路线重新
-  评估 26 倍差距的真值）；
-  ③ 若 fmt=0 活 ⇒ 逐字段差分 fmt=5 载荷（对照 `re/REPORT_STA_ADD_STRUCT.md`
-  §3.2/§6.2），定位毒字段。
-  **不要再盲试描述符常量**（第 9 轮 22 组 + `tx_desc_mask` 8 组 + `tx_staid4b`
-  首臂，结论一致），也**不要盲发 trace 类消息**（r24 判死）。
-- **上传吞吐（旧结论已作废）**：此前测得的"TX 字节率上限 6.2–7.2 Mbit/s"是**管理帧模板**下的
-  结果，不代表设备能力 —— 厂商同链路 95.3 Mbit/s。"URB 流水线无用"的结论仍然成立
-  （4 进程并发反而更低）。详见 `re/EXPERIMENT_TX_RATE.md`。
-- **让速率控制真的能爬升（已收窄，勿再重复劳动）**：5GHz 实测显示 `station dump` 的速率长期停在
-  MCS 0。结论：**这不是驱动侧能解的问题**（见 `[0.3.0]`：主机侧无法影响发射速率）；
-  v0.4 已把当时设想的两件事都实装并实机跑过 —— `.ampdu_action`（`ampdu_en`）与
-  `ht_cap_enable`，见上面的 Added。**唯一剩下的卡点是 A-MPDU 的推送/封装语义**
-  （mac80211 交下聚合 skb，驱动仍一帧一次 bulk + 28 字节描述符 ⇒ 压流量掉线），
-  需要抓一次聚合帧的长度/描述符或拿到官方实现，不是继续调参数。
-- **厂商渠道（最高优先级）**：索取官方 Linux 驱动包，或**含 RAM 段代码的完整固件** ——
+- **会话修复已完成（2026-10-04，`sta_add_fmt=7`）**：宽切除载荷通过浸泡+洪泛
+  三重验证（见上方 r26 条目）。**剩余唯一卡点 = 聚合吞吐的 mac80211 TXQ
+  计量**（agg 路径 ~55 帧/s vs 单帧路径 1760 帧/s；airtime 94% 空闲；
+  tx failed=0）。修复两条路线（见 r25 报告 §9 与 `re/REPORT_AIC_MIGRATION.md`）：
+  ① 读 mac80211 `ieee80211_tx_dequeue` 的 hold/计量语义（kernel.org 反爬，
+     改走 elixir.bootlin.com 或 sparse clone；重点查 AQL charge 与
+     `agg_start` 后的 TXQ 放行条件）；
+  ② **架构路线（参照 aic8800d80）**：挂自定义 netdev_ops 绕开 mac80211 TXQ
+     ——aic 源码已入库 `re/reference/`（rwnx_txq.c 私有队列 + 自己的聚合
+     = 现成模板）。
+- **fmt=5 毒字段精确定位（可选，学术）**：R17 已证明毒物在 fmt=5 的
+  +0x04..05/+0x18..0x1f/+0x24..25 三个掩码块（回填即死），逐字节二分可定
+  具体字段，但对 fmt=7 路线非必需。
+- **厂商渠道（最高优先级）**：索取官方 Linux 驱动包（`ZTOP_ACEV100_Android_
+  wifi_bt_*.tar.gz`，OpenHarmony 适配者证实存在），联系人
+  fangtekuan@ztopmicro.com / +86 15037065080（FCC 申报责任人）；
+  或 Olimex 官方支持（卖同款 USB-WIFI6-5G-ANT）。
   现有 219 KB 镜像里没有速率控制代码（指针表指向段外），这是唯一还能打开
   "主机影响发射速率"通道的路径
 
