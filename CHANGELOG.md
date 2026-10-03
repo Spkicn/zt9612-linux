@@ -16,9 +16,9 @@
 > 截至 2026-10-02（r19~r22）：`sta_add_en`/`ampdu_en`/`tx_staid4b` 等**行为开关仍默认 0**，
 > 但三个参数的默认值已按实测改定 —— `sta_add_fmt=5`（厂商实抓真载荷）、`key_en=2`
 > （mac80211 软件加解密）、`sta_reuse=1`（会话跨重连复用）。默认组合已能完成 WPA2 关联 +
-> DHCP + ping，**当前总卡点是固件数据路径在关联后 8~40s 内定时死亡**（r25 重定性：
-> 原"TX 死锁"实为掉关联态照片；与 HT/legacy、流量类型无关，死亡时间与流量强度负相关，
-> 见下方 r25 条目）。
+> DHCP + ping，**当前总卡点是固件数据路径在 `MM_STA_ADD` 登记后 8~40s 内定时死亡**
+> （r25 R 臂归案：R1 基线参数 5 分钟零掉关联存活——引爆点锁定 STA_ADD 登记，
+> vendor_seq/HT/聚合/加密全部无辜；见下方 r25 条目）。
 
 ### Added (v0.4 主线：站点会话 + A-MPDU 聚合)
 - **A-MPDU 推送语义已定案（2026-09-30）：A-MPDU 由驱动在传输层组帧**。
@@ -254,21 +254,31 @@
   消息名表全解 184 项（`re/_r25_nametable.py`，x64 指针 `<Q`）。
 - **新坑入册**：rmmod/insmod 快速循环 → AP 侧幽灵关联积累 → 新会话 5/5 连接
   失败（NL 臂），需物理清理（网卡重插/AP 断电）。
+- **R 臂归因（同轮后半场）——引爆点锁定 `MM_STA_ADD` 登记**：
+  R1（legacy + 纯基线参数）**5 分钟零掉关联存活**（ping 100 轮 mean 0.8%，
+  assoc 保持 >350s）；R2（legacy + `sta_add_en=1 sta_add_fmt=5`，无 vendor_seq）
+  **round 3 死**（连接后 ~8-10s），tail 三态与 Q/P/B 同构 ⇒
+  **`MM_STA_ADD_REQ`(0x0A, fmt=5 厂商真载荷) 发出后固件数据路径 8~15s 定时
+  死亡；vendor_seq/HT/聚合/加密全部无辜**。与第 17 轮自洽（fmt=2 当场死、
+  fmt=5 定时死）；fmt=0（legacy 模板）从未上机，R3 判据预登记（待 AP 物理
+  清理后执行：活 ⇒ fmt=5 载荷内容有毒；死 ⇒ 消息本身有毒）。
+  叙事波及：第 15 轮"Windows GO 必死循环"（关联/BA 成功后 8~25s 挂死）
+  与 r21 死锁均发生在 sta_add 时代之后，"GO 必死"很可能是同一枚炸弹。
 - 报告 `re/REPORT_R25_ARM_SWEEP.md`（七臂判决 + tail 判别器 + 定时炸弹时间线
   模型 + 名表全解）；工具 `tools/zt_arm_tool.py` 扩展 memdump/sysstat/trace。
 
 ### Planned (v0.4 主线：上传快路径与厂商渠道)
-- **上传真正修好（r25 口径，方向已重写为"关联后定时炸弹"）**：会话/BA/密钥三步
-  都已落地（`sta_add_en` + `ampdu_action` + `key_en=2`），数据帧确实进了固件，
-  但**固件数据路径在关联后 8~40s 内定时死亡**（r25 定案：与 HT/legacy、流量
-  类型无关，死亡时间与流量强度负相关；tail `00 7A→10 2C→90 2C` 是固件侧死亡
-  标记）。r24 的 H1/H2/H3 已上机判决**全部减分**，候选换轨为 R 臂参数归因
-  （判据预登记，见 r25 报告 §6）：
-  ① R1：legacy + 基线参数（无 sta_add/vendor_seq）——判决"定时炸弹是否与驱动
-  登记类消息有关"；
-  ② R2：legacy + `sta_add_fmt=5`（无 vendor_seq）——判决 MM_STA_ADD 登记毒性；
-  ③ R3：HT + 无 vendor_seq——判决 vendor_seq 回放毒性。
-  R1 也死 ⇒ 与参数无关，转攻 ch161/AP/频段特异性与纯时间触发模型。
+- **上传真正修好（r25 口径，方向已锁定为"MM_STA_ADD 登记毒性"）**：会话/BA/密钥
+  三步都已落地（`sta_add_en` + `ampdu_action` + `key_en=2`），数据帧确实进了固件，
+  但**固件数据路径在 STA_ADD 登记后 8~40s 内定时死亡**（r25 R 臂归案：R1 基线
+  5min 存活、R2 +STA_ADD(fmt=5) round 3 死；tail `00 7A→10 2C→90 2C` 是固件侧
+  死亡标记）。剩余判决按预登记判据执行（见 r25 报告 §6）：
+  ① R3：legacy + `sta_add_fmt=0`（legacy 模板载荷）——判"消息本身 vs fmt=5
+  载荷内容"（待 AP 物理清理后执行）；
+  ② 若 fmt=0 也死 ⇒ 换 STA_ADD 策略（重试/降级/不发 STA_ADD 走基线路线重新
+  评估 26 倍差距的真值）；
+  ③ 若 fmt=0 活 ⇒ 逐字段差分 fmt=5 载荷（对照 `re/REPORT_STA_ADD_STRUCT.md`
+  §3.2/§6.2），定位毒字段。
   **不要再盲试描述符常量**（第 9 轮 22 组 + `tx_desc_mask` 8 组 + `tx_staid4b`
   首臂，结论一致），也**不要盲发 trace 类消息**（r24 判死）。
 - **上传吞吐（旧结论已作废）**：此前测得的"TX 字节率上限 6.2–7.2 Mbit/s"是**管理帧模板**下的
