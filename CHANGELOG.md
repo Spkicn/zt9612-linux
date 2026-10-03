@@ -260,12 +260,32 @@
   **round 3 死**（连接后 ~8-10s），tail 三态与 Q/P/B 同构 ⇒
   **`MM_STA_ADD_REQ`(0x0A, fmt=5 厂商真载荷) 发出后固件数据路径 8~15s 定时
   死亡；vendor_seq/HT/聚合/加密全部无辜**。与第 17 轮自洽（fmt=2 当场死、
-  fmt=5 定时死）；fmt=0（legacy 模板）从未上机，R3 判据预登记（待 AP 物理
-  清理后执行：活 ⇒ fmt=5 载荷内容有毒；死 ⇒ 消息本身有毒）。
+  fmt=5 定时死）。
   叙事波及：第 15 轮"Windows GO 必死循环"（关联/BA 成功后 8~25s 挂死）
   与 r21 死锁均发生在 sta_add 时代之后，"GO 必死"很可能是同一枚炸弹。
-- 报告 `re/REPORT_R25_ARM_SWEEP.md`（七臂判决 + tail 判别器 + 定时炸弹时间线
-  模型 + 名表全解）；工具 `tools/zt_arm_tool.py` 扩展 memdump/sysstat/trace。
+- **R11 健康链路终审（同日晚）——STA_ADD 毒性坐实**：R3 原定执行撞上 AP
+  断电重启后的连环坑（芯片挂死 -71/-110、写死网关 MAC 失效、AP 5G 数据面
+  失效），四次 5G 会话作废后查明两件事：
+  ① **AP 重启后 5G 只拒 legacy 调制的数据帧**（assoc/4 次握手/加密 RX 全通、
+  DHCP/ARP 零响应；2.4G 同卡同驱动全通；`ht_cap_enable=1` 完全绕过，
+  beacon 仍通告 legacy 基础速率——AP 侧行为与其自播 beacon 矛盾，机制未解）；
+  ② 借 `ht_cap_enable=1` 恢复健康 5G 数据面后重跑 fmt=5 炸弹臂（R11）：
+  **PRE-LIVENESS 0% 起跑 → round 2 死（~5-8s），census tail `10 2C`×3→
+  `90 2C`×57、B 冻结**，与 R2/Q/B/P 逐位同构且链路健康由 R10（同链路
+  ping 10/10）与 PRE 0% 双重锚定 ⇒ **R 臂归因获得健康链路最终确认**，
+  "AP 劣化伪象"假说出局。tail 标记分类学新增 `00 04` = 已关联但数据从未
+  流动（坏链路/幽灵会话标志，与死亡序列区分）。工具：`re/_r3_rxdump.py`
+  （chardev RX 帧分类 dump，EAPOL/单播定向/beacon）。方法坑入册：跨 BSSID
+  切换不重载模块 = 固件会话陈旧，每臂必须全新模块；写死网关 MAC 的
+  `ip neigh replace` 遇 AP 重启必翻车，改动态 ARP 解析（`_r25_armR3b.sh`）。
+  **R12/R13 完成判决链闭环**：R12（ht=1 + fmt=0 健康链路）**出生即闸死**
+  （PRE 100%、tail `00 04`、B≡0）；R13（ht=1 纯基线）**5 分钟全程存活**。
+  同链路同驱动同时段、唯一变量为 STA_ADD 载荷 ⇒ **"消息本身有毒"否证，
+  毒在载荷内容/固件对注册对端的处理**——fmt=0 立即闸死、fmt=5 延迟炸弹。
+  下一步：fmt=5 载荷逐字段二分（它至少让数据流动）。
+- 报告 `re/REPORT_R25_ARM_SWEEP.md`（七臂判决 + §9 后记 + tail 判别器 +
+  定时炸弹时间线模型 + 名表全解）；工具 `tools/zt_arm_tool.py` 扩展
+  memdump/sysstat/trace。
 
 ### Planned (v0.4 主线：上传快路径与厂商渠道)
 - **上传真正修好（r25 口径，方向已锁定为"MM_STA_ADD 登记毒性"）**：会话/BA/密钥
