@@ -605,6 +605,7 @@ struct zt_dev {
 	unsigned long		ba_rx_stop;
 	unsigned long		tx_agg_xfers;	/* 聚合：一次传输里装多个 MPDU 的次数 */
 	unsigned long		tx_agg_mpdus;	/* 聚合：被聚合发送的 MPDU 总数 */
+	u32			tx_agg_last_bulk_us; /* 聚合：最近一次 bulk OUT 的 USB 耗时（诊断） */
 	unsigned long		tx_legacy_frames;	/* 走传统 .tx 路径的帧数（实测主路径） */
 	unsigned long		tx_txq_frames;	/* 走 TXQ（wake_tx_queue）路径的帧数 */
 	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
@@ -2348,8 +2349,12 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			z->tx_agg_last = jiffies;
 		}
 		mutex_lock(&z->lock);
-		ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
-				   buf, total, &sent, 1000);
+		{
+			u64 t0 = ktime_get_ns();
+			ret = usb_bulk_msg(z->udev, usb_sndbulkpipe(z->udev, (u8)tx_ep),
+					   buf, total, &sent, 1000);
+			z->tx_agg_last_bulk_us = (u32)((ktime_get_ns() - t0) / 1000);
+		}
 		mutex_unlock(&z->lock);
 		if (ret) {
 			dev_warn(&z->intf->dev, "tx(agg): bulk OUT 失败 (%d)\n", ret);
@@ -2365,9 +2370,13 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		/* 聚合帧此刻才真正上线，现在才允许进 done[] 报状态 */
 		for (j = 0; j < sub; j++)
 			done[k++] = skb[agg_idx[j]];
-		dev_info(&z->intf->dev,
-			 "tx(agg): %d 单元 / 一次传输 %d 字节（累计 %u 次 / %u MPDU）\n",
-			 sub, total, (u32)z->tx_agg_xfers, (u32)z->tx_agg_mpdus);
+		/* ⚠️ 2026-10-03：每 bulk 一条 dev_info 在洪泛下就是打印洪流
+		 * （实测把 TXQ 排水拖到 0.5 Mbit/s），改为 tx_diag 门控。 */
+		if (tx_diag)
+			dev_info(&z->intf->dev,
+				 "tx(agg): %d 单元 / %d 字节 / bulk 耗时 %u us（累计 %u 次 / %u MPDU）\n",
+				 sub, total, z->tx_agg_last_bulk_us,
+				 (u32)z->tx_agg_xfers, (u32)z->tx_agg_mpdus);
 	}
 
 	/*
