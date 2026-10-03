@@ -3323,18 +3323,34 @@ static void zt_tx_work(struct work_struct *w)
 
 		while ((skb = skb_dequeue(&z->txq))) {
 			z->tx_legacy_frames++;
+			/*
+			 * 预筛（r26）：只有"聚合合格"帧才进批——数据+Protected+
+			 * 单播+长度窗+会话门。不合格帧（ping/ARP/广播）直接走
+			 * zt_tx_one（持锁、已证 1800fps 快路径），避免把它们喂进
+			 * agg_send 的"无锁 zt_tx_frame"旁路（R23 实测：喂进去后
+			 * 整批退化时吞吐塌 35 倍）。
+			 */
 			if (ampdu_en && !agg_block &&
 			    (agg_max_xfers <= 0 ||
 			     (int)z->tx_agg_attempts < agg_max_xfers) &&
 			    cnt < ZT_AGG_SUBFRAMES) {
-				batch[cnt++] = skb;
-				if (cnt == ZT_AGG_SUBFRAMES) {
-					zt_tx_agg_send(z, batch, cnt, &again);
-					cnt = 0;
+				u8 *d = skb->data;
+				u16 fl = skb->len;
+				bool elig = z->sta_valid && z->ba_valid &&
+					    fl >= 4 && ((d[0] & 0x0c) == 0x08) &&
+					    (d[1] & 0x40) && !(d[4] & 0x01) &&
+					    fl <= 1572 &&
+					    (agg_min_len <= 0 || (int)fl >= agg_min_len);
+				if (elig) {
+					batch[cnt++] = skb;
+					if (cnt == ZT_AGG_SUBFRAMES) {
+						zt_tx_agg_send(z, batch, cnt, &again);
+						cnt = 0;
+					}
+					continue;
 				}
-				continue;
 			}
-			/* 不进批（valve 关闭/批满兜底）：先冲攒批保持顺序，再单帧 */
+			/* 不合格/阀门关：先冲攒批保持顺序，再走快路径单发 */
 			if (cnt) {
 				zt_tx_agg_send(z, batch, cnt, &again);
 				cnt = 0;
