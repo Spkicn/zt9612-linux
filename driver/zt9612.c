@@ -392,9 +392,9 @@ MODULE_PARM_DESC(sta_reuse, "1=skip MM_STA_ADD when a session for the same BSSID
  * （K1：固件拿 beacon 缓存的 AP HT 能力做交叉校验；K2：缺 vendor 关联序列
  * 前置消息），修复路径待固件侧静态定位，先勿再盲试载荷。
  */
-static int sta_add_fmt = 5;
+static int sta_add_fmt = 7;
 module_param(sta_add_fmt, int, 0644);
-MODULE_PARM_DESC(sta_add_fmt, "#MCS-RX-DEAF experiment: RC-block format in MM_STA_ADD_REQ (5=vendor-verbatim payload from 2026-10-02 USBPcap capture, DEFAULT, r21; 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only)");
+MODULE_PARM_DESC(sta_add_fmt, "RC-block format in MM_STA_ADD_REQ (7=wide-cut payload, DEFAULT, r26: unknown mask blocks zeroed, survives reconnect+soak+flood; 5=vendor-verbatim payload (r21-r25 default: data path timers out 8-40s after assoc); 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only; 6=max-MCS clamp (r25: dies); 8=mask bisection arm (r26)");
 
 /*
  * r21 实验：关联后补发厂商配置序列（STA_ADD 之后、密钥之前的 8 条消息）。
