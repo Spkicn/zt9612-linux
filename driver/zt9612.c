@@ -1102,6 +1102,47 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		memcpy(pl, zt_sta_add_v5, sizeof(pl));
 		put_unaligned_le16(aid, pl + 0x14);
 		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 6) {
+		/*
+		 * R15（r25 健康链路二分第一臂）：fmt=5 + max-MCS 钳位。
+		 * SDK 语义（aic8800_fdrv）：+0x01 = 速率表最高 MCS（0x0b = HE
+		 * MCS11）。假说：炸弹 = 固件 RC 爬到 MCS8-11 后进入无效状态。
+		 * 实测（R15）：PRE 0% → round 2 死，与 R11 同时刻 ⇒ 速率档排除。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x01] = 0x07;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 7) {
+		/*
+		 * R16（二分第二臂，宽切除）：fmt=5 保留"速率核"（format/max-mcs/
+		 * r_idx/0x0ff0 位图/NSS 小整数/AID/BSSID），清零全部未知掩码：
+		 * +0x04..05(0xfffa)、+0x18..0x1f(ffff 007f ffff 0fff)、+0x24..25(ffff)。
+		 * 实测（R16）：PRE 0% + 5min 全程存活，census tail `00 3A`×60、
+		 * B 活跃（61→562）⇒ 炸弹在被清零的掩码块内，且清零后固件进入
+		 * 稳定工作态（tail 状态码 3A ≠ 已知健康 7A，语义未解但稳定）。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x04] = 0;
+		pl[0x05] = 0;
+		memset(pl + 0x18, 0, 8);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 8) {
+		/*
+		 * R17（掩码块二分，前半回填）：恢复 +0x04..05(0xfffa) 与
+		 * +0x18..0x1b(ff ff 7f 00)，+0x1c..0x1f 与 +0x24..25 保持清零。
+		 * 判据：死 ⇒ 毒物 ∈ {A:+0x04..05, B:+0x18..19, C:+0x1a..1b}；
+		 * 活 ⇒ 毒物 ∈ {D:+0x1c..1d, E:+0x1e..1f, F:+0x24..25}。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		memset(pl + 0x1c, 0, 4);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
 	}
 
 	if (zt_cmd_fifo_resp(z, 0x000a, pl, ZT_STA_ADD_LEN,
@@ -3257,15 +3298,43 @@ static void zt_tx_work(struct work_struct *w)
 		 * ⚠️ 2026-10-01 实测：**本内核把数据帧走这条路**（不是注释原先写的
 		 * "TXQ 才是主路径"）—— 13k 帧的真实流量下 TXQ 分支一次都没被走到。
 		 *
-		 * 也试过在这里攒批（复用 zt_tx_agg_send）：结果**明显回归** ——
-		 * `tx_blast` 1.26 Mbit/s、网关 ping 丢包 **90%**（改前同链路 10.3 Mbit/s / 0%），
-		 * 于是整体回退，只保留计数。原因推测：这批帧走的是"传统路径"，
-		 * 与 BA 会话/聚合所需的 txq 语义不同（当时也没有 BA 会话）。
+		 * ⚠️ 2026-10-03（r26）重开聚合：旧回归（tx_blast 1.26 Mbit/s、
+		 * ping 90% 丢包）的根因是当时的三个缺陷组合——① 批内skb 泄漏/
+		 * 重复 report（2026-10-01 已修，见 zt_tx_agg_send 内注释）、
+		 * ② 没有 BA 会话却仍打包（ba_valid 门当时恒假，现在 fmt=7 +
+		 * TX_START 已能建立）、③ 一次只喂 1 帧导致打包永不成立。
+		 * 现按正确语义重开：攒最多 ZT_AGG_SUBFRAMES 帧交给
+		 * zt_tx_agg_send——它内部按 {sta_valid, ba_valid, prot, 长度}
+		 * 逐帧三选一（聚合 / 单帧），不合格帧自动走尾部单帧循环，
+		 * 顺序保持（先冲攒批再单发）。ampdu_en=0 时行为与 0.3.2 完全一致。
 		 */
+		struct sk_buff *batch[ZT_AGG_SUBFRAMES];
+		int cnt = 0;
+		bool again = false;
+
 		while ((skb = skb_dequeue(&z->txq))) {
 			z->tx_legacy_frames++;
+			if (ampdu_en && !agg_block &&
+			    (agg_max_xfers <= 0 ||
+			     (int)z->tx_agg_attempts < agg_max_xfers) &&
+			    cnt < ZT_AGG_SUBFRAMES) {
+				batch[cnt++] = skb;
+				if (cnt == ZT_AGG_SUBFRAMES) {
+					zt_tx_agg_send(z, batch, cnt, &again);
+					cnt = 0;
+				}
+				continue;
+			}
+			/* 不进批（valve 关闭/批满兜底）：先冲攒批保持顺序，再单帧 */
+			if (cnt) {
+				zt_tx_agg_send(z, batch, cnt, &again);
+				cnt = 0;
+			}
 			zt_tx_one(z, z->hw, skb, true);
 		}
+		if (cnt)
+			zt_tx_agg_send(z, batch, cnt, &again);
+		(void)again;	/* 批内所有帧都已在 agg_send 内发出/释放，again 仅提示继续喂 */
 
 		/* 2) TXQ 路径：取出本轮被唤醒的队列，逐个 dequeue 到空 */
 		spin_lock_irqsave(&z->txq_lock, flags);
