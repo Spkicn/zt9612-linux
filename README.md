@@ -300,10 +300,14 @@ sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 期望 40 个以上（双频）
   （ping 100 轮 mean 0.8%，assoc 保持 >350s）；R2（legacy + `sta_add_en=1
   sta_add_fmt=5`）**round 3 死**（连接后 ~8-10s），tail 三态 `00 7A→10 2C→90 2C`
   与 Q/P/B 会话同构 ⇒ **引爆点锁定 `MM_STA_ADD_REQ`(0x0A) 登记，vendor_seq/
-  HT/聚合/加密全部无辜**；心跳 tail 三态是固件侧死亡标记，早于 mac80211 掉关联
-  约 9 秒 ⇒ 原"TX 死锁"取证（TX 三计数器冻结、头 4~10 帧后停摆、"26 倍 TX 差距"）
-  实为掉关联态照片/死前残值。R3（`sta_add_fmt=0` 载荷）判据预登记待执行（AP 物理
-  清理后），详见 CHANGELOG `[Unreleased]` r25 条目与 `re/REPORT_R25_ARM_SWEEP.md`。
+  HT/聚合/加密全部无辜**；同日晚 R11 在 ht=1 健康链路上复现（PRE 0% 起跑、
+  round 2 死、tail `10 2C→90 2C`），R12 证明 fmt=0 载荷则**出生即闸死**数据面
+  （`00 04`），R13 确认 ht=1 纯基线长期存活——毒性在**载荷/注册处理**，
+  "消息本身有毒"被否证（详见 r25 报告 §9 与 CHANGELOG `[Unreleased]`）。
+  另记环境怪癖：TP-LINK AP 断电重启后 5G 只拒 legacy 调制**数据**帧
+  （管理帧/HT 帧正常），`ht_cap_enable=1` 可绕过。心跳 tail 三态是固件侧死亡
+  标记，早于 mac80211 掉关联约 9 秒 ⇒ 原"TX 死锁"取证（TX 三计数器冻结、
+  头 4~10 帧后停摆、"26 倍 TX 差距"）实为掉关联态照片/死前残值。
   连续聚合另有"有限次数后打挂设备"的稳定性问题（`agg_max_units=8` 第 21 次、`=3`/`=2`
   第 44 次；1 ms 节流无效）。详见 CHANGELOG `[Unreleased]` r21 定案条目。
 - **做 TX 实验必须带功能判据**：`usb_bulk_msg` 完成得快**不等于**帧发出去了
