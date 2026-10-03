@@ -19,9 +19,15 @@
 > DHCP + ping。
 > **2026-10-04（r26）：炸弹拆除** —— r25 定位的"登记后 8~40s 定时死亡"已由
 > `sta_add_fmt=7`（宽切除修复载荷）实证拆除（重连恢复 + 12min 浸泡 + 21.4 Mbit/s
-> 洪泛 30s 全存活），详见下方 r26 条目；剩余问题收敛为聚合吞吐的 mac80211 TXQ 计量。
+> 洪泛 30s 全存活），详见下方 r26 条目；`sta_add_fmt` 默认值已切换为 7。
+> **2026-10-04（r34 静态判决）：剩余瓶颈重新归因** —— 对 mac80211 master 快照
+> 逐门判定：AQL/airtime 计量对本驱动整体关闭（未声明 `NL80211_EXT_FEATURE_AQL`），
+> 且数据帧从不走 mac80211 TXQ（无 `.sta_state` ⇒ `sta->uploaded` 恒 false）——
+> 此前"TXQ 计量"表述全部作废；35 倍差的当前最优模型为"多单元 bulk 一次性楔死
+> 固件 TX 推送控制器"，R34 段序判决臂（`re/_r34_segment.sh`）待上机执行，
+> 详见 `re/REPORT_R34_TXQ_STATIC.md`。
 
-## [Unreleased] r26（2026-10-04 凌晨）：炸弹拆除 + 聚合咬合 + TXQ 计量定位
+## [Unreleased] r26（2026-10-04 凌晨）：炸弹拆除 + 聚合咬合 + 瓶颈定位
 
 - **`sta_add_fmt=7`（宽切除修复载荷，新实验开关）**：fmt=5 厂商真载荷保留
   "速率核"（format/max-mcs/r_idx/0x0ff0 位图/NSS/AID/BSSID），清零三个未知
@@ -42,13 +48,15 @@
 - **聚合咬合达成（R20-R21b）**：旧"第 21/44 次传输打挂"在 fmt=7 会话上
   **未复现**（30s 洪泛全存活）；咬合元凶 = `agg_max_xfers` 默认值 1（第一次
   尝试后永久关闭打包），需设 0。
-- **剩余问题定位：mac80211 TXQ 计量**（agg 路径 ~55 帧/s vs 单帧路径
-  1760 帧/s，35 倍差；airtime 94% 空闲；tx failed=0）。已排除：打印洪流、
+- **剩余问题定位（2026-10-04 r34 修正）**：35 倍差（agg 路径 ~55 帧/s vs 单帧路径
+  1760 帧/s；airtime 94% 空闲；tx failed=0）。~~mac80211 TXQ 计量~~表述**作废**
+  （r34 静态判决：AQL 未声明特性整链关闭 + 数据帧从不进 TXQ）。已排除：打印洪流、
   扫描打断、USB 速度（bulk 116us）、状态上报模式（free/全 ACK/同步）、
-  速率回填、无锁旁路。tx_diag 纠正：重负载走 TXQ（44k 帧）、轻负载走
-  legacy（5 帧）。修复两条路线过夜沉淀（见 r25 报告 §9）：
-  ① 读 mac80211 dequeue 的 hold 语义；② 学 aic8800d80 挂自定义 netdev_ops
-  绕开 mac80211 TXQ（aic 源码为 GPL 模板）。
+  速率回填、无锁旁路、mac80211 AQL/deficit、BA 会话 hold。当前最优模型 =
+  **多单元 bulk 一次性楔死固件 TX push controller**（R24 预筛后 B/C 段主机侧
+  逐字节等价而吞吐差 35 倍 ⇒ 毒在会话历史不在代码路径）；R34 段序判决臂
+  （C1 干净基准 → A1 首聚合 → C2 楔死后再单帧 → C3 自愈观察）待上机，
+  判据预登记见 `re/REPORT_R34_TXQ_STATIC.md` §5。
 - **参考源码入库（本地 re/reference/，gitignored）**：aic8800_fdrv（CS 包
   GPL 源码树，SDK 同源）、aic8800d80 全套、ZTOP ZT9101 原厂源码
   （Codeberg，Realtek 系架构）、FCC 档案 3 份 PDF（模块 datasheet/内部
