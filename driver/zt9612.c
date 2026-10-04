@@ -523,6 +523,20 @@ static int agg_gap_us;
 module_param(agg_gap_us, int, 0644);
 MODULE_PARM_DESC(agg_gap_us, "experimental: minimum microseconds between aggregated bulk transfers (0 = unrestricted; use to test whether pacing prevents the firmware crash)");
 
+/*
+ * r38：`MM_BA_ADD_REQ` 的载荷布局选择。
+ *
+ * 动机（r36/r37 定案后的头号候选）：厂商实抓的 BA_ADD 是 **7 字节**
+ * {sta,tid,?,A:u16,B:u16}，而我们一直按 aic8800 SDK 的 **8 字节**
+ * {type,sta,tid,pad,A:u16,B:u16} 发。若固件按 7 字节解析我们的 8 字节，
+ * 它读到的会是 sta=0、tid=sta_idx、A=0x4000（=16384，荒谬窗口）——
+ * 而"固件一开始真的用这个窗口组 A-MPDU 就断言 macif.c:1019"正好能被它解释。
+ * 0 = 8 字节（现状，默认，行为与之前完全一致）；1 = 7 字节（厂商实抓布局）。
+ */
+static int ba_add_fmt;
+module_param(ba_add_fmt, int, 0644);
+MODULE_PARM_DESC(ba_add_fmt, "experimental: MM_BA_ADD_REQ payload layout; 0=8B {type,sta,tid,pad,u16 A,u16 B} SDK layout (default), 1=7B vendor-captured layout {sta,tid,pad,u16 A,u16 B}");
+
 struct zt_dev {
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -1146,6 +1160,32 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		pl[0x25] = 0;
 		put_unaligned_le16(aid, pl + 0x14);
 		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 9) {
+		/*
+		 * r38（安全块回填臂一）：fmt=7 + 只回填 F 块 +0x24..25（模板 0xffff）。
+		 * r25-R17 只证明毒物在 {A:+0x04..05, B:+0x18..19, C:+0x1a..1b}，
+		 * D/E/F 三块从未被单独回填过 ⇒ 本臂保持数据面存活，用来单变量回答
+		 * "0x0600 断言是否与 F 块有关"。判据必须带 agg_multi>0 才算数。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x04] = 0;
+		pl[0x05] = 0;
+		memset(pl + 0x18, 0, 8);
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 10) {
+		/*
+		 * r38（安全块回填臂二）：fmt=7 + 只回填 D/E 块 +0x1c..1f。
+		 * 同上，数据面应存活；单变量回答断言与 D/E 块是否有关。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x04] = 0;
+		pl[0x05] = 0;
+		memset(pl + 0x18, 0, 4);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
 	}
 
 	if (zt_cmd_fifo_resp(z, 0x000a, pl, ZT_STA_ADD_LEN,
@@ -1428,14 +1468,10 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	u8 params[8];
 	u8 resp[4];
 	u16 rlen = 0;
+	int plen;
 
 	if (!z->sta_valid)
 		return -EINVAL;
-	/* type：BA_AGMT_TX/RX 的取值未定；0 实测被接受 */
-	params[0] = 0;
-	params[1] = z->sta_idx;
-	params[2] = tid;
-	params[3] = 0;
 	/*
 	 * mac80211 在 TX_START 时给的 buf_size 可能是 0（那是"对端窗口"语义），
 	 * 而用户态实测被固件接受的是 A=64 ⇒ 这里做下限保护。
@@ -1445,12 +1481,28 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	 */
 	if (bufsz < 64)
 		bufsz = 64;
-	put_unaligned_le16(bufsz, params + 4);	/* A：候选 bufsz */
-	put_unaligned_le16(ssn, params + 6);	/* B：候选 ssn */
-	dev_info(&z->intf->dev, "BA_ADD: type=0 sta=%u tid=%u A=%u B=%u\n",
-		 z->sta_idx, tid, bufsz, ssn);
+	/* r38：两种载荷布局（见 ba_add_fmt 注释）；唯一变量，默认 0 = 行为不变。 */
+	if (ba_add_fmt == 1) {
+		params[0] = z->sta_idx;
+		params[1] = tid;
+		params[2] = 0;
+		put_unaligned_le16(bufsz, params + 3);	/* A */
+		put_unaligned_le16(ssn, params + 5);	/* B */
+		plen = 7;
+	} else {
+		/* type：BA_AGMT_TX/RX 的取值未定；0 实测被接受 */
+		params[0] = 0;
+		params[1] = z->sta_idx;
+		params[2] = tid;
+		params[3] = 0;
+		put_unaligned_le16(bufsz, params + 4);	/* A：候选 bufsz */
+		put_unaligned_le16(ssn, params + 6);	/* B：候选 ssn */
+		plen = 8;
+	}
+	dev_info(&z->intf->dev, "BA_ADD: fmt=%d len=%d sta=%u tid=%u A=%u B=%u\n",
+		 ba_add_fmt, plen, z->sta_idx, tid, bufsz, ssn);
 
-	if (zt_cmd_fifo_resp(z, 0x0028, params, sizeof(params), 0x0029, 1000, resp, &rlen)) {
+	if (zt_cmd_fifo_resp(z, 0x0028, params, plen, 0x0029, 1000, resp, &rlen)) {
 		z->ba_add_fail++;
 		dev_warn(&z->intf->dev, "BA_ADD: no CFM (tid=%u)\n", tid);
 		return -EIO;
