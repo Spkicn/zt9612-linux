@@ -31,7 +31,7 @@
 > 多单元消费逐次衰减直至挂死）。v0.4 结论：聚合禁用于持续负载，单帧 16 Mbit/s
 > 为当前安全上限。详见 `re/REPORT_R34_TXQ_STATIC.md` §4。
 
-## [Unreleased] r26（2026-10-04 凌晨）：炸弹拆除 + 聚合咬合 + 瓶颈定位
+## [Unreleased] r26–r35（2026-10-04）：炸弹拆除 → 阶梯终判 → 盲探收口
 
 - **`sta_add_fmt=7`（宽切除修复载荷，新实验开关）**：fmt=5 厂商真载荷保留
   "速率核"（format/max-mcs/r_idx/0x0ff0 位图/NSS/AID/BSSID），清零三个未知
@@ -62,8 +62,14 @@
   消费逐次衰减直至挂死）——**聚合禁用于持续负载**，单帧 16 Mbit/s 为当前
   安全上限；-71 档挂死 `nmcli connection up` 即可恢复，无需拔插。驱动侧改动：
   TXQ 分支 drain-until-empty（语义修正，保留）+ `txq_wakes`/`txq_works` debugfs
-  计数。下一步：GET_STA_INFO(0x75)/AGG_DISABLE(0x63) 盲探臂攻固件消费衰减。
-  方法教训入册：**多网卡环境打流必须绑定接口**。
+  计数。方法教训入册：**多网卡环境打流必须绑定接口**。
+- **r35 盲探判决（同日）：固件未实现 aic 扩展诊断通道** —— GET_STA_INFO(0x75，
+  sta_idx=0/3 两臂)、SET_AGG_DISABLE(0x63，开/关两臂)、vendor 0x0054/0x005a
+  六探针全部 NO CFM（窗口内心跳正常流动 ⇒ 固件活着但"不回"，即未实现）。
+  探针零副作用（探测后 ping 0%）。⇒ 固件视角 TX ACK 计数无内部通道，
+  "多单元消费衰减"的修复只剩厂商渠道与第二张卡空口抓包两路；
+  0x0054/0x005a 无 CFM 说明它们是 fire-and-forget 型，vendor_seq_en=1
+  原样回放语义不变。报告：`re/REPORT_R35_BLIND_PROBE.md`。
 - **参考源码入库（本地 re/reference/，gitignored）**：aic8800_fdrv（CS 包
   GPL 源码树，SDK 同源）、aic8800d80 全套、ZTOP ZT9101 原厂源码
   （Codeberg，Realtek 系架构）、FCC 档案 3 份 PDF（模块 datasheet/内部
@@ -343,17 +349,18 @@
   定时炸弹时间线模型 + 名表全解）；工具 `tools/zt_arm_tool.py` 扩展
   memdump/sysstat/trace。
 
-### Planned (v0.4 主线：上传快路径与厂商渠道)
-- **会话修复已完成（2026-10-04，`sta_add_fmt=7`）**：宽切除载荷通过浸泡+洪泛
-  三重验证（见上方 r26 条目）。**剩余唯一卡点 = 聚合吞吐的 mac80211 TXQ
-  计量**（agg 路径 ~55 帧/s vs 单帧路径 1760 帧/s；airtime 94% 空闲；
-  tx failed=0）。修复两条路线（见 r25 报告 §9 与 `re/REPORT_AIC_MIGRATION.md`）：
-  ① 读 mac80211 `ieee80211_tx_dequeue` 的 hold/计量语义（kernel.org 反爬，
-     改走 elixir.bootlin.com 或 sparse clone；重点查 AQL charge 与
-     `agg_start` 后的 TXQ 放行条件）；
-  ② **架构路线（参照 aic8800d80）**：挂自定义 netdev_ops 绕开 mac80211 TXQ
-     ——aic 源码已入库 `re/reference/`（rwnx_txq.c 私有队列 + 自己的聚合
-     = 现成模板）。
+### Planned (v0.4 主线：r34/r35 终判后的剩余工作)
+- **聚合持续负载禁用已定案（r34 阶梯）**：单帧 2k pps（1,343 帧/s ≈ 16 Mbit/s）
+  为 v0.4 安全上限；`agg_block=1`（保 BA 会话禁打包）为可选折中。
+- **固件多单元消费衰减的修复（当前唯一主线卡点）**：
+  ① **厂商渠道（最高优先级）**：索取官方 Linux 驱动包（`ZTOP_ACEV100_Android_
+     wifi_bt_*.tar.gz`，联系人 fangtekuan@ztopmicro.com / +86 15037065080，
+     或 Olimex 官方支持）。r35 已证固件无内部诊断通道，拿到源码即全解；
+  ② **第二张卡空口抓包**：观察衰减期多单元 A-MPDU 的空口行为
+     （重传？BlockAck 停发？）——唯一可自主推进的硬判据（r23 报告 §5 采购卡）；
+  ③ fmt=5 毒字段逐字节二分（可选，学术）。
+- ~~mac80211 TXQ 计量 / AQL / netdev_ops 绕行~~ **全部作废**（r34：TXQ 从不限流，
+  旧 35 倍差是测试流量走错网口的测量伪象）。
 - **fmt=5 毒字段精确定位（可选，学术）**：R17 已证明毒物在 fmt=5 的
   +0x04..05/+0x18..0x1f/+0x24..25 三个掩码块（回填即死），逐字节二分可定
   具体字段，但对 fmt=7 路线非必需。
