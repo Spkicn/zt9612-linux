@@ -57,6 +57,17 @@
 #define ZT_TX_BUF_SIZE	2048		/* TX 缓冲（z->tx / z->txd） */
 #define ZT_TX_MAX_FRAME	(ZT_TX_BUF_SIZE - TX_DESC_LEN - 8)
 /*
+ * r39：调试通道（`ZT_IOC_TXRAW` / debugfs `tx_raw` / `/dev/zt9612` 的 `write()`）
+ * 单次可发的字节上限，**独立于**数据面的 `ZT_TX_BUF_SIZE`。
+ *
+ * 动机：这两个通道原本共用一个 2048 的上限，于是**无法逐字节回放**我们自己或厂商的
+ * 多单元 bulk（我们的致命形态是 3192 字节、厂商抓包里是 3200/4808 字节）。
+ * r39 实测：2048 以内能发出的多单元样本（我们的复刻 1888、厂商实抓 1888）**都不触发**
+ * 固件断言 ⇒ 必须能发 >2048 的形态才能继续判别。上限取 8192 = 厂商驱动的
+ * `tx_agg_max_len`（也是固件侧的安全上限，见文件头注释）。
+ */
+#define ZT_TXRAW_MAX	8192
+/*
  * 聚合实验（ampdu_en）用的更大缓冲：**A-MPDU 由本驱动自己组帧** —— mac80211 一次
  * `ieee80211_tx_dequeue()` 只给一个 MPDU，把多个 MPDU 拼进**同一次** bulk 传输是驱动的事
  * （2026-09-30 从厂商上传抓包定案：EP5 的传输长度是 1608 / 3200 / 4808，
@@ -1828,7 +1839,7 @@ static long zt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -ENODEV;
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
-	if (req.len < 9 || req.len > ZT_TX_BUF_SIZE)
+	if (req.len < 9 || req.len > ZT_TXRAW_MAX)
 		return -EINVAL;
 	buf = memdup_user((void __user *)(unsigned long)req.data, req.len);
 	if (IS_ERR(buf))
@@ -1858,7 +1869,7 @@ static ssize_t zt_dbg_tx_write(struct file *f, const char __user *ubuf,
 
 	if (!z || !READ_ONCE(z->alive))
 		return -ENODEV;
-	if (count < 9 || count > ZT_TX_BUF_SIZE)
+	if (count < 9 || count > ZT_TXRAW_MAX)
 		return -EINVAL;
 	buf = memdup_user(ubuf, count);
 	if (IS_ERR(buf))
@@ -3084,7 +3095,7 @@ static ssize_t zt_write(struct file *file, const char __user *buf, size_t count,
 	u8 *tmp;
 	int ret;
 
-	if (count < 8 || count > ZT_TX_BUF_SIZE)
+	if (count < 8 || count > ZT_TXRAW_MAX)
 		return -EINVAL;
 	if (!READ_ONCE(z->alive))
 		return -ENODEV;
