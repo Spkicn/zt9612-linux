@@ -1460,6 +1460,12 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 		dev_warn(&z->intf->dev, "BA_ADD_CFM: status=%u (tid=%u)\n", resp[0], tid);
 		return -EIO;
 	}
+	/*
+	 * 【r37 修复】阀门计数必须每个 BA 会话清零：`tx_agg_attempts` 原先
+	 * 只增不减，跑过一次打包后再设有限 `agg_max_xfers` 会静默禁用打包
+	 * （`agg_block=0` 也无效、无日志）。语义 = 每个 BA 会话最多尝试 N 次。
+	 */
+	z->tx_agg_attempts = 0;
 	z->ba_valid = true;
 	z->ba_tid = tid;
 	z->ba_add_ok++;
