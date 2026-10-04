@@ -508,14 +508,22 @@ static int tx_diag;
 module_param(tx_diag, int, 0644);
 MODULE_PARM_DESC(tx_diag, "experimental: expose how many frames took the legacy .tx path vs the TXQ path (write 1 to start logging on every wake-up)");
 /*
- * 只把 >= agg_min_len 的帧纳入聚合（默认 1500 = 满尺寸数据帧）。
- * 依据：厂商抓包里**每一个**聚合单元都是 1578 字节（MPDU 1550），最小的聚合传输是
- * 1888 = 1608 + 280；而我们第一枪聚合的是 394 + 138 字节两个小帧 —— 小帧进聚合是
- * 厂商样本里从未出现过的形态，先用"只聚合大帧"把它排除掉。
+ * 只把 >= agg_min_len 的帧纳入聚合（**默认 1549**，2026-10-04 r40 起）。
+ *
+ * r40 定案的硬规则（raw 通道单变量二分 + 驱动两臂交叉验证）：
+ *   非末尾单元**声明长度** `hlen = 28 + MPDU`
+ *     hlen <= 1576（MPDU <= 1548） -> 固件必断言 `macif.c:1019 scm_admin`
+ *     hlen >= 1577（MPDU >= 1549） -> 同样的字节完全无害
+ *   厂商抓包里**非末尾单元恒为 hlen 1578（MPDU 1550）**，与我们此前 1500 的阈值
+ *   放进来的一堆短帧（例：ICMP 1464 -> MPDU 1542/hlen 1570）正好落在必死侧 ——
+ *   这正是"一开聚合设备就断言"的驱动侧真因。
+ * 因此阈值取 1549（= 1577 - 28）：只聚合"满尺寸"数据帧，短帧一律走单帧路径。
+ * 依据（除上面条文外）：r36/r37 每次致命臂的 aggdump 都是 3192 字节 / hlen 1570；
+ * r40-H3 用 1549 阈值在健康链路上跑出 **1206 次聚合传输 / 3499 MPDU / 12 s 零断言**。
  */
-static int agg_min_len = 1500;
+static int agg_min_len = 1549;
 module_param(agg_min_len, int, 0644);
-MODULE_PARM_DESC(agg_min_len, "experimental: minimum MPDU length for aggregation (default 1500); smaller frames keep the single-frame path");
+MODULE_PARM_DESC(agg_min_len, "minimum MPDU length for aggregation (default 1549 = full-size frames only); non-final units declaring a shorter length make the firmware assert macif.c:1019, so shorter frames keep the single-frame path");
 /*
  * 一次传输最多装几个单元。**实测（2026-10-01）**：装 8 个（12832 字节）能跑出
  * 76 Mbit/s，但连续 21 次传输后固件崩（`bulk OUT 失败 (-71)` → USB 掉线）；
@@ -624,6 +632,13 @@ struct zt_dev {
 	u16			tx_buf_size;	/* 运行期 TX 缓冲长度（聚合时更大） */
 	u8			ba_tid;
 	bool			ba_valid;
+	/*
+	 * r40 安全阀：**一次聚合 bulk 失败（-71/-19 那一类）之后停止打包**。
+	 * 理由：失败说明已经进入固件的致命区（短单元或链路已劣化），此时继续打包
+	 * 会把"一次断言死亡"升级成文档 D6 的 -110 深挂死（今天实测过一次，要拔插）。
+	 * 下一次成功建立 BA 会话时清零（会随重连自动恢复）。
+	 */
+	bool			agg_stop;
 	unsigned long		ba_add_ok;
 	unsigned long		ba_add_fail;
 	unsigned long		ba_rx_start;
@@ -1529,6 +1544,7 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	 * （`agg_block=0` 也无效、无日志）。语义 = 每个 BA 会话最多尝试 N 次。
 	 */
 	z->tx_agg_attempts = 0;
+	z->agg_stop = false;		/* r40：新 BA 会话 = 重新允许打包 */
 	z->ba_valid = true;
 	z->ba_tid = tid;
 	z->ba_add_ok++;
@@ -2431,7 +2447,10 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		}
 		mutex_unlock(&z->lock);
 		if (ret) {
-			dev_warn(&z->intf->dev, "tx(agg): bulk OUT 失败 (%d)\n", ret);
+			dev_warn(&z->intf->dev,
+				 "tx(agg): bulk OUT 失败 (%d) -- r40 安全阀：停止打包直到下次建立 BA 会话\n",
+				 ret);
+			z->agg_stop = true;
 			for (i = 0; i < n; i++) {
 				z->tx_dropped++;
 				ieee80211_free_txskb(z->hw, skb[i]);
@@ -3404,7 +3423,7 @@ static void zt_tx_work(struct work_struct *w)
 			 * agg_send 的"无锁 zt_tx_frame"旁路（R23 实测：喂进去后
 			 * 整批退化时吞吐塌 35 倍）。
 			 */
-			if (ampdu_en && !agg_block &&
+			if (ampdu_en && !agg_block && !z->agg_stop &&
 			    (agg_max_xfers <= 0 ||
 			     (int)z->tx_agg_attempts < agg_max_xfers) &&
 			    cnt < ZT_AGG_SUBFRAMES) {
@@ -3484,7 +3503,7 @@ static void zt_tx_work(struct work_struct *w)
 				 * ampdu_en=1 时攒一批再一次 bulk：mac80211 一次只给一个
 				 * MPDU，把多个 MPDU 拼进同一次传输是驱动的事（zt_tx_agg_send）。
 				 */
-				if (ampdu_en && !agg_block &&
+				if (ampdu_en && !agg_block && !z->agg_stop &&
 				    (agg_max_xfers <= 0 ||
 				     (int)z->tx_agg_attempts < agg_max_xfers)) {
 					struct sk_buff *batch[ZT_AGG_SUBFRAMES];
