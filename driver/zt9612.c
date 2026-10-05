@@ -405,7 +405,7 @@ MODULE_PARM_DESC(sta_reuse, "1=skip MM_STA_ADD when a session for the same BSSID
  */
 static int sta_add_fmt = 7;
 module_param(sta_add_fmt, int, 0644);
-MODULE_PARM_DESC(sta_add_fmt, "RC-block format in MM_STA_ADD_REQ (7=wide-cut payload, DEFAULT, r26: unknown mask blocks zeroed, survives reconnect+soak+flood; 5=vendor-verbatim payload (r21-r25 default: data path timers out 8-40s after assoc); 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only; 6=max-MCS clamp (r25: dies); 8=mask bisection arm (r26)");
+MODULE_PARM_DESC(sta_add_fmt, "RC-block format in MM_STA_ADD_REQ (7=wide-cut payload, DEFAULT, r26: unknown mask blocks zeroed, survives reconnect+soak+flood; 5=vendor-verbatim payload (r21-r25 default: data path timers out 8-40s after assoc); 0=legacy template baseline; 1=only format byte=2 (r19: KILLS firmware - format byte alone is fatal); 2=full HT block (r17: kills too); 3=fmt0 + rate_map 0x0ff0 + r_idx 4..11; 4=fmt0 + rate_map 0x0ff0 only; 6=max-MCS clamp (r25: dies); 8=mask bisection arm (r26); 11=fmt7 + only block A (+0x04..05 rate_map) refilled - r42, splits the r25 poison block; 12=fmt7 + only blocks B/C (+0x18..1b he_max_ampdu) refilled - r42, the other half; 13=fmt8 + lowest rate map (mcs_max 0, r_idx 4..4, rate_map 0x0010) - r42 rate probe, firmware REJECTS it (no CFM); 14=fmt8 + highest rate map (mcs_max 11, r_idx 4..11, rate_map 0x0ff0) - r42 rate probe, accepted but breaks the data path). r42 verdict: fmt 7/11/12/8/5 ALL survive at ~12 Mbit/s, so the r25 poison-block model is retired; the RC block IS validated by firmware but is NOT the rate lever");
 
 /*
  * r21 实验：关联后补发厂商配置序列（STA_ADD 之后、密钥之前的 8 条消息）。
@@ -1208,6 +1208,107 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 		pl[0x04] = 0;
 		pl[0x05] = 0;
 		memset(pl + 0x18, 0, 4);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 11) {
+		/*
+		 * r42（致命块二分第一臂）：fmt=7 + **只回填 A 块** +0x04..05
+		 * （模板 0xfffa）。
+		 *
+		 * 为什么做这一刀：r42 已把真实端到端上传测出来（5GHz 单帧
+		 * 14.15 Mbit/s），并判定 ~15 Mbit/s 就是设备/空口上限
+		 * （UDP 稳态 15.0，TCP 已达其 94%）⇒ 主线是固件选的速率。
+		 * 固件选速的唯一已知入口就是本 RC 块；fmt=5 → fmt=7 的差别
+		 * 正是把 `+0x04..05`（rate_map）、`+0x18..1f`、`+0x24..25`
+		 * 清零，而速率的位图恰好落在被清零的 A 块里。所以要先知道
+		 * 哪块是 r25 那个"登记后 8~40 s 定时死亡"的毒物。
+		 *
+		 * 已知边界：fmt=8（回填 A 与 B 两块）**必死** ⇒ 毒物在
+		 * {A, B/C} 三者之一（r25/R17）。本臂与 fmt=12 把它拆成两半：
+		 * 本臂 = A 单独（速率位图）；fmt=12 = B/C 单独（ampdu 掩码）。
+		 *
+		 * 判据（按序读，且**必须带功能性吞吐**，否则无判决力）：
+		 *   ① 存活 ≥ 5 min 且 ping 0% ⇒ 该块不是毒物；
+		 *   ② 端到端吞吐 > 单帧基线 14.15 ⇒ 速率位图确实拉高速率。
+		 * 若当场死 ⇒ 毒物 = A ⇒ 速率须保持清零，提速另找安全子集
+		 * （例如只回填 rate_map_l +0x08..09）。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		memset(pl + 0x18, 0, 8);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 12) {
+		/*
+		 * r42（致命块二分第二臂）：fmt=7 + **只回填 B/C 块** +0x18..1b
+		 * （模板 `ff ff 7f 00` = he_max_ampdu 0x007fffff）；
+		 * A 块（rate_map）与 D/E/F 一律保持清零。
+		 *
+		 * 判据：存活 ⇒ 毒物不在 B/C；当场死 ⇒ 毒物 ∈ {B,C}，
+		 * 那么 A 块（速率位图）就是安全的，fmt=11 那条路直接成立。
+		 * 两臂合起来把 r25 留下的"三块之一"缩到单块。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		memset(pl + 0x04, 0, 4);
+		memset(pl + 0x1c, 0, 4);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 13) {
+		/*
+		 * r42（速率可控性探测器，**最有信息量的一刀**）：fmt=8 + 把
+		 * 速率位图压到**最低档**。
+		 *
+		 * 为什么需要它：r42 实测 fmt=7/11/12/8/5 **全部存活**，吞吐都在
+		 * 12~13 Mbit/s（差异在噪声内）⇒ 会话载荷里的掩码块**都不是**
+		 * r25 记录的"登记后 8~40 s 定时死亡"毒物（那套归因在今天的
+		 * 关联流程下不复现）。字节既安全，就该问更根本的问题：
+		 * **RC 块到底有没有在控制固件选速？**
+		 * 做法 = 反向探测：fmt=8（三块全回填、已证存活）把速率位图
+		 * `rate_map/rate_map_l` 从 `0x0ff0/0xfffa` 压成**只留最低一档**
+		 * （`0x0010/0x0010`，即 5G 的 r_idx=4 = 6 Mbit/s OFDM），并把
+		 * `mcs_max` 压到 0、`r_idx_min/max` = 4/4。
+		 * 判读（**必须带端到端吞吐**）：
+		 *   吞吐显著下降（如 ≲ 7 Mbit/s）⇒ **RC 块确实在控制速率**，
+		 *   那么反向把它调到高档就能提速（下一条主线）；
+		 *   吞吐不变（仍 ~12）⇒ RC 块对速率**无影响**，固件另有一套
+		 *   自适应（`ARRM`），"靠 STA_ADD 提速"这条路应当放弃，
+		 *   转而去找固件侧真正的速率配置通道（或接受当前上限）。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x01] = 0x00;	/* mcs_max = 0 */
+		pl[0x02] = 0x04;	/* r_idx_min = 4 */
+		pl[0x03] = 0x04;	/* r_idx_max = 4 */
+		pl[0x04] = 0x10;	/* rate_map[0..1] = 0x0010（仅 5G r_idx 4） */
+		pl[0x05] = 0x00;
+		pl[0x08] = 0x10;	/* rate_map_l = 0x0010 */
+		pl[0x09] = 0x00;
+		memset(pl + 0x1c, 0, 4);
+		pl[0x24] = 0;
+		pl[0x25] = 0;
+		put_unaligned_le16(aid, pl + 0x14);
+		memcpy(pl + 0x26, bssid, ETH_ALEN);
+	} else if (sta_add_fmt == 14) {
+		/*
+		 * r42（速率可控性探测器·高档）：与 fmt=13 完全对称，
+		 * 只把速率位图抬到**最高档**：r_idx 4..11 + rate_map=0x0ff0
+		 * + mcs_max=11（HE），bw_max 保持模板 2。
+		 * 与 fmt=13 成对读：若 13 慢、14 快 ⇒ RC 块可控且高档可用；
+		 * 若两者都 ~12 ⇒ 速率不受 RC 块控制（同 fmt=13 判读二）。
+		 */
+		memcpy(pl, zt_sta_add_v5, sizeof(pl));
+		pl[0x01] = 0x0b;	/* mcs_max = 11 (HE) */
+		pl[0x02] = 0x04;	/* r_idx_min = 4 */
+		pl[0x03] = 0x0b;	/* r_idx_max = 11 */
+		pl[0x04] = 0xf0;	/* rate_map[0..1] = 0x0ff0 */
+		pl[0x05] = 0x0f;
+		pl[0x08] = 0xf0;	/* rate_map_l = 0x0ff0 */
+		pl[0x09] = 0x0f;
+		memset(pl + 0x1c, 0, 4);
 		pl[0x24] = 0;
 		pl[0x25] = 0;
 		put_unaligned_le16(aid, pl + 0x14);
