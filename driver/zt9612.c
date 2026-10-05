@@ -270,6 +270,20 @@ module_param(ht_cap_enable, int, 0644);
 MODULE_PARM_DESC(ht_cap_enable, "experimental: advertise HT on the 5GHz band (default 0; measured no throughput gain, but it is the prerequisite for A-MPDU aggregation - see docs/04 D16 and re/EXPERIMENT_HT_VHT.md)");
 
 /*
+ * r43 实验开关（默认关闭）：把 5GHz 的 HT 能力从 HT20 放宽到 HT40
+ * （SUP_WIDTH_20_40 + SGI_40，rx_highest 144 -> 300）。
+ *
+ * 动机：r43 换 AP 对照已证明约 15 Mbit/s 是设备侧上限、与 AP 无关
+ * （mesh AP 12.7-14.2，手机热点 13.9-15.5，两者同档），而两个 AP
+ * 都提供 HT40。驱动此前只声明 HT20 ⇒ 40 MHz 从未进入协商 ⇒ 这是
+ * 主机侧唯一还没试过、且可能影响固件速率表的入口（描述符速率字 /
+ * 速率消息 / RC 块三条已在 r42 全部证否）。只改 HT 带宽，不声明 VHT/HE。
+ */
+static int ht_width40;
+module_param(ht_width40, int, 0644);
+MODULE_PARM_DESC(ht_width40, "experimental: advertise HT40 (SUP_WIDTH_20_40 + SGI_40) instead of HT20 on the 5GHz band; requires ht_cap_enable=1; 0=off (default, HT20)");
+
+/*
  * 实验开关（默认关闭）：打印接下来 N 条 EP2-IN 通知的内容。
  *
  * 背景：厂商 Windows 驱动在**每一次** EP5-OUT 前后都在读 EP2-IN 上的 6 字节通知
@@ -3346,9 +3360,13 @@ static struct ieee80211_supported_band zt_band_5ghz = {
 
 /*
  * 实验用 HT 能力（见 ht_cap_enable 的说明）。
- * 保守声明：HT20（不含 SUP_WIDTH_20_40）+ SGI_20 + MCS 0~15（2 空间流，本卡 2T2R）、
- * 不声明聚合相关的 hw 标志，因此 mac80211 只用 HT 速率、不做 A-MPDU。
- * 射频的真实能力未从固件确证，故先按"能协商上"的最小集合试；若实测无收益即回退。
+ * 保守声明：HT20（不含 SUP_WIDTH_20_40）+ SGI_20 + MCS 0~15（2 流）、
+ * 不声明聚合相关 hw 标志，因此 mac80211 只用 HT 速率、不做 A-MPDU。
+ * 射频真实能力未从固件确证，故先按能协商上的最小集合试。
+ * r43（2026-10-05）：新增 ht_width40 臂，把 SUP_WIDTH_20_40 打开。
+ * 动机 = r43 换 AP 对照已证明约 15 Mbit/s 是设备侧上限、与 AP 无关，
+ * 而两个 AP 都提供 HT40。此前只声明 HT20，从未把 40 MHz 交给固件
+ * ⇒ 这是主机侧唯一剩余入口（描述符/速率消息/RC 块已在 r42 证否）。
  */
 static const struct ieee80211_sta_ht_cap zt_ht_cap_5ghz = {
 	.ht_supported = true,
@@ -3358,6 +3376,20 @@ static const struct ieee80211_sta_ht_cap zt_ht_cap_5ghz = {
 	.mcs = {
 		.rx_mask = { 0xff, 0xff, 0, 0 },
 		.rx_highest = cpu_to_le16(144),	/* HT20/2SS/SGI ≈ 144.4 Mbps */
+		.tx_params = IEEE80211_HT_MCS_TX_DEFINED,
+	},
+};
+
+/* r43：HT40 臂的能力集，额外打开 SUP_WIDTH_20_40 与 SGI_40。 */
+static const struct ieee80211_sta_ht_cap zt_ht_cap_5ghz_40 = {
+	.ht_supported = true,
+	.cap = IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40 |
+	       IEEE80211_HT_CAP_SUP_WIDTH_20_40,
+	.ampdu_factor = IEEE80211_HT_MAX_AMPDU_8K,
+	.ampdu_density = IEEE80211_HT_MPDU_DENSITY_NONE,
+	.mcs = {
+		.rx_mask = { 0xff, 0xff, 0, 0 },
+		.rx_highest = cpu_to_le16(300),	/* HT40/2SS/SGI ≈ 300 Mbps */
 		.tx_params = IEEE80211_HT_MCS_TX_DEFINED,
 	},
 };
@@ -4052,9 +4084,15 @@ static void zt_mac_register(struct zt_dev *z)
 	hw->wiphy->bands[NL80211_BAND_2GHZ] = &zt_band_2ghz;
 	hw->wiphy->bands[NL80211_BAND_5GHZ] = &zt_band_5ghz;
 	if (ht_cap_enable) {
-		zt_band_5ghz.ht_cap = zt_ht_cap_5ghz;
-		dev_info(&z->intf->dev,
-			 "experimental: 5GHz HT cap 已声明（HT20/SGI，MCS0-15，未开聚合）\n");
+		if (ht_width40) {
+			zt_band_5ghz.ht_cap = zt_ht_cap_5ghz_40;
+			dev_info(&z->intf->dev,
+				 "experimental: 5GHz HT40 cap 已声明（SUP_WIDTH_20_40，MCS0-15）\n");
+		} else {
+			zt_band_5ghz.ht_cap = zt_ht_cap_5ghz;
+			dev_info(&z->intf->dev,
+				 "experimental: 5GHz HT cap 已声明（HT20/SGI，MCS0-15，未开聚合）\n");
+		}
 	}
 	if (ampdu_en) {
 		/*
