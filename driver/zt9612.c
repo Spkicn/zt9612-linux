@@ -557,6 +557,32 @@ module_param(agg_gap_us, int, 0644);
 MODULE_PARM_DESC(agg_gap_us, "experimental: minimum microseconds between aggregated bulk transfers (0 = unrestricted; use to test whether pacing prevents the firmware crash)");
 
 /*
+ * r43：**聚合拥塞预测**（r41 预登记的下一步，本轮实现）。
+ *
+ * 背景（r41/r42 实测）：聚合在 TCP（有背压）下能长跑（r42 实测 10,930 次聚合
+ * 传输零断言），但在**无流控的 UDP 满压**下仍会打死设备：r34 观察到 bulk 耗时
+ * 从 113 µs 爬到 2.7 ms 后死亡，r42 的 UDP 臂则在供应侧从 1500 pps 塌到 583 pps
+ * 之后进入 `-110` → USB 重枚举。
+ * ⇒ **bulk 耗时是"设备正在堵"的先行指标**：它上升说明固件/USB 侧排队变深。
+ *
+ * 做法（本组参数）：每次聚合 bulk 之后，若耗时 ≥ `agg_pred_us`（默认 0 = 关闭，
+ * 行为与之前完全一致），就进入 `agg_pred_cool_ms` 的**冷却期**：这期间**不再打包**，
+ * 所有帧退回已证稳定的单帧路径；冷却期过后自动恢复打包。
+ * 与 r40 的 `agg_stop` 的分工：`agg_stop` 是"已经失败"后的硬停（要等新 BA 会话），
+ * 本组是"还没失败但征兆已现"的**提前降级**，用来避免把 `-71` 升级成 `-110`。
+ *
+ * 判据（上机时）：UDP 满压臂在 `agg_pred_us>0` 下**不再出现 USB 重枚举**，
+ * 且吞吐不塌（降级到单帧后仍能跑 ~15 Mbit/s）。
+ */
+static int agg_pred_us;
+module_param(agg_pred_us, int, 0644);
+MODULE_PARM_DESC(agg_pred_us, "experimental: congestion predictor - if an aggregated bulk takes >= this many microseconds, stop packing for agg_pred_cool_ms; 0=off (default, behaviour unchanged); r34 measured bulk latency creeping 113us -> 2.7ms before death");
+
+static int agg_pred_cool_ms = 100;
+module_param(agg_pred_cool_ms, int, 0644);
+MODULE_PARM_DESC(agg_pred_cool_ms, "experimental: cooldown in milliseconds applied after the congestion predictor fires (default 100); during it all frames take the proven single-frame path, packing resumes automatically afterwards");
+
+/*
  * r38：`MM_BA_ADD_REQ` 的载荷布局选择。
  *
  * 动机（r36/r37 定案后的头号候选）：厂商实抓的 BA_ADD 是 **7 字节**
@@ -665,6 +691,10 @@ struct zt_dev {
 	unsigned long		tx_agg_attempts;/* 聚合：尝试打包的次数（受 agg_max_xfers 限制） */
 	unsigned long		tx_agg_multi;	/* 聚合：真正装了 >1 个单元的传输次数 */
 	unsigned long		tx_agg_last;	/* 聚合：上次传输的 jiffies（agg_gap_us 节流用） */
+	/* r43 聚合拥塞预测（见 agg_pred_us 的说明） */
+	unsigned long		agg_pred_until;	/* 冷却截止 jiffies；当前时间在此之前 = 不打包 */
+	unsigned long		agg_pred_hits;	/* 预测器触发次数（诊断） */
+	u32			agg_pred_last_us; /* 触发时记录的 bulk 耗时（诊断） */
 	unsigned long		tx_probes;
 	unsigned long		scan_probe_skip;	/* DFS/NO_IR 信道跳过的主动探测数 */
 	unsigned long		scan_ch_5g;		/* 本次扫描实际切到的 5G 信道数 */
@@ -1660,6 +1690,7 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 	 */
 	z->tx_agg_attempts = 0;
 	z->agg_stop = false;		/* r40：新 BA 会话 = 重新允许打包 */
+	z->agg_pred_until = 0;		/* r43：新 BA 会话 = 清掉预测器冷却 */
 	z->ba_valid = true;
 	z->ba_tid = tid;
 	z->ba_add_ok++;
@@ -2575,6 +2606,23 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		z->tx_frames += sub;
 		z->tx_agg_xfers++;
 		z->tx_agg_mpdus += sub;
+		/*
+		 * r43 聚合拥塞预测：bulk 耗时 ≥ agg_pred_us ⇒ 设备侧排队在变深
+		 * （r34 实测死前 113 µs→2.7 ms），立刻进入冷却期，期间不再打包、
+		 * 全部走已证稳定的单帧路径；冷却到期自动恢复（不是 agg_stop 那种硬停）。
+		 * 默认 agg_pred_us=0 ⇒ 本段完全不执行，行为与之前逐字节一致。
+		 */
+		if (agg_pred_us > 0 && agg_pred_cool_ms > 0 &&
+		    z->tx_agg_last_bulk_us >= (u32)agg_pred_us) {
+			z->agg_pred_until = jiffies +
+				msecs_to_jiffies(agg_pred_cool_ms);
+			z->agg_pred_last_us = z->tx_agg_last_bulk_us;
+			z->agg_pred_hits++;
+			dev_info(&z->intf->dev,
+				 "agg-pred: bulk %u us >= %d us ⇒ 冷却 %d ms 走单帧（第 %lu 次）\n",
+				 z->tx_agg_last_bulk_us, agg_pred_us,
+				 agg_pred_cool_ms, z->agg_pred_hits);
+		}
 		/* 聚合帧此刻才真正上线，现在才允许进 done[] 报状态 */
 		for (j = 0; j < sub; j++)
 			done[k++] = skb[agg_idx[j]];
@@ -3559,6 +3607,7 @@ static void zt_tx_work(struct work_struct *w)
 			if (ampdu_en && !agg_block && !z->agg_stop &&
 			    (agg_max_xfers <= 0 ||
 			     (int)z->tx_agg_attempts < agg_max_xfers) &&
+			    !time_before(jiffies, z->agg_pred_until) &&
 			    cnt < ZT_AGG_SUBFRAMES) {
 				u8 *d = skb->data;
 				u16 fl = skb->len;
@@ -3595,10 +3644,11 @@ static void zt_tx_work(struct work_struct *w)
 		spin_unlock_irqrestore(&z->txq_lock, flags);
 		if (tx_diag)
 			dev_info(&z->intf->dev,
-				 "txpath: legacy=%lu txq=%lu agg_xfers=%lu agg_multi=%lu txq_pend=%d wakes=%lu works=%lu\n",
+				 "txpath: legacy=%lu txq=%lu agg_xfers=%lu agg_multi=%lu txq_pend=%d wakes=%lu works=%lu pred=%lu/%u us\n",
 				 z->tx_legacy_frames, z->tx_txq_frames,
 				 z->tx_agg_xfers, z->tx_agg_multi, n,
-				 z->txq_wakes, ++z->txq_works);
+				 z->txq_wakes, ++z->txq_works,
+				 z->agg_pred_hits, z->agg_pred_last_us);
 		if (!n)
 			return;
 		for (i = 0; i < n; i++) {
@@ -3638,7 +3688,8 @@ static void zt_tx_work(struct work_struct *w)
 				 */
 				if (ampdu_en && !agg_block && !z->agg_stop &&
 				    (agg_max_xfers <= 0 ||
-				     (int)z->tx_agg_attempts < agg_max_xfers)) {
+				     (int)z->tx_agg_attempts < agg_max_xfers) &&
+				    !time_before(jiffies, z->agg_pred_until)) {
 					struct sk_buff *batch[ZT_AGG_SUBFRAMES];
 					int cap = agg_max_units > 0 &&
 						  agg_max_units < ZT_AGG_SUBFRAMES ?
