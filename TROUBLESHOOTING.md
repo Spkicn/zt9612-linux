@@ -62,3 +62,12 @@
 [Issues](https://github.com/Spkicn/zt9612-linux/issues) 反馈，请附 `lsusb -d 350b:`、`uname -a`
 与 `dmesg` 全段（模板见 [.github/ISSUE_TEMPLATE/bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md)）。
 无线网卡驱动的问题几乎都能从这三样里看出来；缺信息时只能来回问，效率很低。
+
+不想一条条敲就把这些交给脚本收集：
+
+```bash
+sudo ./scripts/collect-debug-info.sh        # 生成 zt9612-debug-<时间戳>.txt，直接附到 issue
+```
+
+它只读、不改配置，收集系统/设备/模块/固件校验/参数/接口/dmesg 共十来项。**贴之前自己过一遍**：
+`dmesg`、`ip`、`iw` 的输出里可能有真实 MAC、SSID 与主机名。

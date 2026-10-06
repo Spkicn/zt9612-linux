@@ -13,16 +13,24 @@ name: docs
 #     渲染成删除线（"3.7~4.7 与 7~13" 整段被划掉，已在 release 页上多次出现）⇒ 区间用 `–`，
 #     约数写「约 15 Mbit/s」。Release 正文不在仓库里，本地交付前用
 #     `python ci/markdown_check.py <.md 草稿>` 单独检查。
+#   * `ci/link_check.py` —— 公开文件，无条件执行：文档里的**相对链接**必须指向真实存在的
+#     文件（拆文档/改名最容易断）。外链会随网络抖动，只在本地用 `--external` 探测，不做门。
+#   * `ci/device_id_check.py` —— 公开文件，无条件执行：驱动 `USB_DEVICE` 表与
+#     `supported-device-IDs` / README 必须一致，且表里不得有重复 ID。
 #   * `tools/doc_lint.py` 与 `docs/` —— 本地保留目录（见 .gitignore 的「内部资料」一节），
 #     公开 CI 上**不存在** ⇒ 文档一致性检查只能**跳过**。跳过不是失败：公开仓库每次
 #     push 都变红没有意义。将来把 tools/ 与 docs/ 公开后，同一段判断会自动开始跑它们。
-#   * 结论：公开 CI 查得到 = 版本漂移（本 job）+ 编译（build.yml）；
+#   * 结论：公开 CI 查得到 = 版本漂移 + 文档卫生（本 job）+ 编译（build.yml）；
 #     查不到 = 内部文档一致性（参数表 / 默认值 / CRLF / [Unreleased] / 行数引用），
 #     那要在本地完整工作区跑 `python tools/doc_lint.py`。
 #
-# 两个脚本都只用 Python 标准库（无第三方依赖），ubuntu-latest 自带的 python3 够用。
+# 这些脚本都只用 Python 标准库（无第三方依赖），ubuntu-latest 自带的 python3 够用。
 # 本地在仓库根跑同样的命令即可复现：
 #   python ci/version_check.py -v
+#   python ci/emoji_check.py -v
+#   python ci/markdown_check.py -v
+#   python ci/link_check.py -v
+#   python ci/device_id_check.py -v
 #   python tools/doc_lint.py -v
 on:
   push:
@@ -68,6 +76,12 @@ jobs:
       - name: markdown 渲染检查（ci/markdown_check.py，公开文件，无条件执行）
         run: python3 ci/markdown_check.py -v
 
+      - name: 相对链接检查（ci/link_check.py，公开文件，无条件执行）
+        run: python3 ci/link_check.py -v
+
+      - name: USB ID 一致性（ci/device_id_check.py，公开文件，无条件执行）
+        run: python3 ci/device_id_check.py -v
+
       - name: 文档一致性（tools/doc_lint.py，仅本地完整树）
         if: steps.gate.outputs.tools == 'yes' && steps.gate.outputs.docs == 'yes'
         run: python3 tools/doc_lint.py -v
@@ -81,6 +95,8 @@ jobs:
             echo "- 版本一致性（\`ci/version_check.py\`）：**已执行** —— dkms.conf / MODULE_VERSION / CHANGELOG 最新已发布 / README 最新发布 四处必须一致。"
             echo "- emoji 检查（\`ci/emoji_check.py\`）：**已执行** —— 文档与代码注释里出现 emoji 即失败（告警请用 \`> [!WARNING]\` 或文字）。"
             echo "- markdown 渲染检查（\`ci/markdown_check.py\`）：**已执行** —— 代码之外的单个 \`~\` 会被渲染成删除线，区间请用 \`–\`、约数写「约 N」。Release 正文不在仓库里，本地用同脚本单独检查。"
+            echo "- 相对链接检查（\`ci/link_check.py\`）：**已执行** —— 文档里的相对链接必须指向真实存在的文件（外链只在本地用 \`--external\` 探测）。"
+            echo "- USB ID 一致性（\`ci/device_id_check.py\`）：**已执行** —— 驱动 \`USB_DEVICE\` 表与 supported-device-IDs / README 必须一致，且不得有重复条目。"
             if [ "${{ steps.gate.outputs.tools }}" = "yes" ] && [ "${{ steps.gate.outputs.docs }}" = "yes" ]; then
               echo "- 文档一致性（\`tools/doc_lint.py\`）：**已执行**（CRLF / 表格 / 参数表 / 默认值 / [Unreleased] / 行数引用）。"
             else

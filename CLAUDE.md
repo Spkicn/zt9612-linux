@@ -39,7 +39,7 @@ python tools/doc_lint.py                 # 本地保留：CRLF / 表格 / 参数
 
 `ci/version_check.py` 校验 `dkms.conf` 的 `PACKAGE_VERSION` / `driver/zt9612.c` 的 `MODULE_VERSION()` / `CHANGELOG.md` 最新已发布小节 / `README.md`「最新发布」四处一致。**改版本号或 README 状态后必跑。**
 
-**没有自动化运行时测试**：CI 只保证编译通过（`build.yml`，ubuntu-24.04 阻塞 + 一个仅信息性的 old-kernel 对照作业验证下限声明）、风格（`checkpatch.yml`）、脚本静态检查（`shellcheck.yml`）、版本一致与 emoji 检查（`docs.yml`）。回归 100% 靠真机人工验证。
+**没有自动化运行时测试**：CI 只保证编译通过（`build.yml`，ubuntu-24.04 阻塞 + 一个仅信息性的 old-kernel 对照作业验证下限声明）、风格（`checkpatch.yml`）、脚本静态检查（`shellcheck.yml`）、版本一致与 emoji/markdown/相对链接/USB ID 检查（`docs.yml`）。回归 100% 靠真机人工验证。
 
 ## 架构
 

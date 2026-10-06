@@ -190,7 +190,8 @@ sudo python3 scripts/zt9612-devtest.py                     # 期望「往返成�
 
 **遇到问题**：先查 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 与 [FAQ.md](FAQ.md)；仍未解决就到
 [Issues](https://github.com/Spkicn/zt9612-linux/issues) 反馈 —— 请附 `lsusb -d 350b:`、
-`uname -a` 与 `dmesg` 全段（模板见 [.github/ISSUE_TEMPLATE/bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md)）。
+`uname -a` 与 `dmesg` 全段（模板见 [.github/ISSUE_TEMPLATE/bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md)）；
+这些信息可以一条命令收齐：`sudo ./scripts/collect-debug-info.sh`。
 
 ## 来源与许可
 
