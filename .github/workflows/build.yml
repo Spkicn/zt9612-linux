@@ -109,8 +109,10 @@ jobs:
 
       - name: 编译模块
         run: |
+          # mainline 内核的 headers 会沿用构建它时的编译器（如 6.12.112 用 gcc-15），
+          # runner 上未必装了那个版本 ⇒ 显式指定 CC/HOSTCC，避免 "gcc-15: not found" (Error 127)。
           echo "headers: $KSRC"
-          if make -C driver KVER="$KVER" KSRC="$KSRC" modules > build.log 2>&1; then
+          if make -C driver KVER="$KVER" KSRC="$KSRC" CC=gcc HOSTCC=gcc modules > build.log 2>&1; then
             cat build.log
             echo "RESULT=PASS" >> "$GITHUB_ENV"
             echo "::notice::内核 $KVER：编译通过"
