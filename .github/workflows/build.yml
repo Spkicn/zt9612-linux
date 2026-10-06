@@ -95,8 +95,9 @@ jobs:
           DIR=$(curl -fsSL "$INDEX" | grep -o "v${MINOR}\.[0-9]*/" | sort -V | tail -1)
           test -n "$DIR"
           LIST=$(curl -fsSL "${INDEX}${DIR}")
-          ALL=$(echo "$LIST" | grep -o 'linux-headers-[^"]*_all\.deb' | head -1)
-          AMD=$(echo "$LIST" | grep -o 'linux-headers-[^"]*_amd64\.deb' | head -1)
+          # mainline PPA 的链接形如 href="amd64/linux-headers-….deb"，amd64 前缀不能丢
+          ALL=$(echo "$LIST" | grep -o 'href="[^"]*_all\.deb"' | head -1 | sed 's/^href="//; s/"$//')
+          AMD=$(echo "$LIST" | grep -o 'href="[^"]*_amd64\.deb"' | head -1 | sed 's/^href="//; s/"$//')
           test -n "$ALL" && test -n "$AMD"
           KVER=$(basename "$AMD" | sed 's/^linux-headers-//; s/_.*$//')
           echo "KVER=$KVER" >> "$GITHUB_ENV"
