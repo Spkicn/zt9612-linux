@@ -10,7 +10,7 @@ ZT9612U（ZTOP / 兆通微 ACEV100）USB Wi-Fi 6 网卡的**独立实现** Linux
 
 ## 常用命令
 
-驱动是 out-of-tree 内核模块，**必须在 Linux 目标机上编译**（Windows 开发机上没有内核头文件）。开发机上通过 `tools/rsh.py` 把源码上传到测试机再编译（见「开发工作流」）。编译下限内核 **6.12**（驱动 include `linux/unaligned.h`，`dkms.conf` 用 `BUILD_EXCLUSIVE_KERNEL` 声明；实机验证内核 7.0.0-31 / 7.0.0-34）。
+驱动是 out-of-tree 内核模块，**必须在 Linux 目标机上编译**（Windows 开发机上没有内核头文件）。开发机上通过 `tools/rsh.py` 把源码上传到测试机再编译（见「开发工作流」）。编译下限内核 **6.12**（驱动 include `linux/unaligned.h`，`dkms.conf` 用 `BUILD_EXCLUSIVE_KERNEL` 声明；实机验证内核 7.0.0-31 / 7.0.0-34）。**6.17 起 `config` op 多了 `radio_idx`，驱动内有 `LINUX_VERSION_CODE` 兼容转发；CI 的 `build-kernel-matrix` 对 6.12/6.14/6.16 做编译取证（运行行为未验证）。**
 
 ```bash
 # 编译 / 安装（在 Linux 上，driver/ 目录内）
