@@ -6,6 +6,7 @@
  *   - 閸ヨ桨娆㈢憗鍛版祰閿涘牊褰欓幍?/ 488B 閸?/ 閺堫偄娼?XOR16 / 闁板秶鐤嗛崸?/ RUN閿? *   - 閸氬本顒為崚婵嗩潗閸栨牕绨崚妤嬬礄閸欐垳绔撮弶锛勭搼娑撯偓閺?CFM閿涘绱癛ESET -> VERSION -> 閸樺倸鏅?-> START(缁涘瀹?6.5s) -> 闁板秶鐤? *   - 5 缁夋帒绺剧捄?0x05c2閿涘牐娴囬懡宄版儓 ASCII 閺冨爼妫块幋绛圭礆閿涘奔绗夐崣鎴濇祼娴犳湹绱伴惇瀣，閻欐顦叉担? *   - /dev/zt9612閿涙氨鏁ら幋閿嬧偓浣稿讲閻╁瓨甯撮弨璺哄絺閸樼喎顫?"WLAN" 鐢? *
  * 閸楀繗顔呴弶銉ㄥ殰 USB 閹舵挸瀵?+ 闂堟瑦鈧線鈧棗鎮滈獮鍫曗偓鎰摟閼哄倿鐛欑拠渚婄礄鐟?zt9612-linux/re/REPORT*.md閵嗕笍RIVER_PROGRESS.md閿? */
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
@@ -3795,6 +3796,30 @@ static int zt_mac_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 	return 0;
 }
 
+/*
+ * 内核兼容层（6.17 的 op 签名变更）
+ *
+ * mac80211 在 6.17 给下面这些 op 加了 `int radio_idx` 参数：
+ *   config / set_frag_threshold / set_rts_threshold / set_coverage_class /
+ *   set_antenna / get_antenna
+ * 6.12–6.16 的 `config` 是 `int (*config)(struct ieee80211_hw *hw, u32 changed)`，
+ * 6.17 起才是 `(hw, int radio_idx, u32 changed)`。
+ * 依据：内核 `include/net/mac80211.h` 的 v6.12 / v6.16 / v6.17 三个 tag 对比
+ * （6.12 与 6.16 的 config 完全一致，变更发生在 6.17）。
+ *
+ * 本驱动只保留 6.17 形态的实现，旧内核上用一层转发适配，这样 dkms.conf 声明的
+ * 6.12 编译下限才真正成立。除 config 外本驱动未实现其余几个受影响的 op。
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+static int zt_mac_config_compat(struct ieee80211_hw *hw, u32 changed)
+{
+	return zt_mac_config(hw, 0, changed);
+}
+#define ZT_MAC_CONFIG_OP	zt_mac_config_compat
+#else
+#define ZT_MAC_CONFIG_OP	zt_mac_config
+#endif
+
 /* M3.1閿涙瓖X 閺嗗倷绗夐幒銉р€栨禒璁圭礉閻╁瓨甯存稉銏犲瘶閿涘牆褰х紒鐔活吀閿涘绱滿3.4 閸愬秷藟 TX 閹诲繗鍫粭?*/
 static void zt_mac_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 		      struct sk_buff *skb)
@@ -4093,7 +4118,7 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.stop = zt_mac_stop,
 	.add_interface = zt_mac_add_interface,
 	.remove_interface = zt_mac_remove_interface,
-	.config = zt_mac_config,
+	.config = ZT_MAC_CONFIG_OP,
 	.tx = zt_mac_tx,
 	.configure_filter = zt_mac_configure_filter,
 	/* 本内核把 TXQ 路径定为必选：alloc_hw 会检查 wake_tx_queue 是否存在 */
