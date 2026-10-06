@@ -109,16 +109,36 @@ jobs:
 
       - name: 编译模块
         run: |
-          # mainline 内核的 headers 会沿用构建它时的编译器（如 6.12.112 用 gcc-15），
-          # runner 上未必装了那个版本 ⇒ 显式指定 CC/HOSTCC，避免 "gcc-15: not found" (Error 127)。
+          # mainline 的 headers 会沿用构建它时的编译器（6.12.112 是 gcc-15、6.16.12 是 gcc-14），
+          # runner 上不一定装了那个版本。策略：先用 headers 默认的编译器，
+          # 只有在"编译器找不到"时才退到 runner 自带的 gcc-14；
+          # 不要盲目指定 gcc-13 —— 内核配置带 -fmin-function-alignment=16，gcc-13 不认。
           echo "headers: $KSRC"
-          if make -C driver KVER="$KVER" KSRC="$KSRC" CC=gcc HOSTCC=gcc modules > build.log 2>&1; then
-            cat build.log
-            echo "RESULT=PASS" >> "$GITHUB_ENV"
-            echo "::notice::内核 $KVER：编译通过"
+          try_build() {
+            if [ -z "$1" ]; then
+              make -C driver KVER="$KVER" KSRC="$KSRC" modules > build.log 2>&1
+            else
+              make -C driver KVER="$KVER" KSRC="$KSRC" CC="$1" HOSTCC="$1" modules > build.log 2>&1
+            fi
+          }
+          CC_USED="headers 默认编译器"
+          if try_build ""; then
+            RESULT=PASS
+          elif grep -qE "not found|No such file" build.log && command -v gcc-14 >/dev/null; then
+            echo "::notice::headers 默认编译器不可用，改用 gcc-14 重试"
+            CC_USED="gcc-14（headers 默认编译器缺失）"
+            if try_build gcc-14; then RESULT=PASS; else RESULT=FAIL; fi
           else
-            tail -40 build.log
-            echo "RESULT=FAIL" >> "$GITHUB_ENV"
+            RESULT=FAIL
+          fi
+          tail -25 build.log
+          {
+            echo "CC_USED=$CC_USED"
+            echo "RESULT=$RESULT"
+          } >> "$GITHUB_ENV"
+          if [ "$RESULT" = PASS ]; then
+            echo "::notice::内核 $KVER：编译通过（$CC_USED）"
+          else
             echo "::warning::内核 $KVER：编译失败 —— 该版本仍在未验证区间，详见上方日志"
           fi
 
@@ -129,5 +149,6 @@ jobs:
             echo "## 内核矩阵：${{ matrix.minor }}"
             echo
             echo "- headers：\`${{ env.KVER }}\`（来源：Ubuntu mainline PPA）"
+            echo "- 编译器：${{ env.CC_USED }}"
             echo "- 编译结果：**${{ env.RESULT }}**"
           } >> "$GITHUB_STEP_SUMMARY"
