@@ -1812,7 +1812,7 @@ static int zt_run_init(struct zt_dev *z)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ 閸ヨ桨娆㈢憗鍛版祰 */
+/* ------------------------------------------------------------------ 固件装载 */
 
 static int zt_wait_fw_ack(struct zt_dev *z, u8 want_sub, int timeout_ms)
 {
@@ -4130,7 +4130,7 @@ static const struct ieee80211_ops zt_mac_ops = {
 	.ampdu_action = zt_mac_ampdu_action,
 	/* 实验：固件密钥（key_en=1 时生效；WPA 聋态修复主线，44B 布局已用户态实测） */
 	.set_key = zt_mac_set_key,
-	/* 鍗曚俊閬?STA 鍦烘櫙锛氱敤 mac80211 鎻愪緵鐨?chanctx 妯℃嫙瀹炵幇 */
+	/* 单信道 STA 场景：用 mac80211 提供的 chanctx 模拟实现 */
 	.add_chanctx = ieee80211_emulate_add_chanctx,
 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
 	.change_chanctx = ieee80211_emulate_change_chanctx,
