@@ -44,6 +44,7 @@ TX 侧上限。历史上"TX 死锁 / TXQ 计量 / 35 倍差 / 固件消费衰减
 | 上传 | 6.5–7.5 Mbit/s | **12.7–14.9 Mbit/s** |
 | 下载 | — | **18.5–20.4 Mbit/s** |
 
+> [!WARNING]
 > 早先这张表记的是"2.4G 约 4 / 5G 上传 3.7–4.7 Mbit/s"，那是**旧口径**（不同仪器、
 > 且当时 TX 侧还有 988 字节帧长上限等已修缺陷）——数字以本表为准。
 > **别拿厂商"95.3 Mbit/s"对比**：那是近端 sink 口径，不可比；见「已知问题」。
@@ -172,6 +173,7 @@ sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载
 sudo modprobe zt9612
 ```
 
+> [!IMPORTANT]
 > 本项目开发文档（`docs/06` 等）里另有一个**手工**写的守卫文件，其中除了 `blacklist` 还有
 > `install zt9612 /bin/true`。那种环境下 `sudo modprobe zt9612` 会**静默返回 0 且什么都不做**
 > （实测 2026-09-27，内核 7.0.0-34），必须用：
@@ -180,7 +182,7 @@ sudo modprobe zt9612
 > sudo modprobe --ignore-install zt9612
 > ```
 >
-> ⚠️ 手工加过守卫的机器上，`--enable-autoload` 会**整个删除**该 blacklist 文件（连同守卫）。
+> 手工加过守卫的机器上，`--enable-autoload` 会**整个删除**该 blacklist 文件（连同守卫）。
 
 也可以直接用 DKMS：
 
@@ -510,6 +512,11 @@ sudo journalctl -k --since '-2 min' | grep rxdbg
 
 见 [CONTRIBUTING.md](CONTRIBUTING.md)。目前最需要的是实机测试反馈（不同主板、不同内核，
 失败的 dmesg 同样有价值），以及向厂商索取官方 Linux 驱动包。
+
+**遇到问题去哪里问**：先查 [FAQ.md](FAQ.md)；仍未解决就到
+[Issues](https://github.com/Spkicn/zt9612-linux/issues) 反馈，请附 `lsusb -d 350b:`、`uname -a`
+与 `dmesg` 全段（模板见 [.github/ISSUE_TEMPLATE/bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md)）。
+无线网卡驱动的问题几乎都能从这三样里看出来；缺信息时只能来回问，效率很低。
 
 ## 来源与许可
 
