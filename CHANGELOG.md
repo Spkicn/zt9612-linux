@@ -9,6 +9,27 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+## [Unreleased] r46（2026-10-07）：**CI 卫生补齐**——相对链接与 USB ID 机检，外加排障信息采集脚本
+
+- **`ci/link_check.py`（公开，CI 无条件执行）**：文档里的**相对链接**必须指向仓库里真实存在的
+  文件。直接动因是本轮把 README 拆成四份（`README`/`INSTALL`/`TROUBLESHOOTING`/`PARAMETERS`），
+  这类拆分最容易留下断链。实测本仓库当前 142 条相对链接全部可解析；反向测试（塞一条
+  `NOT_THERE.md`）能正确判失败。外链会随网络抖动，只提供本地 `--external` 探测，不做阻塞门。
+- **`ci/device_id_check.py`（公开，CI 无条件执行）**：驱动 `USB_DEVICE` 表、
+  `supported-device-IDs` 与 `README` 三者的 VID:PID 必须一致，表里不得有重复条目，
+  且必须有 `MODULE_DEVICE_TABLE`（否则 `modinfo` 没有 alias、udev 不会自动绑定）。
+  实测定位到 `350b:9612` 一条；反向测试（把 README 里的 ID 改掉）能正确判失败。
+- **`scripts/collect-debug-info.sh`（新工具）**：一条命令把 issue 模板要的东西收成一个文件
+  （系统 / `lsusb` / `modinfo` / `lsmod` / 固件 SHA-256 / 接口 / `/dev/zt9612` / 模块参数 /
+  Secure Boot / `dmesg` 末 200 行），并在文件末尾提醒贴之前先过一遍隐私内容。
+  只读、不改配置；README 与 TROUBLESHOOTING 的"去哪里问"已指向它。
+- **出处**：这三项来自对同类驱动仓库 CI 惯例的调研（`mimic` conventions 模式）——
+  `morrownr/8821au-20210708` 有独立的 markdown-link / codespell 工作流，
+  `aircrack-ng/rtl8812au` 在 CI 里做设备 ID 卫生检查，`morrownr` 提供 `save-log.sh` 这类收集脚本。
+  本仓库只借"该检查什么"，实现全部是自己写的 stdlib 脚本（不引入第三方 action）。
+  **未采纳**：codespell（文档以中文为主，价值低）、第三方 markdown-link action（供应链面）、
+  `paths-ignore` 跳过编译（削弱"main 永远能编"的保证）、changesets/CODEOWNERS（单维护者规模不符）。
+
 ## [Unreleased] r45（2026-10-07）：**内核兼容层落地**——6.12–6.16 从"未验证"变成编译取证
 
 - **发现（可复现）**：`dkms.conf` 声明编译下限 6.12，但驱动只实现了 6.17 形态的 `.config`
