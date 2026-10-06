@@ -4,9 +4,11 @@ name: build
 #   * ubuntu-24.04 runner（内核 6.17.0-1022-azure）：**零告警编译通过**，产出 zt9612.ko
 #   * ubuntu-22.04 runner（内核 6.8.0-1064-azure）：因缺少 linux/unaligned.h 失败
 #     —— 该头文件 6.12 才引入，驱动的编译下限就是 6.12（dkms.conf 里已声明）
+#   * build-kernel-matrix：对 dkms.conf 声明区间内的 6.12 / 6.14 / 6.16 做**编译取证**
+#     （内核 6.12–6.16 不在 24.04 官方源里，从 Ubuntu mainline PPA 取 headers）
 #
-# 因此：build 作业在 24.04 上**阻塞**；old-kernel 作业是"预期失败"的信息性对照，
-# 用来验证下限声明是否仍然成立（不阻塞合并）。
+# 因此：build 作业在 24.04 上**阻塞**；old-kernel 与 kernel-matrix 是信息性对照，
+# 用来验证下限/区间声明是否成立，不阻塞合并。
 on:
   push:
     branches: [main]
@@ -69,3 +71,60 @@ jobs:
           else
             echo "::notice::预期结果：内核 $(uname -r) 低于编译下限 6.12（缺 linux/unaligned.h）"
           fi
+
+  build-kernel-matrix:
+    name: build (kernel ${{ matrix.minor }}, informational)
+    # 目的：把 README「未验证区间 6.12–6.16」从"没测过"变成可核对的**编译证据**。
+    # 内核 6.12–6.16 不在 Ubuntu 24.04 官方源里，改从 Ubuntu mainline PPA 取 headers deb。
+    # 思路来源：aircrack-ng/rtl8812au 的 build.yml 用内核版本驱动矩阵、装 headers 后编译
+    # （只借结构，实现是自己写的：按 minor 选最新 patch、从 deb 名反推 KVER/KSRC）。
+    # 这一项**不阻塞**：结果写进 job summary，失败打 warning；成功后请同步 README「兼容性」。
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        minor: ['6.12', '6.14', '6.16']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取该 minor 最新补丁版的 headers 并安装
+        run: |
+          set -euo pipefail
+          MINOR="${{ matrix.minor }}"
+          INDEX="https://kernel.ubuntu.com/~kernel-ppa/mainline/"
+          DIR=$(curl -fsSL "$INDEX" | grep -o "v${MINOR}\.[0-9]*/" | sort -V | tail -1)
+          test -n "$DIR"
+          LIST=$(curl -fsSL "${INDEX}${DIR}")
+          ALL=$(echo "$LIST" | grep -o 'linux-headers-[^"]*_all\.deb' | head -1)
+          AMD=$(echo "$LIST" | grep -o 'linux-headers-[^"]*_amd64\.deb' | head -1)
+          test -n "$ALL" && test -n "$AMD"
+          KVER=$(basename "$AMD" | sed 's/^linux-headers-//; s/_.*$//')
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+          echo "KSRC=/usr/src/linux-headers-$KVER" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/kdebs" && cd "$RUNNER_TEMP/kdebs"
+          curl -fsSLO "${INDEX}${DIR}${ALL}"
+          curl -fsSLO "${INDEX}${DIR}${AMD}"
+          sudo dpkg -i --force-all ./*.deb
+
+      - name: 编译模块
+        run: |
+          echo "headers: $KSRC"
+          if make -C driver KVER="$KVER" KSRC="$KSRC" modules > build.log 2>&1; then
+            cat build.log
+            echo "RESULT=PASS" >> "$GITHUB_ENV"
+            echo "::notice::内核 $KVER：编译通过"
+          else
+            tail -40 build.log
+            echo "RESULT=FAIL" >> "$GITHUB_ENV"
+            echo "::warning::内核 $KVER：编译失败 —— 该版本仍在未验证区间，详见上方日志"
+          fi
+
+      - name: 结果写进 job summary
+        if: always()
+        run: |
+          {
+            echo "## 内核矩阵：${{ matrix.minor }}"
+            echo
+            echo "- headers：\`${{ env.KVER }}\`（来源：Ubuntu mainline PPA）"
+            echo "- 编译结果：**${{ env.RESULT }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
