@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ZT9612U（ZTOP / 兆通微 ACEV100）USB Wi-Fi 6 网卡的**独立实现** Linux 驱动（VID:PID `350b:9612`）。厂商没有公开发布 Linux 驱动；本驱动完全依据设备对外可观测的行为（USB 描述符、总线请求/响应序列）与公开的 CEVA RivieraWaves rwnx 消息框架知识编写。当前发布 **0.3.2**；`[Unreleased]` 的 v0.4 三大组件（固件站点会话 `sta_add_fmt=7`、WPA2 密钥路径 `key_en=2`、A-MPDU 聚合 `ampdu_en`）**均已实机走通，行为开关默认关，默认联网行为与 0.3.2 一致**。已实机验证：固件装载、IPC 初始化、双频扫描、关联、WPA2-PSK、DHCP、外网访问。**吞吐真值（r42~r44，端到端、对端接收侧逐字节核对）**：5 GHz 上传 **12.7–14.9 Mbit/s**、下载 **18.5–20.4 Mbit/s**、UDP 容量 15.0 Mbit/s；厂商**同口径**（经出口核对）13.37–18.21 ⇒ **同量级**（曾被引用的"95.3 Mbit/s / 差 26 倍"是**近端 sink 口径、不可比**，已退役）。聚合经 r40 修掉 `macif.c:1019` 断言、r42 在真实 TCP 下长跑 10,930 次零断言，但**不提速**；UDP 满压需 `agg_pred_us>0`（r44）。**主机侧七个提速杠杆已逐一证否** ⇒ ~15 Mbit/s 是固件 TX 侧上限。设备挂死用 **S5 冷启动 + RTC 唤醒**远程复位（`docs/06` §2.4），**不必物理拔插**。状态结论迭代频繁，**引用前以 `CHANGELOG.md` `[Unreleased]` 顶部与 `README.md`「项目状态」为准**。
 
-项目文档以中文为主，本文件与所有公开文档保持一致使用中文。
+项目文档以中文为主，本文件与所有公开文档保持一致使用中文。**全仓库禁止 emoji**（文档与代码注释都不允许；机检 `python ci/emoji_check.py`，公开 CI 每次 push 都跑），需要强调时用 `> [!WARNING]` 这类 alert 语法或文字。
 
 ## 常用命令
 
@@ -39,7 +39,7 @@ python tools/doc_lint.py                 # 本地保留：CRLF / 表格 / 参数
 
 `ci/version_check.py` 校验 `dkms.conf` 的 `PACKAGE_VERSION` / `driver/zt9612.c` 的 `MODULE_VERSION()` / `CHANGELOG.md` 最新已发布小节 / `README.md`「最新发布」四处一致。**改版本号或 README 状态后必跑。**
 
-**没有自动化运行时测试**：CI 只保证编译通过（`build.yml`，ubuntu-24.04 阻塞 + 一个仅信息性的 old-kernel 对照作业验证下限声明）、风格（`checkpatch.yml`）、脚本静态检查（`shellcheck.yml`）、版本一致（`docs.yml`）。回归 100% 靠真机人工验证。
+**没有自动化运行时测试**：CI 只保证编译通过（`build.yml`，ubuntu-24.04 阻塞 + 一个仅信息性的 old-kernel 对照作业验证下限声明）、风格（`checkpatch.yml`）、脚本静态检查（`shellcheck.yml`）、版本一致与 emoji 检查（`docs.yml`）。回归 100% 靠真机人工验证。
 
 ## 架构
 
@@ -92,7 +92,7 @@ python tools/rsh.py --put <本地> <远端>    # 上传文件
 
 驱动由 `.gitignore` 严格切分：**公开的只有驱动源码、构建/安装脚本与开源规范文档**。
 
-- **公开**：`driver/`（`zt9612.c`/`Makefile`/`zt9612_fw.c`）、`scripts/`、`install-driver.sh`、`uninstall-driver.sh`、`dkms-make.sh`、`dkms.conf`、`README.md`、`CONTRIBUTING.md`、`CHANGELOG.md`、`FAQ.md`、`AGENTS.md`、`CLAUDE.md`、`zt9612.conf`、`supported-device-IDs`、`ci/`、`.github/`（`firmware/` 目录只有占位 README，二进制由用户自备）
+- **公开**：`driver/`（`zt9612.c`/`Makefile`/`zt9612_fw.c`）、`scripts/`、`install-driver.sh`、`uninstall-driver.sh`、`dkms-make.sh`、`dkms.conf`、`README.md`、`INSTALL.md`、`TROUBLESHOOTING.md`、`PARAMETERS.md`、`CONTRIBUTING.md`、`CHANGELOG.md`、`FAQ.md`、`AGENTS.md`、`CLAUDE.md`、`zt9612.conf`、`supported-device-IDs`、`ci/`、`.github/`（`firmware/` 目录只有占位 README，二进制由用户自备）
 - **本地保留（已 gitignore，公开仓库不含）**：`docs/`（内部交接文档，含测试机信息/凭据）、`re/`（逆向报告、抓包、用户态原型）、`tools/`（运维脚本 + 明文凭据 `ssh/pass.txt`）、`firmware_from_cd/`、`vendor-request.txt`、`.workbuddy/`
 
 提交前做脱敏检查（`docs/07` §8）：`git grep` 查凭据、测试机 IP、真实 MAC / 接口名 / SSID。**厂商固件、抓包、反编译产物、密钥、凭据一律不入库。**
@@ -101,7 +101,7 @@ python tools/rsh.py --put <本地> <远端>    # 上传文件
 
 文档分工（`docs/12` §1 是总入口）：`docs/12` = 「以后怎么干活」唯一入口；`docs/02` = 协议规格；`docs/03` = 上机环境与铁律；`docs/04` = 踩坑记录（Dxx）；`docs/07` = 公开边界与发版流程；`docs/14` = 对外呈现规范（README / Release / commit 写法）；`docs/11`/`13` = 已收口的里程碑计划（只作历史）；`re/REPORT_*.md` 与 `CHANGELOG.md` = 结论。
 
-**改驱动行为 / 新增模块参数**时，同一批提交里必须同步：`README.md` 参数表、`zt9612.conf`、`docs/03` §7、`docs/05`、`docs/08` **五处参数表** + `CHANGELOG.md` 的 `[Unreleased]`。结论被推翻时不要静默改写历史，加更正横幅并写进 `CHANGELOG` 新小节。
+**改驱动行为 / 新增模块参数**时，同一批提交里必须同步：`PARAMETERS.md`（公开的参数表）、`zt9612.conf`、`docs/03` §7、`docs/05`、`docs/08` **五处参数表** + `CHANGELOG.md` 的 `[Unreleased]`（机检：`tools/doc_lint.py` 按 `PARAMETERS.md` 与三份内部文档对账）。结论被推翻时不要静默改写历史，加更正横幅并写进 `CHANGELOG` 新小节。
 
 提交规范（`docs/07` §4）：区域前缀 `driver`/`scripts`/`docs`/`ci`/`build`，标题祈使句 ≤75 字符，正文 75 列折行，一个提交只做一件事（可 bisect），`git commit -s` 加 DCO 签名。AI 辅助需加 `Assisted-by: LLM <工具名>`，但 **AI 不得添加 `Signed-off-by`**（DCO 是法律声明）。
 

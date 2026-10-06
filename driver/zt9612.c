@@ -2437,7 +2437,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		off[sub] = total;
 		total = unit;
 		/*
-		 * ⚠️ 2026-10-01 修复：这些帧此刻**还没上线**（聚合缓冲可能最终
+		 * 2026-10-01 修复：这些帧此刻**还没上线**（聚合缓冲可能最终
 		 * 被退化丢弃，或 break 后重排），不能先记进 done[]。
 		 * 旧代码在此处 done[k++]，配合下方两处缺陷（补齐循环覆盖 k、
 		 * 退化分支重发）导致 skb 泄漏 / 重复 report。
@@ -2488,7 +2488,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			memmove(buf + want, buf + have, tail);
 			memset(buf + have, 0, want - have);
 			total = (int)(want + tail);
-			/* ⚠️ 2026-10-01 修复：此处严禁用 k —— k 是 done[] 的写入游标，
+			/* 2026-10-01 修复：此处严禁用 k —— k 是 done[] 的写入游标，
 			 * 旧代码在这覆盖 k 导致混合批次（前置单帧 + 聚合）漏报 skb。 */
 			for (j = i + 1; j < sub; j++)
 				off[j] += want - have;
@@ -2527,7 +2527,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		 * 没有区别，多单元形态未定案前不冒险），从第一个聚合帧起
 		 * 全部改走尾部单帧循环。
 		 *
-		 * ⚠️ 2026-10-01 修复：旧代码 stop=0 / k=0 会把第一遍里**已经
+		 * 2026-10-01 修复：旧代码 stop=0 / k=0 会把第一遍里**已经
 		 * 单帧发出**的帧（批次开头的 ARP 广播 / EAPOL 等不合格帧）在
 		 * 尾部循环里**再发一遍** —— 线上出现重复帧（EAPOL/ARP 重复对
 		 * AP 侧状态机是真实输入差异）。first_agg 之前的帧已上线且在
@@ -2626,7 +2626,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 		/* 聚合帧此刻才真正上线，现在才允许进 done[] 报状态 */
 		for (j = 0; j < sub; j++)
 			done[k++] = skb[agg_idx[j]];
-		/* ⚠️ 2026-10-03：每 bulk 一条 dev_info 在洪泛下就是打印洪流
+		/* 2026-10-03：每 bulk 一条 dev_info 在洪泛下就是打印洪流
 		 * （实测把 TXQ 排水拖到 0.5 Mbit/s），改为 tx_diag 门控。 */
 		if (tx_diag)
 			dev_info(&z->intf->dev,
@@ -3578,10 +3578,10 @@ static void zt_tx_work(struct work_struct *w)
 		/*
 		 * 1) 传统 .tx 路径登记进来的 skb
 		 *
-		 * ⚠️ 2026-10-01 实测：**本内核把数据帧走这条路**（不是注释原先写的
+		 * 2026-10-01 实测：**本内核把数据帧走这条路**（不是注释原先写的
 		 * "TXQ 才是主路径"）—— 13k 帧的真实流量下 TXQ 分支一次都没被走到。
 		 *
-		 * ⚠️ 2026-10-03（r26）重开聚合：旧回归（tx_blast 1.26 Mbit/s、
+		 * 2026-10-03（r26）重开聚合：旧回归（tx_blast 1.26 Mbit/s、
 		 * ping 90% 丢包）的根因是当时的三个缺陷组合——① 批内skb 泄漏/
 		 * 重复 report（2026-10-01 已修，见 zt_tx_agg_send 内注释）、
 		 * ② 没有 BA 会话却仍打包（ba_valid 门当时恒假，现在 fmt=7 +
@@ -3653,7 +3653,7 @@ static void zt_tx_work(struct work_struct *w)
 			return;
 		for (i = 0; i < n; i++) {
 			/*
-			 * ⚠️ 2026-10-01 定案：出队必须走 mac80211 规定的**调度循环**：
+			 * 2026-10-01 定案：出队必须走 mac80211 规定的**调度循环**：
 			 *     schedule_start(ac) → next_txq(ac) → tx_dequeue()* → return_txq() → …
 			 * 只调 `ieee80211_tx_dequeue_ni()` 是不够的 —— 实测现象：
 			 * `txpath: legacy=… txq=0 … txq_pend=1` 反复出现（mac80211 不停

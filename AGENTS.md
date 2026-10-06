@@ -1,7 +1,9 @@
 # AGENTS.md
 
 ZT9612U（ZTOP / ACEV100，`350b:9612`）USB Wi-Fi 6 网卡的独立实现 Linux 驱动。
-**仓库文档、代码注释一律用中文**（提交信息无强制语言要求，历史上中英混用，近轮以英文为主）。
+**仓库文档、代码注释一律用中文，且一律不使用 emoji**（终端 / diff / 邮件里表现不一致，还会
+污染 `grep`；机检 `python ci/emoji_check.py`，已接入公开 CI，见 `.github/workflows/docs.yml`）。
+**提交信息**无强制语言要求（历史上中英混用，近轮以英文为主）。
 状态结论迭代很快（数天内多次反转）：真值以 `README.md`「项目状态」与
 `CHANGELOG.md` `[Unreleased]` 顶部为准，不要照抄旧文档的结论或行号 —— 行号一律 `grep -n` 现场确认。
 
@@ -32,7 +34,7 @@ python ci/version_check.py   # 改版本号或 README 状态后必跑：dkms.con
 ```
 
 **没有自动化运行时测试**：CI 只做编译（build.yml，ubuntu-24.04 阻塞）、checkpatch（只有
-ERROR 阻塞，WARNING/CHECK 是存量告警不阻塞）、shellcheck、版本一致（docs.yml）；
+ERROR 阻塞，WARNING/CHECK 是存量告警不阻塞）、shellcheck、版本一致 + emoji 检查（docs.yml）；
 回归 100% 靠真机人工验证。`python tools/doc_lint.py` 只在本地完整树可用
 （参数表 / 默认值 / CRLF / 行数引用），公开树没有 `tools/` 与 `docs/`。
 
@@ -84,14 +86,15 @@ M3 mac80211（文件内 `==== mac80211` 之后的区段）。
   （实机编译 + M1/M2 + M3 回归 + checkpatch 无新增告警）→ L3 协议/固件/TX-RX 数据路径
   （另加功能判据 + 单臂 A/B + 动手前预登记回滚条件 + 一变量一轮）。
 - 新功能一律 opt-in 模块参数（默认关）；默认值 = 与上一发布版本行为一致。加载期参数，换臂只能重启。
-- 改驱动行为/新增参数时，同一批提交同步 `README.md` 参数表、`zt9612.conf`、`docs/03` §7、
+- 改驱动行为/新增参数时，同一批提交同步 `PARAMETERS.md`（公开参数表）、`zt9612.conf`、`docs/03` §7、
   `docs/05`、`docs/08` 五处参数表 + `CHANGELOG.md` 的 `[Unreleased]`。
 
 ## 仓库边界与文档地图
 
 **公开树只有**：`driver/`（`zt9612.c` / `Makefile` / 不参与编译的 `zt9612_fw.c`）、`scripts/`、
 `install-driver.sh` / `uninstall-driver.sh` / `dkms-make.sh` / `dkms.conf`、`ci/`、`.github/`、
-`README.md` / `CHANGELOG.md` / `CONTRIBUTING.md` / `FAQ.md` / `SECURITY.md` / `MAINTAINERS`、
+`README.md` / `INSTALL.md` / `TROUBLESHOOTING.md` / `PARAMETERS.md` / `CHANGELOG.md` /
+`CONTRIBUTING.md` / `FAQ.md` / `SECURITY.md` / `MAINTAINERS`、
 `AGENTS.md` / `CLAUDE.md`、`zt9612.conf`、`supported-device-IDs`、`firmware/`（仅占位 README）。
 
 **本地保留（已 gitignore，公开仓库不存在，但本地开发时要读）**：`docs/`（内部文档）、`re/`（逆向

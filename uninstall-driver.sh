@@ -4,7 +4,7 @@
 # ZT9612U 驱动卸载脚本
 #
 # 默认只删除模块文件与配置，**不做 rmmod**：本项目观察到反复卸载/加载会让机器
-# 变成"能 ping 不能 SSH"（见 README「已知问题」）。模块若已加载，重启即可消失。
+# 变成"能 ping 不能 SSH"（见 TROUBLESHOOTING.md）。模块若已加载，重启即可消失。
 #
 # 用法:
 #   sudo ./uninstall-driver.sh              # 删除文件，提示重启

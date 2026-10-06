@@ -7,6 +7,8 @@ name: docs
 #     ⇒ 版本一致性检查**无条件执行**：dkms.conf 的 PACKAGE_VERSION /
 #     driver/zt9612.c 的 MODULE_VERSION() / CHANGELOG.md 最新已发布小节 /
 #     README.md 的「当前版本·最新发布」，任何一处漂移都让 job 失败。
+#   * `ci/emoji_check.py` —— 同样是**公开文件**，无条件执行：文档与代码注释里出现 emoji
+#     即失败（仓库约定，见 docs/14 §2.4；告警改用 `> [!WARNING]` 或文字）。
 #   * `tools/doc_lint.py` 与 `docs/` —— 本地保留目录（见 .gitignore 的「内部资料」一节），
 #     公开 CI 上**不存在** ⇒ 文档一致性检查只能**跳过**。跳过不是失败：公开仓库每次
 #     push 都变红没有意义。将来把 tools/ 与 docs/ 公开后，同一段判断会自动开始跑它们。
@@ -56,6 +58,9 @@ jobs:
       - name: 版本一致性（ci/version_check.py，公开文件，无条件执行）
         run: python3 ci/version_check.py -v
 
+      - name: emoji 检查（ci/emoji_check.py，公开文件，无条件执行）
+        run: python3 ci/emoji_check.py -v
+
       - name: 文档一致性（tools/doc_lint.py，仅本地完整树）
         if: steps.gate.outputs.tools == 'yes' && steps.gate.outputs.docs == 'yes'
         run: python3 tools/doc_lint.py -v
@@ -67,6 +72,7 @@ jobs:
             echo "## docs 检查"
             echo
             echo "- 版本一致性（\`ci/version_check.py\`）：**已执行** —— dkms.conf / MODULE_VERSION / CHANGELOG 最新已发布 / README 最新发布 四处必须一致。"
+            echo "- emoji 检查（\`ci/emoji_check.py\`）：**已执行** —— 文档与代码注释里出现 emoji 即失败（告警请用 \`> [!WARNING]\` 或文字）。"
             if [ "${{ steps.gate.outputs.tools }}" = "yes" ] && [ "${{ steps.gate.outputs.docs }}" = "yes" ]; then
               echo "- 文档一致性（\`tools/doc_lint.py\`）：**已执行**（CRLF / 表格 / 参数表 / 默认值 / [Unreleased] / 行数引用）。"
             else

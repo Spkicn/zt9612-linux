@@ -12,12 +12,12 @@
 #   实测吞吐（**端到端**，对端 TCP sink 接收侧逐字节核对）：5 GHz 上传 12.7–14.9 Mbit/s、
 #   下载 18.5–20.4 Mbit/s；2.4 GHz 上传 6.5–7.5 Mbit/s；UDP 容量上限 15.0 Mbit/s。
 #   同空口下载更快 ⇒ **约 15 Mbit/s 是固件 TX 侧上限，不是链路容量**；厂商**经出口核对**的
-#   空口实测是 13.37–18.21 Mbit/s ⇒ 属同一量级。⚠️ 流传的"厂商 95.3 Mbit/s（差 26 倍）"
+#   空口实测是 13.37–18.21 Mbit/s ⇒ 属同一量级。流传的"厂商 95.3 Mbit/s（差 26 倍）"
 #   是**近端 TCP sink 口径、不可比**，该说法已退役。固件站点会话与 A-MPDU 聚合都已实现
 #   并能长跑（TCP 下 10,930 次零断言），但**都不提升吞吐**（`ampdu_en` 默认关）；
 #   主机侧七个提速杠杆已逐一实测证否，速率由固件内部 ARRM 决定。
-#   注意：`iw link` 报的 1.0 Mbit/s **不是**真实发射速率，见 README「已知问题」。
-#   本脚本只负责把模块正确编译、签名、安装，并把已知风险（见 README「已知问题」）挡住。
+#   注意：`iw link` 报的 1.0 Mbit/s **不是**真实发射速率，见 TROUBLESHOOTING.md。
+#   本脚本只负责把模块正确编译、签名、安装，并把已知风险（见 TROUBLESHOOTING.md）挡住。
 #
 # 用法:
 #   sudo ./install-driver.sh                # 默认：编译 + 安装，保留 blacklist（不自动加载）
@@ -159,14 +159,14 @@ else
 	make install || exit 1
 fi
 
-# ---- 6. 自动加载策略（默认关闭，见 README「已知问题」）---------------------
+# ---- 6. 自动加载策略（默认关闭，见 TROUBLESHOOTING.md）---------------------
 if [ "$ENABLE_AUTOLOAD" -eq 1 ]; then
 	rm -f "$BLACKLIST"
 	echo
 	echo "注意：已启用自动加载。插上网卡（或开机）就会自动 probe 并装载固件。"
 	echo "      曾观察到这条路径让机器启动后无法登录，根因是驱动漏设 wiphy 的父设备"
 	echo "      （缺少 SET_IEEE80211_DEV()），已在 v0.2.0 修复，但「干净开机自动加载」"
-	echo "      这条完整路径尚未重新复验过（见 README 的「已知问题」）。"
+	echo "      这条完整路径尚未重新复验过（见 TROUBLESHOOTING.md）。"
 	echo "      如果开机后机器异常，请参考 README 中的恢复步骤。"
 else
 	printf 'blacklist %s\n' "$DRV_NAME" > "$BLACKLIST"
@@ -193,6 +193,6 @@ fi
 
 echo
 echo "完成。收尾建议："
-echo "  * 不要反复 rmmod/insmod（已知会把机器搞成无法登录，见 README「已知问题」）"
+echo "  * 不要反复 rmmod/insmod（已知会把机器搞成无法登录，见 TROUBLESHOOTING.md）"
 echo "  * 需要换模块时：重启机器"
 echo "  * 卸载：sudo ./uninstall-driver.sh"
