@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * zt9612.c - Linux driver for ZT9612U (ZTOP / 閸忓棝鈧艾浜?ACEV100) USB WiFi adapter
+ * zt9612.c - Linux driver for ZT9612U (ZTOP / 兆通微 ACEV100) USB WiFi adapter
  *
  * M1 + M2:
- *   - 閸ヨ桨娆㈢憗鍛版祰閿涘牊褰欓幍?/ 488B 閸?/ 閺堫偄娼?XOR16 / 闁板秶鐤嗛崸?/ RUN閿? *   - 閸氬本顒為崚婵嗩潗閸栨牕绨崚妤嬬礄閸欐垳绔撮弶锛勭搼娑撯偓閺?CFM閿涘绱癛ESET -> VERSION -> 閸樺倸鏅?-> START(缁涘瀹?6.5s) -> 闁板秶鐤? *   - 5 缁夋帒绺剧捄?0x05c2閿涘牐娴囬懡宄版儓 ASCII 閺冨爼妫块幋绛圭礆閿涘奔绗夐崣鎴濇祼娴犳湹绱伴惇瀣，閻欐顦叉担? *   - /dev/zt9612閿涙氨鏁ら幋閿嬧偓浣稿讲閻╁瓨甯撮弨璺哄絺閸樼喎顫?"WLAN" 鐢? *
- * 閸楀繗顔呴弶銉ㄥ殰 USB 閹舵挸瀵?+ 闂堟瑦鈧線鈧棗鎮滈獮鍫曗偓鎰摟閼哄倿鐛欑拠渚婄礄鐟?zt9612-linux/re/REPORT*.md閵嗕笍RIVER_PROGRESS.md閿? */
+ *   - 固件装载：批量写 488B 块 / 末块整段 XOR16 校验 / 配置块 / RUN
+ *   - IPC 一问一答：每条等对应 CFM（RESET -> VERSION -> 设信道 -> START(约 6.5s) -> 配置）
+ *   - 5 秒心跳 0x05c2（载荷为纯 ASCII），否则固件看门狗复位、设备退回光盘模式
+ *   - /dev/zt9612 字符设备：原始报文通道，报文头 "WLAN" + u16 hlen + u16 type
+ *
+ * 协议来自 USB 抓包与实验记录：结论见仓库 CHANGELOG 与 re/REPORT*.md、re/DRIVER_PROGRESS.md
+ * （re/ 为本地保留目录，不随公开仓库发布）。 */
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/module.h>
@@ -1952,7 +1957,7 @@ static int zt_boot(struct zt_dev *z)
 	if (ret)
 		goto out;
 
-	/* RUN 娑斿鎮楅崶杞版娴兼艾鍘涢崣鎴滅閺夆€虫儙閸斻劑鈧氨鐓￠敍鍧眣pe=0x0100, id=0x0200閿涘绱濈粵澶婄暊閸愬秴绱戞慨?IPC 閸掓繂顫愰崠鏍モ偓?	 * 閻劍鍩涢幀浣稿斧閸ㄥ鐤勫ù瀣剁窗娑撳秶鐡戦柅姘辩叀閻╁瓨甯撮崣?MM_RESET 娴兼碍鏁规稉宥呭煂 CFM閵?*/
+	/* RUN 状态通知（type=0x0100, id=0x0200）：固件开始 IPC 初始化后会发；不等通知直接发 MM_RESET 会收不到 CFM */
 	{
 		unsigned long end = jiffies + msecs_to_jiffies(3000);
 		u16 type = 0;
@@ -1971,7 +1976,7 @@ out:
 	return ret;
 }
 
-/* ------------------------------------------------------------------ 鏉╂劘顢戦弮鑸靛复閺€?*/
+/* ------------------------------------------------------------------ 固件装载层结束 */
 
 /* ------------------------------------------------------------------ TX 数据路径（M3.4） */
 
@@ -3320,7 +3325,7 @@ static const struct file_operations zt_fops = {
 
 /* ================================================================== mac80211 (M3.1)
  *
- * 閻╊喗鐖ｉ敍姘暈閸?wiphy / mac80211閿涘矁顔€ wlan0 閸戣櫣骞囬敍鍦?.1閿涘鈧? * 閺佺増宓侀棃顫礄TX/RX閿涘娈忛張顏呭复闁熬绱皌x 閻╁瓨甯存稉銏犲瘶閿涘本澹傞幓蹇撶毣閺堫亜鐤勯悳甯礄M3.2 閸愬秴浠涢敍澶堚偓? */
+ * 注册 wiphy / mac80211 接口 wlan0 与双频 band（M3.1）；TX/RX 数据面留到 M3.2。 */
 static struct ieee80211_channel zt_ch_2ghz[] = {
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1,  .max_power = 20 },
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2,  .max_power = 20 },
@@ -3820,7 +3825,7 @@ static int zt_mac_config_compat(struct ieee80211_hw *hw, u32 changed)
 #define ZT_MAC_CONFIG_OP	zt_mac_config
 #endif
 
-/* M3.1閿涙瓖X 閺嗗倷绗夐幒銉р€栨禒璁圭礉閻╁瓨甯存稉銏犲瘶閿涘牆褰х紒鐔活吀閿涘绱滿3.4 閸愬秷藟 TX 閹诲繗鍫粭?*/
+/* M3.1：.tx 只登记不发送 —— 帧进 txq，真正的 usb_bulk_msg 在 zt_tx_work() 里做 */
 static void zt_mac_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 		      struct sk_buff *skb)
 {
