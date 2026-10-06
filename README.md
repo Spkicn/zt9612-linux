@@ -102,15 +102,16 @@ WPA2 密钥路径；行为开关**默认关闭**，默认联网行为与 0.3.2 �
 |---|---|
 | 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）：功能全通、0 Oops、0 WARNING |
 | 功能已验证 | `7.0.0-34-generic`（2026-09-27 复测）：固件装载、IPC 初始化、双频扫描、5 GHz 关联、DHCP、外网 `ping`、`ping -M do 1472` 全部通过，`dmesg` **0 WARNING**（首帧 TX 曾在 `net/mac80211/tx.c:3832` 触发一次，已修：进程上下文改用 `ieee80211_tx_dequeue_ni()`） |
-| 已验证可编译 | `6.17.0-1022-azure`（CI，ubuntu-24.04 runner，无告警）；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
-| 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h` |
-| 未验证区间 | 6.12–6.16 能否正常工作未验证；mac80211 ops 签名只在 6.17 及以上确认匹配 |
+| 已验证可编译 | `6.17.0-1022-azure`（CI 阻塞作业，无告警）；CI 内核矩阵另在 **`6.12.112` / `6.14.11` / `6.16.12`**（Ubuntu mainline headers）上编译通过；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
+| 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h`；6.17 给 `config` 等 op 加了 `radio_idx`，驱动内有按 `LINUX_VERSION_CODE` 选择的转发，因此 6.12–6.16 也能编译 |
+| 未验证区间 | 6.12–6.16 的**运行**行为未验证（只做了编译取证，没有这些内核的实机）；6.12 以下不支持（缺 `linux/unaligned.h`） |
 | 构建依赖 | `build-essential`、`linux-headers-$(uname -r)` |
 
-驱动使用了较新的 mac80211 ops 签名，例如
-`config(struct ieee80211_hw *, int radio_idx, u32 changed)` 和
-`tx(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *)`。
-在较老内核上需要适配，欢迎提 PR 并附完整报错与 `uname -a`。
+驱动使用较新的 mac80211 ops 签名（`config(struct ieee80211_hw *, int radio_idx, u32 changed)`、
+`tx(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *)`）。其中 `config` 在
+6.17 才加上 `radio_idx`，6.12–6.16 是 `(hw, u32 changed)`，所以驱动里有一层按
+`LINUX_VERSION_CODE` 选择的转发来保住 6.12 下限（详见 CHANGELOG `[Unreleased]`）。
+更老的内核需要另加适配，欢迎提 PR 并附完整报错与 `uname -a`。
 
 ## 安装与验收
 

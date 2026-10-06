@@ -13,7 +13,9 @@ ZT9612U（ZTOP / ACEV100，`350b:9612`）USB Wi-Fi 6 网卡的独立实现 Linux
 
 驱动是 out-of-tree 内核模块，**必须在 Linux 目标机上编译**（Windows 开发机没有内核头文件），
 编译下限内核 6.12（`dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`；驱动 include 的是 6.12 才改名的
-`linux/unaligned.h`）。Windows 侧把源码/脚本传到测试机，在那边编译、加载、取证：
+`linux/unaligned.h`）。**6.17 给 `config` 等 op 加了 `radio_idx`，驱动内有 `LINUX_VERSION_CODE`
+兼容转发；CI 的 `build-kernel-matrix` 对 6.12/6.14/6.16 做编译取证（运行行为仍以实机为准）。**
+Windows 侧把源码/脚本传到测试机，在那边编译、加载、取证：
 
 ```bash
 python tools/rsh.py "<远程命令>"           # 在测试机执行一条命令（凭据 tools/ssh/pass.txt，已 gitignore）

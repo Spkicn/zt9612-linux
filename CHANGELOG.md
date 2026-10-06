@@ -9,6 +9,37 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+## [Unreleased] r45（2026-10-07）：**内核兼容层落地**——6.12–6.16 从"未验证"变成编译取证
+
+- **发现（可复现）**：`dkms.conf` 声明编译下限 6.12，但驱动只实现了 6.17 形态的 `.config`
+  op，6.12–6.16 从来编译不过。CI 内核矩阵在 6.16.12 上复现：
+  `zt9612.c:4096:19: error: initialization of 'int (*)(struct ieee80211_hw *, u32)'
+  from incompatible pointer type 'int (*)(struct ieee80211_hw *, int, u32)'
+  [-Wincompatible-pointer-types]`（`note: near initialization for 'zt_mac_ops.config'`）。
+  依据：内核 `include/net/mac80211.h` 的 **v6.12 / v6.16 / v6.17** 三个 tag 对比 ——
+  mac80211 在 6.17 给 `config`、`set_frag_threshold`、`set_rts_threshold`、
+  `set_coverage_class`、`set_antenna`、`get_antenna` 加了 `int radio_idx`；
+  6.12 与 6.16 的 `config` 完全相同，变更点在 6.17。本驱动只实现 `config`，
+  其余五个未实现，因此不需要额外 shim。
+- **修复**：`driver/zt9612.c` 增加 `#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)`
+  的转发 `zt_mac_config_compat()`，ops 里用 `ZT_MAC_CONFIG_OP` 组装。语义不变：
+  旧内核没有多 radio 概念，`radio_idx` 传 0。
+- **新增 CI 内核矩阵（信息性、不阻塞）**：从 Ubuntu mainline PPA 取 headers，
+  编译 **6.12.112 / 6.14.11 / 6.16.12** 三个版本，结果写进 job summary。
+  两个工程坑（都已在 workflow 注释里记下）：① PPA 链接是 `amd64/<deb>`，取链接文本会 404；
+  ② 6.12.112 的 headers 要 `gcc-15`（runner 没有），用 `CC=gcc` 退到 gcc-13 又会撞上
+  内核配置的 `-fmin-function-alignment=16` ⇒ 策略改为"先用 headers 默认编译器，
+  仅在缺编译器时退到 runner 的 gcc-14"。
+  **实测（runs 37499863876 → 37501491036）**：加 shim 前三个版本全部编译失败；
+  加 shim 后 **6.12.112 / 6.14.11 / 6.16.12 全部编译通过**，同时 `build`（6.17 阻塞）
+  与 `build-old-kernel`（6.8，预期失败）保持原结论。
+- **诚实边界**：这是**编译**取证，不是运行验证 —— 6.12–6.16 的实机行为仍未测
+  （项目只有 7.0.0-31/34 的测试机），README「兼容性」已按此措辞更新；
+  驱动行为语义未改动，默认联网行为与 0.3.2 一致。
+- **provenance**：矩阵思路（按内核版本驱动矩阵 + 先装 headers 再编译）参考
+  `aircrack-ng/rtl8812au` 的 `.github/workflows/build.yml`（GPL-2.0）；只借结构，
+  实现是本仓库自己写的（按 minor 选最新 patch、从 deb 名反推 KVER/KSRC、CC 回退）。
+
 > **发布线说明**：已发布版本是 **0.3.2**（三处一致：`dkms.conf` 的 `PACKAGE_VERSION`、
 > `driver/zt9612.c` 的 `MODULE_VERSION()`、`README`「项目状态」的当前版本）。
 > 本节按两条发布线分组：**0.3.3 候选/维护组** 只收 0.3.x 级的实验开关与工程收口；
