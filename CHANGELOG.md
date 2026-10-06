@@ -9,6 +9,20 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+## [Unreleased] r50（2026-10-07）：把"C 注释结构"机检加进公开 CI（r48 两次事故的防复发措施）
+
+- **动因**：r48 重写注释块时**两次漏掉结尾 `*/`**，把后面的代码吞进注释 —— 一次吞掉
+  `module_param()`（报 `error: expected ')' before 'int'`），一次吞掉 `zt_band_2ghz`
+  （报 `undeclared`）。两次都是 CI 的**编译作业**最后才发现的：本地那几道文档机检不解析 C 语法。
+- **新增 `ci/check_comments.py`（公开，CI 无条件执行）**：只读 `driver/*.c` 文本，
+  报两类问题 —— ① 块注释未闭合；② **像代码的行却落在块注释里**（预处理指令、`static`/`struct`/
+  `module_param`、单独一个 `}`）。不需要内核头文件，公开 CI 上就能跑。
+- **自测（正反两面都做了）**：当前驱动 → `OK`；在临时目录里人工制造 r48 的两种事故 →
+  都被点名（`#include <linux/module.h>`、`static int do_init = 1;`、`static struct foo bar = …`）。
+- 接入 `.github/workflows/docs.yml`（无条件步骤 + job summary 说明），并同步
+  `docs/12` §5 收口检查表 / §8 机制表、`AGENTS.md`、`CLAUDE.md`。本地 `tools/check_comments.py`
+  已删除（同一份逻辑，改由公开副本承担，避免两份漂移）。
+
 ## [Unreleased] r49（2026-10-07）：RX 速率候选字段被现有数据**否证**（离线复核，不需硬件）
 
 - **背景**：`re/REPORT_RX_DESC.md` 曾把描述符 `+0x10` / `+0x25` 列为"速率"弱候选，并因
