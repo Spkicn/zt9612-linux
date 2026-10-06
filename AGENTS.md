@@ -39,7 +39,7 @@ python ci/version_check.py   # 改版本号或 README 状态后必跑：dkms.con
 
 **没有自动化运行时测试**：CI 只做编译（build.yml，ubuntu-24.04 阻塞）、checkpatch（只有
 ERROR 阻塞，WARNING/CHECK 是存量告警不阻塞）、shellcheck、版本一致 + emoji + markdown +
-相对链接 + USB ID 检查（docs.yml）；
+相对链接 + USB ID + C 注释结构检查（docs.yml）；
 回归 100% 靠真机人工验证。`python tools/doc_lint.py` 只在本地完整树可用
 （参数表 / 默认值 / CRLF / 行数引用），公开树没有 `tools/` 与 `docs/`。
 

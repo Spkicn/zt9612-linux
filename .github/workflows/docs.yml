@@ -17,6 +17,9 @@ name: docs
 #     文件（拆文档/改名最容易断）。外链会随网络抖动，只在本地用 `--external` 探测，不做门。
 #   * `ci/device_id_check.py` —— 公开文件，无条件执行：驱动 `USB_DEVICE` 表与
 #     `supported-device-IDs` / README 必须一致，且表里不得有重复 ID。
+#   * `ci/check_comments.py` —— 公开文件，无条件执行：块注释必须闭合。漏掉 `*/` 会把后面的
+#     代码整段吞进注释，编译报错却指向别处（r48 两次真实事故：`module_param` 被吞报
+#     `expected ')'`、`zt_band_2ghz` 被吞报 undeclared）。它只读 `driver/*.c` 文本，不需要内核头文件。
 #   * `tools/doc_lint.py` 与 `docs/` —— 本地保留目录（见 .gitignore 的「内部资料」一节），
 #     公开 CI 上**不存在** ⇒ 文档一致性检查只能**跳过**。跳过不是失败：公开仓库每次
 #     push 都变红没有意义。将来把 tools/ 与 docs/ 公开后，同一段判断会自动开始跑它们。
@@ -82,6 +85,9 @@ jobs:
       - name: USB ID 一致性（ci/device_id_check.py，公开文件，无条件执行）
         run: python3 ci/device_id_check.py -v
 
+      - name: C 注释结构（ci/check_comments.py，公开文件，无条件执行）
+        run: python3 ci/check_comments.py
+
       - name: 文档一致性（tools/doc_lint.py，仅本地完整树）
         if: steps.gate.outputs.tools == 'yes' && steps.gate.outputs.docs == 'yes'
         run: python3 tools/doc_lint.py -v
@@ -97,6 +103,7 @@ jobs:
             echo "- markdown 渲染检查（\`ci/markdown_check.py\`）：**已执行** —— 代码之外的单个 \`~\` 会被渲染成删除线，区间请用 \`–\`、约数写「约 N」。Release 正文不在仓库里，本地用同脚本单独检查。"
             echo "- 相对链接检查（\`ci/link_check.py\`）：**已执行** —— 文档里的相对链接必须指向真实存在的文件（外链只在本地用 \`--external\` 探测）。"
             echo "- USB ID 一致性（\`ci/device_id_check.py\`）：**已执行** —— 驱动 \`USB_DEVICE\` 表与 supported-device-IDs / README 必须一致，且不得有重复条目。"
+            echo "- C 注释结构（\`ci/check_comments.py\`）：**已执行** —— 块注释必须闭合；漏 \`*/\` 会把后面的代码吞进注释，编译报错却指向别处。"
             if [ "${{ steps.gate.outputs.tools }}" = "yes" ] && [ "${{ steps.gate.outputs.docs }}" = "yes" ]; then
               echo "- 文档一致性（\`tools/doc_lint.py\`）：**已执行**（CRLF / 表格 / 参数表 / 默认值 / [Unreleased] / 行数引用）。"
             else
