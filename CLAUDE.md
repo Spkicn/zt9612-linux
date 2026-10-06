@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-ZT9612U（ZTOP / 兆通微 ACEV100）USB Wi-Fi 6 网卡的**独立实现** Linux 驱动（VID:PID `350b:9612`）。厂商没有公开发布 Linux 驱动；本驱动完全依据设备对外可观测的行为（USB 描述符、总线请求/响应序列）与公开的 CEVA RivieraWaves rwnx 消息框架知识编写。当前发布 **0.3.2**；`[Unreleased]` 的 v0.4 三大组件（固件站点会话 `sta_add_fmt=7`、WPA2 密钥路径 `key_en=2`、A-MPDU 聚合 `ampdu_en`）**均已实机走通，行为开关默认关，默认联网行为与 0.3.2 一致**。已实机验证：固件装载、IPC 初始化、双频扫描、关联、WPA2-PSK、DHCP、外网访问。**吞吐真值（r42~r44，端到端、对端接收侧逐字节核对）**：5 GHz 上传 **12.7–14.9 Mbit/s**、下载 **18.5–20.4 Mbit/s**、UDP 容量 15.0 Mbit/s；厂商**同口径**（经出口核对）13.37–18.21 ⇒ **同量级**（曾被引用的"95.3 Mbit/s / 差 26 倍"是**近端 sink 口径、不可比**，已退役）。聚合经 r40 修掉 `macif.c:1019` 断言、r42 在真实 TCP 下长跑 10,930 次零断言，但**不提速**；UDP 满压需 `agg_pred_us>0`（r44）。**主机侧七个提速杠杆已逐一证否** ⇒ ~15 Mbit/s 是固件 TX 侧上限。设备挂死用 **S5 冷启动 + RTC 唤醒**远程复位（`docs/06` §2.4），**不必物理拔插**。状态结论迭代频繁，**引用前以 `CHANGELOG.md` `[Unreleased]` 顶部与 `README.md`「项目状态」为准**。
+ZT9612U（ZTOP / 兆通微 ACEV100）USB Wi-Fi 6 网卡的**独立实现** Linux 驱动（VID:PID `350b:9612`）。厂商没有公开发布 Linux 驱动；本驱动完全依据设备对外可观测的行为（USB 描述符、总线请求/响应序列）与公开的 CEVA RivieraWaves rwnx 消息框架知识编写。当前发布 **0.3.2**；`[Unreleased]` 的 v0.4 三大组件（固件站点会话 `sta_add_fmt=7`、WPA2 密钥路径 `key_en=2`、A-MPDU 聚合 `ampdu_en`）**均已实机走通，行为开关默认关，默认联网行为与 0.3.2 一致**。已实机验证：固件装载、IPC 初始化、双频扫描、关联、WPA2-PSK、DHCP、外网访问。**吞吐真值（r42–r44，端到端、对端接收侧逐字节核对）**：5 GHz 上传 **12.7–14.9 Mbit/s**、下载 **18.5–20.4 Mbit/s**、UDP 容量 15.0 Mbit/s；厂商**同口径**（经出口核对）13.37–18.21 ⇒ **同量级**（曾被引用的"95.3 Mbit/s / 差 26 倍"是**近端 sink 口径、不可比**，已退役）。聚合经 r40 修掉 `macif.c:1019` 断言、r42 在真实 TCP 下长跑 10,930 次零断言，但**不提速**；UDP 满压需 `agg_pred_us>0`（r44）。**主机侧七个提速杠杆已逐一证否** ⇒ 约 15 Mbit/s 是固件 TX 侧上限。设备挂死用 **S5 冷启动 + RTC 唤醒**远程复位（`docs/06` §2.4），**不必物理拔插**。状态结论迭代频繁，**引用前以 `CHANGELOG.md` `[Unreleased]` 顶部与 `README.md`「项目状态」为准**。
 
-项目文档以中文为主，本文件与所有公开文档保持一致使用中文。**全仓库禁止 emoji**（文档与代码注释都不允许；机检 `python ci/emoji_check.py`，公开 CI 每次 push 都跑），需要强调时用 `> [!WARNING]` 这类 alert 语法或文字。
+项目文档以中文为主，本文件与所有公开文档保持一致使用中文。**全仓库禁止 emoji**（文档与代码注释都不允许；机检 `python ci/emoji_check.py`，公开 CI 每次 push 都跑），需要强调时用 `> [!WARNING]` 这类 alert 语法或文字。**markdown 里也不要裸用 `~`**（GitHub 把单个 `~` 渲染成删除线，区间用 `–`、约数写「约 N」；机检 `python ci/markdown_check.py`，Release 正文用同脚本单独查）。
 
 ## 常用命令
 
@@ -84,7 +84,7 @@ python tools/rsh.py --put <本地> <远端>    # 上传文件
 
 实验工具全部经 `rsh.py` 从开发机调用：A/B 臂标准跑法 `tools/run_arm.sh`（等接口 → 关 NetworkManager 托管 → 手动关联指定 BSSID → 测量），固件侧观测 `tools/zt_arm_tool.py`（census / kick / rawtx / mempeek / memdump，经 `/dev/zt9612`），高风险设备实验走 `re/r40_safe_probe.sh`（健康门 + 单发 + 冷却 + 硬失败即停）；设备挂死后用 **S5 冷启动**复位（`tools/r42_coldboot.sh` + `tools/r42_after_boot.sh`，旧的 `re/r40_recover.py` 阶梯对 `-110` 深挂死已证无效）。
 
-改动分级（`docs/12` §2，**不许降级**）：L0 文档/注释 → L1 脚本/工具 → L2 驱动非 TX 路径（需实机编译 + M1/M2 + M3.1~M3.4 回归 + checkpatch 无新增告警）→ L3 协议/固件交互/TX-RX 数据路径（另加功能判据 + 单臂 A/B + 动手前预登记回滚条件 + 一变量一轮）。
+改动分级（`docs/12` §2，**不许降级**）：L0 文档/注释 → L1 脚本/工具 → L2 驱动非 TX 路径（需实机编译 + M1/M2 + M3.1–M3.4 回归 + checkpatch 无新增告警）→ L3 协议/固件交互/TX-RX 数据路径（另加功能判据 + 单臂 A/B + 动手前预登记回滚条件 + 一变量一轮）。
 
 **新功能一律 opt-in 模块参数（默认关）**，默认值 = 与上一发布版本行为一致，保证运行时可回退、可 A/B。加载期参数，换臂只能重启。
 

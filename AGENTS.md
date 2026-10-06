@@ -3,6 +3,8 @@
 ZT9612U（ZTOP / ACEV100，`350b:9612`）USB Wi-Fi 6 网卡的独立实现 Linux 驱动。
 **仓库文档、代码注释一律用中文，且一律不使用 emoji**（终端 / diff / 邮件里表现不一致，还会
 污染 `grep`；机检 `python ci/emoji_check.py`，已接入公开 CI，见 `.github/workflows/docs.yml`）。
+**markdown 里也不要裸用 `~`**：GitHub 会把单个 `~` 渲染成删除线（`3.7~4.7` 与 `7~13` 这种写法
+会让整段被划掉）；区间用 `–`，约数写「约 15 Mbit/s」，必须用时放进反引号（机检 `python ci/markdown_check.py`）。
 **提交信息**无强制语言要求（历史上中英混用，近轮以英文为主）。
 状态结论迭代很快（数天内多次反转）：真值以 `README.md`「项目状态」与
 `CHANGELOG.md` `[Unreleased]` 顶部为准，不要照抄旧文档的结论或行号 —— 行号一律 `grep -n` 现场确认。
