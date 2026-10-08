@@ -3343,11 +3343,36 @@ static struct ieee80211_channel zt_ch_2ghz[] = {
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2484, .hw_value = 14, .max_power = 20 },
 };
 
+/*
+ * 2.4 GHz 速率表：CCK（1/2/5.5/11）+ OFDM（6/9/12/18/24/36/48/54）。
+ *
+ * 为什么补 OFDM：本芯片是 802.11ax 双频，2.4 GHz 本来就支持 802.11g 速率；只声明 CCK 会让
+ * `iw dev <iface> link` / `station dump` 里的速率看着不对（显示一致性）。`hw_value` 沿续 CCK
+ * 的编号（0..3 → 4..11），与 5 GHz 表同一约定；本驱动不读速率表的 `hw_value`（只读信道表的）。
+ *
+ * 标志位：OFDM 项设 `IEEE80211_RATE_ERP_G` —— 内核 `include/net/cfg80211.h` 对该标志的定义是
+ * "This is an ERP rate in 802.11g mode"，2.4 GHz 的 OFDM 正是 ERP 速率（这样 mac80211 在
+ * 非 ERP／纯 11b 的 BSS 里不会去选它们）。参照：内核同类 USB 驱动 `rtl8xxxu` 的 2.4G 表把
+ * CCK 与 OFDM 的 `flags` 都留 0 —— 两种做法在**本驱动**里等价（发射速率由固件决定，我们不读
+ * 主机选出的速率），这里按 canon 的语义取更明确的一种。
+ * CCK 项**不加** `IEEE80211_RATE_SHORT_PREAMBLE`：该标志表示"硬件支持短前导"，我们尚无实机证据。
+ *
+ * 诚实边界：实测**不改变吞吐**（发射速率由固件 ARRM 决定，见 `re/REPORT_HOST_RATE.md`）；
+ * 本改动属 L2，需要**实机编译 + M1/M2/M3 回归**后才宜并入 main。
+ */
 static struct ieee80211_rate zt_rates_2ghz[] = {
 	{ .bitrate = 10,  .hw_value = 0 },
 	{ .bitrate = 20,  .hw_value = 1 },
 	{ .bitrate = 55,  .hw_value = 2 },
 	{ .bitrate = 110, .hw_value = 3 },
+	{ .bitrate = 60,  .hw_value = 4,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 90,  .hw_value = 5,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 120, .hw_value = 6,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 180, .hw_value = 7,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 240, .hw_value = 8,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 360, .hw_value = 9,  .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 480, .hw_value = 10, .flags = IEEE80211_RATE_ERP_G },
+	{ .bitrate = 540, .hw_value = 11, .flags = IEEE80211_RATE_ERP_G },
 };
 
 static struct ieee80211_supported_band zt_band_2ghz = {
