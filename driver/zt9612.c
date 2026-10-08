@@ -107,6 +107,22 @@
 #define ZT_RX_BUF_SIZE	2048		/* RX URB 缓冲：覆盖 ~1950 字节的帧 */
 #define ZT_RX_MAX_FRAME	2048		/* 单帧硬上限（超过按脏帧丢弃） */
 /*
+ * CFM 载荷拷贝上限（防"设备返回超长 CFM 写穿调用方缓冲"）。
+ *
+ * 设备是**半可信输入**：CFM 的 param_len 由设备给出，
+ * `zt_cmd()` / `zt_cmd_fifo_resp()` 原来只按"收到的帧长 − 16"截断，
+ * **不看调用方缓冲区大小** —— 实测最大可到
+ * `ZT_RX_MAX_FRAME - 16 = 2032` 字节，
+ * 而最小的调用方缓冲是 `resp[4]` ⇒ 固件异常或有恶意设备时，
+ * 最多约 2 KB 设备可控内容写进内核栈。
+ *
+ * 因此：拷贝统一再按本常量截断（超长时告警，不静默），
+ * 并且**本文件内所有 `zt_cmd*()` 的 `resp` 缓冲区都不得小于本值**
+ * （当前均为 64，见各调用点）。
+ * 分析细节见 `re/REPORT_INPUT_HARDENING.md`。
+ */
+#define ZT_CFM_MAX_RESP	64
+/*
  * 接口 MTU 上限。
  *
  * 历史：曾按"设备每帧只能处理约 1 KB"的观测（ping payload 905 通、920 丢）把它设成 900，
@@ -892,6 +908,17 @@ static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 			u16 rl = (len >= 16) ? get_unaligned_le16(z->rx + 14) : 0;
 
 			rl = min_t(u16, rl, (u16)(len - 16));
+			/*
+			 * 设备给的 param_len 不可信：再按调用方缓冲上限截断
+			 * （理由见 ZT_CFM_MAX_RESP 注释），
+			 * 超长时告警而不是静默截断。
+			 */
+			if (rl > ZT_CFM_MAX_RESP) {
+				dev_warn(&z->intf->dev,
+					 "CFM %#06x 载荷 %u 字节超过 %u，已截断\n",
+					 (u16)want_cfm, rl, ZT_CFM_MAX_RESP);
+				rl = ZT_CFM_MAX_RESP;
+			}
 			if (rl)
 				memcpy(resp, z->rx + 16, rl);
 			*resp_len = rl;
@@ -1043,6 +1070,17 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
 			u16 rl = (len >= 16) ? get_unaligned_le16(z->rx + 14) : 0;
 
 			rl = min_t(u16, rl, (u16)(len - 16));
+			/*
+			 * 设备给的 param_len 不可信：再按调用方缓冲上限截断
+			 * （理由见 ZT_CFM_MAX_RESP 注释），
+			 * 超长时告警而不是静默截断。
+			 */
+			if (rl > ZT_CFM_MAX_RESP) {
+				dev_warn(&z->intf->dev,
+					 "CFM %#06x 载荷 %u 字节超过 %u，已截断\n",
+					 (u16)want_cfm, rl, ZT_CFM_MAX_RESP);
+				rl = ZT_CFM_MAX_RESP;
+			}
 			if (rl)
 				memcpy(resp, z->rx + 16, rl);
 			*resp_len = rl;
@@ -1114,7 +1152,7 @@ static void zt_sta_add(struct zt_dev *z, u16 aid, const u8 *bssid)
 {
 	/* 载荷从模板拷贝再改写：sta_add_fmt=2 时只动 RC 块 8 个字节（一次一个变量）。 */
 	u8 pl[ZT_STA_ADD_LEN];
-	u8 resp[8];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 
 	/* r20 修复：同 BSSID 复用旧固件会话（见 sta_reuse 说明） */
@@ -1458,7 +1496,7 @@ static void zt_vendor_seq(struct zt_dev *z)
  */
 static void zt_sta_del(struct zt_dev *z)
 {
-	u8 resp[4];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 	u8 idx;
 
@@ -1532,7 +1570,7 @@ static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	struct zt_dev *z = *(struct zt_dev **)hw->priv;
 #define ZT_KEY_ADD_LEN	44
 	u8 pl[ZT_KEY_ADD_LEN];
-	u8 resp[8];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 	u8 sta_idx, cipher, pairwise, klen;
 	int ret;
@@ -1643,7 +1681,7 @@ static int zt_mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 {
 	u8 params[8];
-	u8 resp[4];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 	int plen;
 
@@ -1709,7 +1747,7 @@ static int zt_ba_add(struct zt_dev *z, u8 tid, u16 bufsz, u16 ssn)
 static void zt_ba_del(struct zt_dev *z, u8 tid)
 {
 	u8 params[3];
-	u8 resp[4];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 
 	if (!z->ba_valid)
@@ -1737,7 +1775,7 @@ static int zt_run_init(struct zt_dev *z)
 	};
 	u8 addif[8] = { 0 };
 	u8 chan[12];
-	u8 resp[64];
+	u8 resp[ZT_CFM_MAX_RESP];
 	u16 rlen = 0;
 	u8 one = 1, zero = 0, slottime = 0x14;
 	int i, ret;
