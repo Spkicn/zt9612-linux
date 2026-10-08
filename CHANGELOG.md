@@ -9,6 +9,26 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+## [Unreleased] r52（2026-10-08）：厂商给的 "AX1800安装驱动" 是 **Windows** 包，而且比我们手里的更旧
+
+- **实测结论**：用户从厂商处获得的 `AX1800安装驱动`（`autorun.inf` + `auto_load.exe`）是
+  **Windows 驱动安装包** —— 按 `MSCF` 抠出 3 个 CAB：`usbwifi_ndis650.inf/.sys/.cat`
+  （x64 + x86 两个变体，NDIS 网卡驱动）、`zt9612_fw.bin`、`rwnx_settings.ini`、厂商工具。
+  字符串证据：`USB\VID_350B&PID_9612&MI_02`、`Provider="ZTOPMICRO"`、`SetupCopyOEMInfA`。
+  **没有任何** Makefile / Kconfig / `.ko` / Linux / Android 内容。
+- **它比我们已有的还旧**：厂商包 INF `DriverVer = 07/09/2025, 12.16.0.317`；
+  我们 `firmware_from_cd/` 里的是 `01/23/2026, 13.9.0.737`。固件也是不同构建：
+  214,980 字节（载荷长度 `0x347a8`）vs 219,076（`0x357a8`），**差正好 4 KB**；
+  头部结构（`5a 54 00 00 | 12 96 00 00 | …`）与尾部填充一致，但共同长度内 74.6% 字节不同
+  ⇒ 不同编译产物，不是裁剪关系。
+- **对项目的意义**：厂商渠道下一次必须**点名要 Linux/Android 包**
+  （`ZTOP_ACEV100_Android_wifi_bt_*.tar.gz`）并**明确不要 Windows 安装包**；
+  顺带问有没有比 13.9.0.737 更新的版本与固件变更说明。**本次没有新增能力**，
+  但避免了"以为拿到 Linux 驱动了"的误会。
+- **安全**：全程只做静态取证（PE 头解析、字符串提取、按签名抠 CAB、`expand.exe` 解包），
+  **没有执行**包里任何 exe/sys。厂商固件不入库，产物只在本地 `.workbuddy/`（已 gitignore）。
+  取证记录见本地 `re/REPORT_VENDOR_AX1800_PACKAGE.md`。
+
 ## [Unreleased] r51（2026-10-07）：release 正文可机器核对（补上 CI 覆盖不到的那一段）
 
 - **动因**：用户反馈的渲染 bug 正是出在 release 页上（单个 `~` 被当成删除线），而 release 正文
