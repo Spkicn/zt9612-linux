@@ -2410,6 +2410,11 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			if (zt_tx_frame(z, f, flen)) {
 				z->tx_dropped++;
 				ieee80211_free_txskb(z->hw, skb[i]);
+				/*
+				 * 置空：尾部"整批释放"会再遍历
+				 * skb[0..n-1]，不置空即二次释放。
+				 */
+				skb[i] = NULL;
 				continue;
 			}
 			z->tx_path_frames++;
@@ -2438,6 +2443,7 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 			}
 			z->tx_dropped++;
 			ieee80211_free_txskb(z->hw, skb[i]);
+			skb[i] = NULL;	/* 同上：防止尾部整批释放二次释放 */
 			continue;
 		}
 		off[sub] = total;
@@ -2457,6 +2463,12 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 
 	if (dropping) {
 		for (i = 0; i < n; i++) {
+			/*
+			 * 跳过已置空的条目：循环里"单帧发出失败 / 构建失败"
+			 * 的分支已经释放过它，这里再释放就是双重释放。
+			 */
+			if (!skb[i])
+				continue;
 			z->tx_dropped++;
 			ieee80211_free_txskb(z->hw, skb[i]);
 		}
@@ -2604,6 +2616,9 @@ static int zt_tx_agg_send(struct zt_dev *z, struct sk_buff **skb, int n, bool *a
 				 ret);
 			z->agg_stop = true;
 			for (i = 0; i < n; i++) {
+				/* 同上：已在循环里释放过 */
+				if (!skb[i])
+					continue;
 				z->tx_dropped++;
 				ieee80211_free_txskb(z->hw, skb[i]);
 			}
