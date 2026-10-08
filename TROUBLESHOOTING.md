@@ -71,3 +71,37 @@ sudo ./scripts/collect-debug-info.sh        # 生成 zt9612-debug-<时间戳>.tx
 
 它只读、不改配置，收集系统/设备/模块/固件校验/参数/接口/dmesg 共十来项。**贴之前自己过一遍**：
 `dmesg`、`ip`、`iw` 的输出里可能有真实 MAC、SSID 与主机名。
+
+## 自己先判一遍：排障包判读表
+
+拿到上面那份报告后，**按下面这张表先自己定位一次**（维护者也是按同一套规则看的）：
+
+| 你看到什么 | 说明什么 | 下一步 |
+|---|---|---|
+| `固件校验` 段出现 `No such file` | 固件没装或路径不对 —— 这是 M1 装载失败最常见的原因 | 用 `scripts/install-firmware.sh` 安装两个固件（自带 SHA-256 校验） |
+| `USB 设备` 段是 `(没有 350b: 设备)` | 设备可能退回了**光盘模式**（`350b:f179`）或没插好 | `lsusb -d 350b:` 复核；退回光盘模式时先断电复位 |
+| dmesg 里有 `hello ack timeout` | 设备没进入固件下载态（握手超时） | **S5 冷启动 + RTC 唤醒**（见下） |
+| dmesg 里有 `-110` / `Entity not found` | USB 传输失败，设备已挂死 | 同上；**不要**反复 unbind-bind 或 `USBDEVFS_RESET`（实测无效） |
+| dmesg 里有 `assert`（`macif.c` / `scm_admin`） | **固件断言**：进了已知致命区（短单元或描述符形态不符） | 先把实验开关全关（`ampdu_en=0`、`sta_add_en=0`、`key_en=2`、`agg_pred_us=0`）复现；仍断言请附**完整** dmesg |
+| dmesg 里有 `WARNING:` / `BUG:` / `Oops` / `Call Trace` | 内核侧异常（可能是驱动，也可能在 USB/内核层） | 附该行**前后各 20 行**与复现步骤；这是我们最优先处理的一类 |
+| dmesg 里读到 `=== init done, firmware running ===` 且 `接口状态` 有 `wlan0` | 驱动侧到这一步是**正常**的 | 问题更可能在关联/密钥/NetworkManager 侧，先查 [FAQ.md](FAQ.md) |
+| `dmesg` 段是 `(读不到 dmesg…)` | 权限不足，证据没采到 | 用 root 重跑一次收集脚本 |
+
+**挂死的唯一可靠复位**是 **S5 冷启动 + RTC 唤醒**（`rtcwake -m no -s 180` + `systemctl poweroff`），
+热重启无效、也不必物理拔插；细节见 [README.md](README.md)「已知问题」与内部文档 `docs/06`。
+
+## 稳定性怎么测（建议一起报这三个数）
+
+本项目的公开状态里目前只有**吞吐**，但日常使用更关心**丢包与延迟**。这两样**不需要厂商资料**就能测，
+而且能区分"慢"和"不稳"——请按同一口径测、把三个数一起报上来：
+
+```bash
+# 1) 到网关（20 个包就够看出异常；稳态观察用 -c 300）
+ping -I wlan0 -c 100 "$(ip route show default | awk '{print $3; exit}')"
+# 2) 到公网（同上；两者差别大 ⇒ 问题在无线段而不是出口）
+ping -I wlan0 -c 100 223.5.5.5
+# 3) 报告里请连同：内核版本（uname -r）、频段与信道（iw dev wlan0 link）、距离与环境
+```
+
+看三件事：**丢包率**（应接近 0）、**平均延迟**、**mdev/jitter**（波动大说明链路不稳，
+即使吞吐数字好看也不适合视频/通话）。把这三点塞进 issue，我们就能判断是驱动、固件还是环境问题。
