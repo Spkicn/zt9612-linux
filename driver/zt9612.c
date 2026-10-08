@@ -1994,12 +1994,88 @@ struct zt_txraw_req {
 
 #define ZT_IOC_TXRAW	_IOW('Z', 1, struct zt_txraw_req)
 
+/*
+ * 实验通道（M3.4+）：/dev/zt9612 上的 ioctl ZT_IOC_MMPROBE
+ *
+ * 主动发一条 MM 消息并取回 CFM —— 目的是验证"固件名字表里有、但厂商 Windows 驱动从不下发"
+ * 的那几条速率消息是否可达：
+ *   0x0016 MM_SET_BASIC_RATES_REQ      -> 0x0017
+ *   0x0069 MM_STA_RC_UPDATE_REQ        -> 0x006a
+ *   0x0091 DBG_RRM_RATE_INFO_CFG_REQ   -> 0x0092
+ * 设计与判据（含**动手前登记**的回滚条件）见 re/TASK_HOST_RATE_MESSAGES.md；
+ * 用 tools/mmprobe.py 调用。
+ *
+ * 为什么用 ioctl 而不是 debugfs：Secure Boot 打开时内核 lockdown=integrity 会拒绝写 debugfs
+ * （实测 EPERM），ioctl 路径不受影响 —— 与 ZT_IOC_TXRAW 同一个理由。
+ *
+ * 本通道**只在被显式调用时**才发消息，不改变任何默认行为。
+ */
+struct zt_mmprobe_req {
+	__u32 id;		/* 要发的 LMAC 消息 id（wire id，如 0x0016） */
+	__u32 cfm;		/* 期望的 CFM id；填 0 表示不等待 */
+	__u32 plen;		/* 载荷长度（<= ZT_MMPROBE_MAX） */
+	__u32 timeout_ms;	/* 等 CFM 的超时 */
+	__u64 data;		/* 用户态载荷缓冲区指针（可为 0） */
+	__u64 resp;		/* 用户态接收缓冲区指针（可为 0） */
+	__u32 rlen;		/* 出参：实际 CFM 载荷长度 */
+	__u32 status;		/* 出参：返回码（0 = 收到 CFM） */
+};
+
+#define ZT_IOC_MMPROBE	_IOWR('Z', 2, struct zt_mmprobe_req)
+#define ZT_MMPROBE_MAX	64
+
 static long zt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct zt_dev *z = file->private_data;
 	struct zt_txraw_req req;
 	u8 *buf;
 	int ret, sent = 0;
+
+	if (cmd == ZT_IOC_MMPROBE) {
+		struct zt_mmprobe_req probe;
+		u8 payload[ZT_MMPROBE_MAX];
+		u8 resp[ZT_MMPROBE_MAX];
+		u16 rlen = 0;
+
+		if (!READ_ONCE(z->alive))
+			return -ENODEV;
+		if (copy_from_user(&probe, (void __user *)arg, sizeof(probe)))
+			return -EFAULT;
+		if (!probe.id || probe.plen > ZT_MMPROBE_MAX)
+			return -EINVAL;
+		if (probe.plen) {
+			if (!probe.data)
+				return -EINVAL;
+			if (copy_from_user(payload,
+					   (void __user *)(unsigned long)probe.data,
+					   probe.plen))
+				return -EFAULT;
+		}
+		if (!probe.timeout_ms || probe.timeout_ms > 10000)
+			probe.timeout_ms = 3000;
+		ret = zt_cmd_fifo_resp(z, (u16)probe.id,
+				       probe.plen ? payload : NULL, (u16)probe.plen,
+				       probe.cfm ? (int)probe.cfm : -1,
+				       (int)probe.timeout_ms, resp, &rlen);
+		probe.status = ret ? (u32)(-ret) : 0;
+		probe.rlen = rlen;
+		if (!ret && rlen && probe.resp) {
+			if (copy_to_user((void __user *)(unsigned long)probe.resp,
+					 resp, min_t(u32, rlen, ZT_MMPROBE_MAX)))
+				return -EFAULT;
+		}
+		if (copy_to_user((void __user *)arg, &probe, sizeof(probe)))
+			return -EFAULT;
+		if (ret)
+			dev_warn(&z->intf->dev,
+				 "MMPROBE: id=%#06x plen=%u 失败 (%d)\n",
+				 probe.id, probe.plen, ret);
+		else
+			dev_info(&z->intf->dev,
+				 "MMPROBE: id=%#06x cfm=%#06x 收到 %u 字节响应\n",
+				 probe.id, probe.cfm, rlen);
+		return 0;
+	}
 
 	if (cmd != ZT_IOC_TXRAW)
 		return -ENOTTY;
