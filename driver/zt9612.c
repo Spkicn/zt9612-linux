@@ -4415,6 +4415,18 @@ static void zt_disconnect(struct usb_interface *intf)
 		zt_dbg_root = NULL;
 	}
 	zt_mac_unregister(z);
+	/*
+	 * 二次取消（2026-10-08 审查发现）：第一次 cancel 与上面的
+	 * ieee80211_unregister_hw() 之间有窗口 —— 这期间 mac80211 仍已注册、
+	 * netdev 可能还在 up，而 `.wake_tx_queue`(L3776) 与
+	 * `hw_scan`(L4064) 都不看 `alive`，能把 tx_work / scan_work 重排上；
+	 * 排上后不会再被取消，可能在下面的 kfree(z) 之后才跑 ⇒ UAF。
+	 * unregister 返回后 mac80211 不再回调，这里再取消一次即可关窗。
+	 * （`.tx` 有 alive 门控，窗口内只释放 skb、不重排 work。）
+	 */
+	cancel_work_sync(&z->scan_work);
+	cancel_work_sync(&z->tx_work);
+	skb_queue_purge(&z->txq);	/* 窗口内若有帧进过队列，补一次清理 */
 
 	zt_ntf_stop(z);		/* 通知通道：同样有界等待 */
 	if (zt_rx_stop(z)) {
