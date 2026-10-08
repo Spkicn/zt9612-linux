@@ -9,6 +9,26 @@
 
 > 下一个里程碑的候选清单见下面的 Planned；公开侧路线图以本节与 README「路线图」为准。
 
+## [Unreleased] r62（2026-10-08）：卸载路径的**工作项重排窗口**（已修，补丁待实机回归）
+
+- **第三轮静态审查换到并发/生命周期**。先记账（都是干净的）：两个 URB 完成回调**不取 mutex**
+  （软中断上下文）；`.wake_tx_queue` 只用自旋锁记账、解锁后才 `schedule_work`；`z->lock`（mutex）
+  的 7 个获取点**全在进程上下文**；自旋锁与 mutex **不嵌套**（`zt_tx_work` 先解锁再 dequeue/聚合）。
+- **发现**：`zt_disconnect()` 的两次 `cancel_work_sync()` 在**第 2 步**，而撤掉 mac80211 的
+  `zt_mac_unregister()`（`ieee80211_unregister_hw()`）在**第 3 步**。窗口期内 mac80211 仍已注册、
+  netdev 可能还在 up，而 **`.wake_tx_queue`（L3776）与 `hw_scan`（L4064）都不看 `alive`**，
+  能把 `tx_work` / `scan_work` **重新排上**；排上后再没人取消，函数末尾却 `kfree(z)`
+  ⇒ **可能在释放之后才执行（use-after-free）**。对照：`.tx`（`zt_mac_tx`）**有 `alive` 门控**，
+  窗口内只释放 skb、不重排 work。设备掉出总线即可触发。
+- **修复**（分支 `fix/teardown-work-rearm`，提交 `522d24b`，补丁 `re/patch-teardown-work-rearm.diff`）：
+  在 `zt_mac_unregister(z)` **之后**再取消一次 `scan_work` 与 `tx_work`（此后 mac80211 不再回调，
+  窗口关闭），并补一次 `skb_queue_purge(&z->txq)`；**D9 的顺序语义不变**。新增 12 行。
+- **验证**：真机（Ubuntu 24.04 / kernel 7.0.0-34）对未改动的同一文件对比 —— 编译 0 error、
+  同样 2 条构建环境告警；checkpatch `0 errors, 26 warnings, 315 checks` **与基线逐项相同**。
+  仍**只编译**，未加载、未碰设备。合并前需**实机拔插一次 + M1/M2 + M3 回归**。
+- **累计**：三轮静态审查共 14 个检查点，发现 **3 处缺陷**（r60 长度写穿 / r61 双重释放 /
+  r62 卸载重排），另 11 项判定健全，依据都在本地 `re/REPORT_INPUT_HARDENING.md`。
+
 ## [Unreleased] r61（2026-10-08）：TX 聚合错误路径的**双重释放**（已修，补丁待实机回归）
 
 - **第二轮静态审查换了角度**：第一轮查"边界"（长度/下标），这轮查"**归属**"（谁负责释放 skb）。

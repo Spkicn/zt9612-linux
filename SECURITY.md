@@ -44,6 +44,8 @@
 | **设备响应的载荷长度写穿调用方缓冲**：`zt_cmd()` / `zt_cmd_fifo_resp()` 原来只按"收到的帧长 − 16"截断，**不检查调用方缓冲容量**（最小为 `resp[4]`），而设备可给到 2032 字节 ⇒ 异常/恶意设备可向内核栈写入设备可控数据（约 2 KB 上界） | **已定位并做成补丁**：`fix/cfm-resp-cap` 分支（按 `ZT_CFM_MAX_RESP` 截断 + 超长告警，6 个调用点缓冲统一）。**两套独立编译验证已过**：①目标机（Ubuntu 24.04 / kernel 7.0.0-34）与同文件未加固版本对比 —— 0 error、告警与 checkpatch CHECK 数**逐项相同**；②CI 内核矩阵 —— `6.17`（阻塞作业）+ `6.12/6.14/6.16` + `22.04` **全部 success**。**按 L2 规则，还需实机 M1/M2 + M3 回归后才并入 main** |
 | **聚合 TX 错误路径的双重释放**：`zt_tx_agg_send()` 拥有整批 skb，但循环内已释放的条目仍留在 `skb[]` 里，bulk OUT 失败时又对 `skb[0..n-1]` 整批释放 ⇒ 同一条 skb **被释放两次**。设备可触发：让 bulk OUT 端点失败/停顿，单帧发送与聚合传输会一起失败 | **已定位并做成补丁**：`fix/agg-double-free` 分支（循环内释放后置空 + 两处整批释放跳过空项，纯新增 15 行）。**真机基线对比**：编译 0 error、告警与 checkpatch（`0 errors / 26 warnings / 315 checks`）**逐项相同**；**CI 内核矩阵** `6.17` 阻塞 + `6.12/6.14/6.16` + `22.04` 全 success。**同需实机 M1/M2 + M3 回归后才并入 main** |
 
+| **装卸路径的工作项重排窗口**：`zt_disconnect()` 先 `cancel_work_sync()`、后 `ieee80211_unregister_hw()`；这期间 `.wake_tx_queue` 与 `hw_scan` **不看 `alive`**，能把 `tx_work`/`scan_work` 重新排上，排上后不会再被取消 ⇒ 可能在 `kfree(z)` 之后执行（**use-after-free**）。设备掉出总线即可触发 | **已定位并做成补丁**：`fix/teardown-work-rearm` 分支（unregister **之后**再取消两个 work + 补一次队列清理，新增 12 行；D9 顺序不变）。**真机基线对比**：编译 0 error、告警与 checkpatch（`0 errors / 26 warnings / 315 checks`）**逐项相同**。**合并前需实机拔插一次 + M1/M2 + M3 回归**（卸载路径正是改动处） |
+
 分析细节（本地保留）：`re/REPORT_INPUT_HARDENING.md`。
 
 ## 供应链注意事项
