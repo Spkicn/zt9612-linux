@@ -29,6 +29,8 @@
 | checkpatch | `0 errors, 26 warnings, 315 checks` | `0 errors, 26 warnings, **315 checks**` |
 
   ⇒ **零新增编译告警、零新增 checkpatch 发现**。只编译、未加载、未碰设备与 `/lib/modules`。
+  另在 CI 内核矩阵上复核：`6.17`（阻塞作业）+ `6.12/6.14/6.16` + `22.04` **全部 success**
+  ⇒ 该补丁现有**两套独立编译验证**（真机 7.0.0-34 + CI 矩阵）。
 - **顺带记一条工具经验**：checkpatch **按字节计宽**（一个汉字 3 列），中文注释很容易"看起来没超"
   实则超 100 列（首版就这样多出 5 条 CHECK，真机复验才发现）。已补本地工具
   `tools/long_lines.py`（按字节 + tab=8 复刻 checkpatch 口径，支持"只报新增"），本地复现 0 新增。
